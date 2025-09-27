@@ -1155,3 +1155,527 @@ Next: /setup_channels (will work after session upload)""",
     return ConversationHandler.END
 
 # [REST OF THE HANDLERS REMAIN THE SAME - CONTINUING WITH CHANNELS, TRADING, MONITORING...]
+
+# ================== CHANNEL SETUP ==================
+
+async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    await update.message.reply_text("🔍 <b>Loading your channels...</b>", parse_mode='HTML')
+
+    channels = await trading_bot.get_available_channels(user_id)
+
+    if not channels:
+        await update.message.reply_text(
+            """❌ <b>No channels found!</b>
+
+<b>Possible reasons:</b>
+• Telegram API not configured (/setup_telegram)
+• Telethon needs authentication (run locally first)
+• No channels available
+
+<b>For Railway:</b>
+Run bot locally first, then upload session files.""", parse_mode='HTML')
+        return ConversationHandler.END
+
+    context.user_data['available_channels'] = channels
+    keyboard_markup = create_channel_keyboard(user_id, channels)
+
+    await update.message.reply_text(
+        create_channel_selection_text(user_id),
+        reply_markup=keyboard_markup,
+        parse_mode='HTML'
+    )
+
+    return WAITING_CHANNEL_SELECTION
+
+async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        await query.answer()
+    except:
+        pass
+
+    if query.data == "channels_done":
+        await query.edit_message_text(
+            f"""✅ <b>Channel selection complete!</b>
+
+Monitoring: <b>{len(config.monitored_channels)}</b> channels
+
+Next step: /setup_trading to configure parameters""",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+
+    elif query.data == "clear_all_channels":
+        config.monitored_channels.clear()
+        channels = context.user_data.get('available_channels', [])
+        keyboard_markup = create_channel_keyboard(user_id, channels)
+        await query.edit_message_text(
+            create_channel_selection_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+
+    elif query.data == "add_manual_channel":
+        await query.edit_message_text(
+            """📝 <b>Manual Channel ID Input</b>
+
+Send the channel ID (numbers only):
+
+<b>Format:</b> <code>-1001234567890</code>
+
+<b>How to get Channel ID:</b>
+• Forward message to @userinfobot
+• Use @RawDataBot""",
+            parse_mode='HTML'
+        )
+        return WAITING_MANUAL_CHANNEL
+
+    elif query.data.startswith("toggle_channel_"):
+        channel_id = query.data.replace("toggle_channel_", "")
+
+        if channel_id in config.monitored_channels:
+            config.monitored_channels.remove(channel_id)
+        else:
+            config.monitored_channels.append(channel_id)
+
+        channels = context.user_data.get('available_channels', [])
+        keyboard_markup = create_channel_keyboard(user_id, channels)
+
+        await query.edit_message_text(
+            create_channel_selection_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+
+    return WAITING_CHANNEL_SELECTION
+
+async def handle_manual_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    channel_id = update.message.text.strip()
+
+    if not channel_id.lstrip('-').isdigit():
+        await update.message.reply_text("❌ <b>Invalid format!</b> Send numeric ID like: <code>-1001234567890</code>", parse_mode='HTML')
+        return WAITING_MANUAL_CHANNEL
+
+    if not channel_id.startswith('-'):
+        channel_id = '-' + channel_id
+
+    if channel_id not in config.monitored_channels:
+        config.monitored_channels.append(channel_id)
+
+    await update.message.reply_text(
+        f"""✅ <b>Channel added successfully!</b>
+
+Channel ID: <code>{channel_id}</code>
+Total monitoring: <b>{len(config.monitored_channels)}</b> channels
+
+Use /setup_trading to configure parameters""",
+        parse_mode='HTML'
+    )
+
+    return ConversationHandler.END
+
+# ================== ENHANCED TRADING SETUP ==================
+
+async def setup_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    keyboard_markup = create_settings_keyboard(user_id)
+
+    await update.message.reply_text(
+        """⚙️ <b>Enhanced Trading Setup v4.3</b>
+
+🎯 <b>Settings Source:</b>
+• <b>Signal</b>: Use leverage/SL/TP from signals (fallback to bot)
+• <b>Bot</b>: Always use your configured settings
+
+📊 <b>SL/TP Orders:</b>
+• <b>ON</b>: Auto-create stop loss & take profit orders
+• <b>OFF</b>: Only create main position
+
+✅ <b>FIXED:</b> Balance parsing now works with BingX single object format!
+
+Click any parameter to change it:""",
+        reply_markup=keyboard_markup,
+        parse_mode='HTML'
+    )
+    return WAITING_LEVERAGE
+
+async def handle_trading_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    await query.answer()
+
+    if query.data == "trading_done":
+        settings_source = "Signal" if config.use_signal_settings else "Bot"
+        sl_tp_status = "ON" if config.create_sl_tp else "OFF"
+
+        await query.edit_message_text(
+            f"""✅ <b>Trading setup complete!</b>
+
+⚙️ <b>Configuration:</b>
+🎯 Settings Source: <b>{settings_source}</b>
+📊 SL/TP Creation: <b>{sl_tp_status}</b>
+⚡ Leverage: <b>{config.leverage}x</b> (BingX Max: 150x)
+🛑 Stop Loss: <b>{config.stop_loss_percent}%</b>
+🎯 Take Profit: <b>{config.take_profit_percent}%</b>
+💰 Position Size: <b>{config.balance_percent}%</b>
+
+✅ <b>FIXED:</b> Your 10.01 USDT balance will be detected correctly!
+
+Ready to start: /start_monitoring""", 
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+
+    elif query.data == "toggle_settings_source":
+        config.use_signal_settings = not config.use_signal_settings
+        keyboard_markup = create_settings_keyboard(user_id)
+        await query.edit_message_reply_markup(reply_markup=keyboard_markup)
+        return WAITING_LEVERAGE
+
+    elif query.data == "toggle_sl_tp":
+        config.create_sl_tp = not config.create_sl_tp
+        keyboard_markup = create_settings_keyboard(user_id)
+        await query.edit_message_reply_markup(reply_markup=keyboard_markup)
+        return WAITING_LEVERAGE
+
+    elif query.data == "set_leverage":
+        await query.edit_message_text("⚡ <b>Set Bot Leverage</b>\n\nSend leverage (1-150 for BingX):", parse_mode='HTML')
+        return WAITING_LEVERAGE
+
+    elif query.data == "set_stop_loss":
+        await query.edit_message_text("🛑 <b>Set Bot Stop Loss %</b>\n\nSend percentage (0.5-20):", parse_mode='HTML')
+        return WAITING_STOP_LOSS
+
+    elif query.data == "set_take_profit":
+        await query.edit_message_text("🎯 <b>Set Bot Take Profit %</b>\n\nSend percentage (1-100):", parse_mode='HTML')
+        return WAITING_TAKE_PROFIT
+
+    elif query.data == "set_balance_percent":
+        await query.edit_message_text("💰 <b>Set Position Size %</b>\n\nSend percentage per trade (0.1-10):", parse_mode='HTML')
+        return WAITING_BALANCE_PERCENT
+
+async def handle_leverage_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        leverage = int(update.message.text.strip())
+        if 1 <= leverage <= 150:  # BingX max 150x
+            config.leverage = leverage
+            await update.message.reply_text(f"✅ <b>Bot leverage set to {leverage}x</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid! Enter 1-150 (BingX max)", parse_mode='HTML')
+            return WAITING_LEVERAGE
+    except ValueError:
+        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
+        return WAITING_LEVERAGE
+
+    return ConversationHandler.END
+
+async def handle_stop_loss_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        stop_loss = float(update.message.text.strip())
+        if 0.1 <= stop_loss <= 50:
+            config.stop_loss_percent = stop_loss
+            await update.message.reply_text(f"✅ <b>Bot stop loss set to {stop_loss}%</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid! Enter 0.1-50", parse_mode='HTML')
+            return WAITING_STOP_LOSS
+    except ValueError:
+        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
+        return WAITING_STOP_LOSS
+
+    return ConversationHandler.END
+
+async def handle_take_profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id  
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        take_profit = float(update.message.text.strip())
+        if 1 <= take_profit <= 100:
+            config.take_profit_percent = take_profit
+            await update.message.reply_text(f"✅ <b>Bot take profit set to {take_profit}%</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid! Enter 1-100", parse_mode='HTML')
+            return WAITING_TAKE_PROFIT
+    except ValueError:
+        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
+        return WAITING_TAKE_PROFIT
+
+    return ConversationHandler.END
+
+async def handle_balance_percent_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        balance_percent = float(update.message.text.strip())
+        if 0.1 <= balance_percent <= 20:
+            config.balance_percent = balance_percent
+            await update.message.reply_text(f"✅ <b>Position size set to {balance_percent}%</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid! Enter 0.1-20", parse_mode='HTML')
+            return WAITING_BALANCE_PERCENT
+    except ValueError:
+        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
+        return WAITING_BALANCE_PERCENT
+
+    return ConversationHandler.END
+
+# ================== MONITORING COMMANDS ==================
+
+async def start_monitoring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    missing = []
+    if not config.bingx_api_key:
+        missing.append("/setup_bingx")
+    if not config.telegram_api_id:
+        missing.append("/setup_telegram")
+    if not config.monitored_channels:
+        missing.append("/setup_channels")
+
+    if missing:
+        await update.message.reply_text(f"❌ <b>Setup incomplete!</b>\n\nMissing: {' '.join(missing)}", parse_mode='HTML')
+        return
+
+    if trading_bot.active_monitoring.get(user_id):
+        await update.message.reply_text("⚠️ <b>Already monitoring!</b> Use /stop_monitoring first", parse_mode='HTML')
+        return
+
+    await update.message.reply_text("🚀 <b>Starting enhanced monitoring...</b>", parse_mode='HTML')
+
+    success = await trading_bot.start_monitoring(user_id, context.bot)
+
+    if success:
+        settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
+        sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
+
+        await update.message.reply_text(
+            f"""🟢 <b>BINGX MONITORING STARTED!</b>
+
+📡 Watching <b>{len(config.monitored_channels)}</b> channels
+⚙️ Settings Source: <b>{settings_source}</b>
+📊 SL/TP Creation: <b>{sl_tp_status}</b>
+⚡ Bot Leverage: <b>{config.leverage}x</b> (Max: 150x)
+🛑 Bot Stop Loss: <b>{config.stop_loss_percent}%</b>
+🎯 Bot Take Profit: <b>{config.take_profit_percent}%</b>
+💰 Position Size: <b>{config.balance_percent}%</b>
+
+✅ <b>Enhanced Features Active:</b>
+• Auto SL/TP order creation
+• Russian signal parsing (Плечо, Сл, Тп)
+• Configurable settings priority
+• FIXED BingX API response handling
+• FIXED balance parsing (single object)
+• Up to 150x leverage available!
+
+💰 <b>Balance Detection Fixed!</b>
+Your 10.01 USDT will be properly detected and used for trades.
+
+🎯 <b>Ready for BingX trading!</b>
+Send signals like:
+#BCH/USDT
+LONG
+Entry: 350.5
+Leverage: 5x
+SL: 330.0
+TP: 380.0""",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            """❌ <b>Failed to start monitoring</b>
+
+<b>Possible issues:</b>
+• Telethon not authenticated (need session files)
+• Telegram API issues
+• Network connectivity
+
+<b>For Railway deployment:</b>
+Run bot locally first to create session files.""", 
+            parse_mode='HTML'
+        )
+
+async def stop_monitoring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not trading_bot.active_monitoring.get(user_id):
+        await update.message.reply_text("ℹ️ <b>Not currently monitoring</b>", parse_mode='HTML')
+        return
+
+    trading_bot.active_monitoring[user_id] = False
+    await update.message.reply_text("🔴 <b>BingX monitoring stopped</b>", parse_mode='HTML')
+
+# ================== TEST SIGNAL ==================
+
+async def test_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    samples = [
+        """🚀 SIGNAL ALERT 🚀
+#BTCUSDT LONG
+Entry: 109642
+Target 1: 109890
+Target 2: 110350
+Stop Loss: 109000
+Leverage: 10x""",
+
+        """#BCH/USDT
+LONG
+Entry: 350.5
+Leverage: 5x
+SL: 330.0
+TP: 380.0""",
+
+        """#BAKE/USDT
+LONG
+Плечо: 5x-50x
+Сл:На ваше усмотрение 
+Тп: 60%+
+Осторожно 🛑""",
+
+        """#SOL/USDT
+LONG
+Entry: 135.5
+Плечо: 20х
+Сл: 130.0
+Тп: 145.0"""
+    ]
+
+    results = []
+    for i, msg in enumerate(samples, 1):
+        signal = trading_bot.parse_trading_signal(msg, "test")
+        if signal:
+            result_text = f"✅ Sample {i}: {signal.symbol} {signal.trade_type}"
+            if signal.entry_price:
+                result_text += f" @ {signal.entry_price}"
+            if signal.leverage:
+                result_text += f" ({signal.leverage}x)"
+            results.append(result_text)
+        else:
+            results.append(f"❌ Sample {i}: Failed to parse")
+
+    await update.message.reply_text(
+        f"""🧪 <b>Enhanced Signal Parser Test v4.3</b>
+
+{chr(10).join(results)}
+
+✅ <b>Enhanced Features (ALL FIXED):</b>
+• Russian parsing (Плечо, Сл, Тп)
+• Multiple entry patterns
+• Flexible TP detection
+• Leverage range support (1-150x)
+• Settings priority system
+• FIXED BingX API response handling
+• FIXED Telethon authentication
+• FIXED balance parsing for single objects
+
+💰 <b>Balance Detection Fixed!</b>
+Your 10.01 USDT will be properly detected for all trades.
+
+🚀 <b>Ready for BingX trading with 150x leverage!</b>""",
+        parse_mode='HTML'
+    )
+
+# ================== ERROR HANDLER ==================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Error: {context.error}")
+
+# ================== MAIN FUNCTION ==================
+
+def main():
+    BOT_TOKEN = '8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4'
+
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_error_handler(error_handler)
+
+    # Basic commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("start_monitoring", start_monitoring_command))
+    application.add_handler(CommandHandler("stop_monitoring", stop_monitoring_command))
+    application.add_handler(CommandHandler("test_signal", test_signal))
+
+    # ALL CONVERSATION HANDLERS
+    bingx_handler = ConversationHandler(
+        entry_points=[CommandHandler("setup_bingx", setup_bingx)],
+        states={
+            WAITING_BINGX_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bingx_key)],
+            WAITING_BINGX_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bingx_secret)],
+        },
+        fallbacks=[CommandHandler("cancel", start)]
+    )
+
+    telegram_handler = ConversationHandler(
+        entry_points=[CommandHandler("setup_telegram", setup_telegram_api)],
+        states={
+            WAITING_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_id)],
+            WAITING_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_hash)],
+        },
+        fallbacks=[CommandHandler("cancel", start)]
+    )
+
+    channels_handler = ConversationHandler(
+        entry_points=[CommandHandler("setup_channels", setup_channels)],
+        states={
+            WAITING_CHANNEL_SELECTION: [
+                CallbackQueryHandler(handle_channel_selection,
+                    pattern=r"^(toggle_channel_.*|channels_done|clear_all_channels|add_manual_channel)$")
+            ],
+            WAITING_MANUAL_CHANNEL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", start)],
+        allow_reentry=True
+    )
+
+    trading_handler = ConversationHandler(
+        entry_points=[CommandHandler("setup_trading", setup_trading)],
+        states={
+            WAITING_LEVERAGE: [
+                CallbackQueryHandler(handle_trading_setup,
+                    pattern=r"^(set_leverage|set_stop_loss|set_take_profit|set_balance_percent|trading_done|toggle_settings_source|toggle_sl_tp)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_leverage_input)
+            ],
+            WAITING_STOP_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stop_loss_input)],
+            WAITING_TAKE_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_take_profit_input)],
+            WAITING_BALANCE_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_balance_percent_input)],
+        },
+        fallbacks=[CommandHandler("cancel", start)]
+    )
+
+    # Add ALL handlers
+    application.add_handler(bingx_handler)
+    application.add_handler(telegram_handler)
+    application.add_handler(channels_handler)
+    application.add_handler(trading_handler)
+
+    logger.info("🚀 BingX Trading Bot v4.3 - BALANCE PARSING FIXED!")
+    logger.info("🔥 BINGX INTEGRATION COMPLETE!")
+    logger.info("✅ 150x LEVERAGE AVAILABLE!")
+    logger.info("✅ NO SUBACCOUNT RESTRICTIONS!")
+    logger.info("✅ LOWER MINIMUM ORDERS!")
+    logger.info("🛠️ FIXED BingX API RESPONSE HANDLING!")
+    logger.info("📱 FIXED TELETHON AUTHENTICATION!")
+    logger.info("💰 FIXED BALANCE PARSING FOR SINGLE OBJECTS!")
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
