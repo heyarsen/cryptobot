@@ -3,6 +3,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python telegram_trading_bot_v4_0_BINGX.py"
+    "startCommand": "python futures_bot.py"
   }
 }
