@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Trading Bot v4.5 - BINGX INTEGRATION (COMPLETE WORKING VERSION)
+Telegram Trading Bot v4.6 - COMPLETE WORKING VERSION (API FIXED)
 - BingX API integration (150x leverage, no subaccount restrictions!)
 - Uses bot settings (leverage, SL, TP, position size)
 - Creates SL/TP orders automatically  
@@ -11,7 +11,8 @@ Telegram Trading Bot v4.5 - BINGX INTEGRATION (COMPLETE WORKING VERSION)
 - FIXED: Telethon "EOF when reading a line" error
 - FIXED: BingX balance parsing (single object vs array)
 - FIXED: BingX API v2 parameters (positionSide required)
-- FIXED: Complete file with all handlers
+- FIXED: Proper order success validation
+- FIXED: Real error detection and reporting
 """
 
 import asyncio
@@ -158,7 +159,7 @@ class BingXClient:
                     logger.error(f"Invalid JSON response: {text}")
                     raise Exception(f"BingX API returned invalid JSON: {text}")
 
-                # CRITICAL: Don't throw error on 109414, let the calling code handle it
+                # Don't throw error on non-200 status, let caller handle it
                 return data
 
     async def get_account_balance(self) -> dict:
@@ -545,7 +546,7 @@ class TradingBot:
 
     async def create_sl_tp_orders(self, symbol: str, side: str, quantity: float, entry_price: float, 
                                 sl_price: Optional[float], tp_prices: List[float]) -> Dict[str, Any]:
-        """FIXED: Create stop loss and take profit orders with proper parameters"""
+        """FIXED: Create stop loss and take profit orders with proper parameters and validation"""
         try:
             results = {'stop_loss': None, 'take_profits': []}
 
@@ -567,16 +568,19 @@ class TradingBot:
                         position_side=sl_position_side  # FIXED: Include positionSide
                     )
 
-                    # Better response handling
+                    # CRITICAL: Validate order success
                     order_id = None
                     if isinstance(sl_order, dict):
                         if sl_order.get('code') == 0 and 'data' in sl_order and isinstance(sl_order['data'], dict):
                             order_id = sl_order['data'].get('orderId')
+                            logger.info(f"🎉 Stop Loss SUCCESS: {order_id} @ {sl_price}")
                         elif 'orderId' in sl_order:
                             order_id = sl_order['orderId']
+                            logger.info(f"🎉 Stop Loss SUCCESS: {order_id} @ {sl_price}")
+                        else:
+                            logger.error(f"❌ Stop Loss FAILED: {sl_order}")
 
                     results['stop_loss'] = order_id
-                    logger.info(f"✅ Stop Loss created: {order_id} @ {sl_price}")
                 except Exception as e:
                     logger.error(f"❌ Failed to create Stop Loss: {e}")
 
@@ -587,7 +591,7 @@ class TradingBot:
                     tp_position_side = "LONG" if side == 'Buy' else "SHORT"  # FIXED: Add positionSide
                     tp_quantity = quantity / len(tp_prices)  # Split quantity across TPs
 
-                    logger.info(f"🎯 Creating Take Profit {i+1}: {tp_side} {tp_quantity} {symbol} @ {tp_price} (positionSide: {tp_position_side})")
+                    logger.info(f"🎯 Creating Take Profit {i+1}: {tp_side} {tp_quantity:.6f} {symbol} @ {tp_price} (positionSide: {tp_position_side})")
 
                     tp_order = await self.bingx_client.create_order(
                         symbol=symbol,
@@ -599,20 +603,23 @@ class TradingBot:
                         position_side=tp_position_side  # FIXED: Include positionSide
                     )
 
-                    # Better response handling
+                    # CRITICAL: Validate order success
                     order_id = None
                     if isinstance(tp_order, dict):
                         if tp_order.get('code') == 0 and 'data' in tp_order and isinstance(tp_order['data'], dict):
                             order_id = tp_order['data'].get('orderId')
+                            logger.info(f"🎉 Take Profit {i+1} SUCCESS: {order_id} @ {tp_price}")
                         elif 'orderId' in tp_order:
                             order_id = tp_order['orderId']
+                            logger.info(f"🎉 Take Profit {i+1} SUCCESS: {order_id} @ {tp_price}")
+                        else:
+                            logger.error(f"❌ Take Profit {i+1} FAILED: {tp_order}")
 
                     results['take_profits'].append({
                         'order_id': order_id,
                         'price': tp_price,
                         'quantity': tp_quantity
                     })
-                    logger.info(f"✅ Take Profit {i+1} created: {order_id} @ {tp_price}")
                 except Exception as e:
                     logger.error(f"❌ Failed to create Take Profit {i+1}: {e}")
 
@@ -623,7 +630,7 @@ class TradingBot:
             return {'stop_loss': None, 'take_profits': []}
 
     async def execute_trade(self, signal: TradingSignal, config: BotConfig) -> Dict[str, Any]:
-        """FIXED: Enhanced trade execution with all API fixes"""
+        """FIXED: Enhanced trade execution with proper order validation"""
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
@@ -677,10 +684,13 @@ class TradingBot:
             logger.info(f"⚙️ Using settings: {'Signal' if config.use_signal_settings else 'Bot'}")
             logger.info(f"⚡ Leverage: {leverage}x")
 
-            # Set leverage
+            # Set leverage (ignore errors since it might be already set)
             try:
-                await self.bingx_client.set_leverage(symbol=signal.symbol, leverage=leverage)
-                logger.info(f"✅ Leverage set to {leverage}x")
+                leverage_result = await self.bingx_client.set_leverage(symbol=signal.symbol, leverage=leverage)
+                if leverage_result.get('code') == 0:
+                    logger.info(f"✅ Leverage set to {leverage}x")
+                else:
+                    logger.warning(f"⚠️ Leverage setting: {leverage_result}")
             except Exception as e:
                 logger.warning(f"⚠️ Leverage setting warning: {e}")
 
@@ -709,7 +719,7 @@ class TradingBot:
 
             logger.info(f"📦 Final quantity: {quantity}")
 
-            # FIXED: Execute market order with proper parameters
+            # FIXED: Execute market order with proper parameters AND validation
             side = 'Buy' if signal.trade_type == 'LONG' else 'Sell'  # BingX format
             position_side = "LONG" if signal.trade_type == 'LONG' else "SHORT"  # FIXED: Add positionSide
 
@@ -723,7 +733,7 @@ class TradingBot:
                 position_side=position_side  # FIXED: Include positionSide parameter
             )
 
-            # CRITICAL: Check if order actually succeeded
+            # CRITICAL: Actually check if order succeeded
             order_id = "Unknown"
             order_success = False
 
