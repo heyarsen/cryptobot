@@ -55,7 +55,7 @@ from telethon.errors import ApiIdInvalidError
  WAITING_SETTINGS_SOURCE, WAITING_WEBHOOK_URL) = range(12)
 
 # Your Make.com Webhook URL
-DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/y2od16qhv046ht3lwbx3ovtoj5eu345l"
+DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava"
 
 # Logging setup
 logging.basicConfig(
