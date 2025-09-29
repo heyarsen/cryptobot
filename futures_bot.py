@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram Trading Bot v3.0 - ENHANCED VERSION
+Telegram Trading Bot v3.0 - ENHANCED VERSION WITH GOOGLE SHEETS
 - Uses bot settings (leverage, SL, TP, position size)
 - Creates SL/TP orders automatically  
 - Option to use signal settings vs bot settings
 - Enhanced signal parsing for Russian formats
 - Interactive setup with buttons
+- Google Sheets integration for trade logging
+- Balance checker functionality
+- $5 minimum order enforcement
 """
 
 import asyncio
@@ -44,13 +47,17 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Channel, PeerChannel
 from telethon.errors import ApiIdInvalidError
 
+# Google Sheets integration
+import gspread
+from google.oauth2.service_account import Credentials
+
 # Conversation states
 (WAITING_BINANCE_KEY, WAITING_BINANCE_SECRET,
  WAITING_TELEGRAM_ID, WAITING_TELEGRAM_HASH,
  WAITING_LEVERAGE, WAITING_STOP_LOSS,
  WAITING_TAKE_PROFIT, WAITING_BALANCE_PERCENT,
  WAITING_CHANNEL_SELECTION, WAITING_MANUAL_CHANNEL,
- WAITING_SETTINGS_SOURCE) = range(11)
+ WAITING_SETTINGS_SOURCE, WAITING_GOOGLE_SHEETS_SETUP) = range(12)
 
 # Logging setup
 logging.basicConfig(
@@ -91,12 +98,98 @@ class BotConfig:
     balance_percent: float = 1.0
     monitored_channels: List[str] = None
     user_id: int = 0
-    use_signal_settings: bool = True  # NEW: Choose signal vs bot settings
-    create_sl_tp: bool = True  # NEW: Auto create SL/TP orders
+    use_signal_settings: bool = True  # Choose signal vs bot settings
+    create_sl_tp: bool = True  # Auto create SL/TP orders
+    google_sheets_enabled: bool = False
+    google_credentials_path: str = ""
+    spreadsheet_name: str = "Trading Bot Logs"
+    minimum_order_usd: float = 5.0  # Minimum $5 order
 
     def __post_init__(self):
         if self.monitored_channels is None:
             self.monitored_channels = []
+
+class GoogleSheetsLogger:
+    def __init__(self, credentials_path: str, spreadsheet_name: str):
+        self.credentials_path = credentials_path
+        self.spreadsheet_name = spreadsheet_name
+        self.client = None
+        self.sheet = None
+        self.setup_sheet()
+
+    def setup_sheet(self):
+        """Setup Google Sheets connection"""
+        try:
+            if not os.path.exists(self.credentials_path):
+                logger.error(f"❌ Google credentials file not found: {self.credentials_path}")
+                return False
+
+            # Define the scope
+            scope = [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive"
+            ]
+
+            # Load credentials
+            creds = Credentials.from_service_account_file(self.credentials_path, scopes=scope)
+            self.client = gspread.authorize(creds)
+
+            # Open or create spreadsheet
+            try:
+                self.sheet = self.client.open(self.spreadsheet_name).sheet1
+                logger.info(f"✅ Connected to existing spreadsheet: {self.spreadsheet_name}")
+            except gspread.SpreadsheetNotFound:
+                # Create new spreadsheet
+                self.sheet = self.client.create(self.spreadsheet_name).sheet1
+                logger.info(f"✅ Created new spreadsheet: {self.spreadsheet_name}")
+
+            # Setup headers if empty
+            if not self.sheet.get_all_values():
+                headers = [
+                    'Timestamp', 'Symbol', 'Trade Type', 'Entry Price', 'Quantity', 
+                    'Leverage', 'Order ID', 'Stop Loss', 'Take Profit', 'Status', 
+                    'Balance Used', 'Channel ID', 'PNL', 'Notes'
+                ]
+                self.sheet.append_row(headers)
+                logger.info("📊 Headers added to spreadsheet")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Google Sheets setup error: {e}")
+            return False
+
+    def log_trade(self, trade_ Dict[str, Any]):
+        """Log trade to Google Sheets"""
+        try:
+            if not self.sheet:
+                return False
+
+            # Prepare row data
+            row = [
+                trade_data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                trade_data.get('symbol', ''),
+                trade_data.get('trade_type', ''),
+                trade_data.get('entry_price', ''),
+                trade_data.get('quantity', ''),
+                trade_data.get('leverage', ''),
+                trade_data.get('order_id', ''),
+                trade_data.get('stop_loss', ''),
+                trade_data.get('take_profit', ''),
+                trade_data.get('status', ''),
+                trade_data.get('balance_used', ''),
+                trade_data.get('channel_id', ''),
+                trade_data.get('pnl', ''),
+                trade_data.get('notes', '')
+            ]
+
+            self.sheet.append_row(row)
+            logger.info(f"📊 Trade logged to Google Sheets: {trade_data.get('symbol')} {trade_data.get('trade_type')}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error logging to Google Sheets: {e}")
+            return False
 
 class SignalDetector:
     @staticmethod
@@ -252,9 +345,10 @@ class TradingBot:
         self.config = BotConfig()
         self.binance_client: Optional[BinanceClient] = None
         self.user_monitoring_clients: Dict[int, TelegramClient] = {}
-        self.user_data: Dict[int, BotConfig] = {}
+        self.user_ Dict[int, BotConfig] = {}
         self.active_monitoring = {}
         self.monitoring_tasks = {}
+        self.sheets_loggers: Dict[int, GoogleSheetsLogger] = {}
 
     def parse_trading_signal(self, message: str, channel_id: str) -> Optional[TradingSignal]:
         """Enhanced signal parsing with Russian support"""
@@ -297,10 +391,77 @@ class TradingBot:
             return None
 
     def get_user_config(self, user_id: int) -> BotConfig:
-        if user_id not in self.user_data:
+        if user_id not in self.user_
             self.user_data[user_id] = BotConfig()
             self.user_data[user_id].user_id = user_id
         return self.user_data[user_id]
+
+    def setup_google_sheets(self, user_id: int) -> bool:
+        """Setup Google Sheets logger for user"""
+        try:
+            config = self.get_user_config(user_id)
+            if not config.google_sheets_enabled or not config.google_credentials_path:
+                return False
+
+            sheets_logger = GoogleSheetsLogger(
+                config.google_credentials_path, 
+                config.spreadsheet_name
+            )
+            
+            if sheets_logger.sheet:
+                self.sheets_loggers[user_id] = sheets_logger
+                logger.info(f"✅ Google Sheets setup completed for user {user_id}")
+                return True
+            
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ Google Sheets setup error: {e}")
+            return False
+
+    async def get_account_balance(self, config: BotConfig) -> Dict[str, float]:
+        """Get detailed account balance information"""
+        try:
+            if not self.binance_client:
+                success = await self.setup_binance_client(config)
+                if not success:
+                    return {'success': False, 'error': 'Failed to connect to Binance API'}
+
+            # Get futures account balance
+            balance_info = self.binance_client.futures_account_balance()
+            account_info = self.binance_client.futures_account()
+
+            usdt_info = {'balance': 0, 'available': 0, 'wallet_balance': 0}
+
+            # Find USDT balance from balance info
+            for asset in balance_info:
+                if asset['asset'] == 'USDT':
+                    usdt_info['balance'] = float(asset['balance'])
+                    usdt_info['available'] = float(asset['withdrawAvailable'])
+                    break
+
+            # Get wallet balance from account info
+            for asset in account_info['assets']:
+                if asset['asset'] == 'USDT':
+                    usdt_info['wallet_balance'] = float(asset['walletBalance'])
+                    break
+
+            # Calculate total wallet balance
+            total_wallet_balance = float(account_info.get('totalWalletBalance', 0))
+            
+            return {
+                'success': True,
+                'usdt_balance': usdt_info['balance'],
+                'usdt_available': usdt_info['available'],
+                'usdt_wallet_balance': usdt_info['wallet_balance'],
+                'total_wallet_balance': total_wallet_balance,
+                'total_unrealized_pnl': float(account_info.get('totalUnrealizedProfit', 0)),
+                'total_margin_balance': float(account_info.get('totalMarginBalance', 0))
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error getting account balance: {e}")
+            return {'success': False, 'error': str(e)}
 
     async def setup_binance_client(self, config: BotConfig) -> bool:
         try:
@@ -420,7 +581,7 @@ class TradingBot:
             return {'stop_loss': None, 'take_profits': []}
 
     async def execute_trade(self, signal: TradingSignal, config: BotConfig) -> Dict[str, Any]:
-        """Enhanced trade execution with SL/TP orders and configurable settings"""
+        """Enhanced trade execution with SL/TP orders and minimum order enforcement"""
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
@@ -450,8 +611,8 @@ class TradingBot:
                             logger.info(f"✅ Found USDT balance (fallback): {usdt_balance}")
                             break
 
-                if usdt_balance <= 5:
-                    return {'success': False, 'error': f'Insufficient USDT balance: {usdt_balance}'}
+                if usdt_balance <= config.minimum_order_usd:
+                    return {'success': False, 'error': f'Insufficient USDT balance: {usdt_balance} (minimum ${config.minimum_order_usd} required)'}
 
             except Exception as e:
                 logger.error(f"❌ Error getting account balance: {e}")
@@ -483,11 +644,16 @@ class TradingBot:
 
             # Calculate position size using BOT settings (always use bot balance %)
             trade_amount = usdt_balance * (config.balance_percent / 100)
+            
+            # Enforce minimum order size
+            if trade_amount < config.minimum_order_usd:
+                return {'success': False, 'error': f'Trade amount ${trade_amount:.2f} below minimum ${config.minimum_order_usd}'}
+            
             raw_quantity = (trade_amount * leverage) / entry_price
 
             logger.info(f"🧮 Trade calculation:")
             logger.info(f"   Balance: {usdt_balance} USDT")
-            logger.info(f"   Trade amount: {trade_amount} USDT ({config.balance_percent}%)")
+            logger.info(f"   Trade amount: ${trade_amount:.2f} ({config.balance_percent}%)")
             logger.info(f"   Entry price: {entry_price}")
             logger.info(f"   Raw quantity: {raw_quantity}")
 
@@ -530,6 +696,11 @@ class TradingBot:
 
                 if quantity <= 0:
                     return {'success': False, 'error': 'Calculated quantity is zero or negative'}
+
+                # Final check: ensure order value meets minimum
+                order_value = quantity * entry_price / leverage
+                if order_value < config.minimum_order_usd:
+                    return {'success': False, 'error': f'Order value ${order_value:.2f} below minimum ${config.minimum_order_usd}'}
 
             except Exception as e:
                 logger.error(f"❌ Error getting symbol info: {e}")
@@ -586,6 +757,26 @@ class TradingBot:
                     signal.symbol, side, quantity, current_price, sl_price, tp_prices
                 )
 
+                # Log to Google Sheets
+                if config.google_sheets_enabled and config.user_id in self.sheets_loggers:
+                    trade_data = {
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'symbol': signal.symbol,
+                        'trade_type': signal.trade_type,
+                        'entry_price': current_price,
+                        'quantity': quantity,
+                        'leverage': leverage,
+                        'order_id': order['orderId'],
+                        'stop_loss': sl_price,
+                        'take_profit': ', '.join([str(tp) for tp in tp_prices]),
+                        'status': 'EXECUTED',
+                        'balance_used': f"${trade_amount:.2f}",
+                        'channel_id': signal.channel_id,
+                        'pnl': '',
+                        'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'}"
+                    }
+                    self.sheets_loggers[config.user_id].log_trade(trade_data)
+
                 return {
                     'success': True,
                     'order_id': order['orderId'],
@@ -596,20 +787,63 @@ class TradingBot:
                     'stop_loss_id': sl_tp_result['stop_loss'],
                     'take_profit_ids': sl_tp_result['take_profits'],
                     'sl_price': sl_price,
-                    'tp_prices': tp_prices
+                    'tp_prices': tp_prices,
+                    'order_value': order_value
                 }
             else:
+                # Log to Google Sheets without SL/TP
+                if config.google_sheets_enabled and config.user_id in self.sheets_loggers:
+                    trade_data = {
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'symbol': signal.symbol,
+                        'trade_type': signal.trade_type,
+                        'entry_price': current_price,
+                        'quantity': quantity,
+                        'leverage': leverage,
+                        'order_id': order['orderId'],
+                        'stop_loss': '',
+                        'take_profit': '',
+                        'status': 'EXECUTED',
+                        'balance_used': f"${trade_amount:.2f}",
+                        'channel_id': signal.channel_id,
+                        'pnl': '',
+                        'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'}, No SL/TP"
+                    }
+                    self.sheets_loggers[config.user_id].log_trade(trade_data)
+
                 return {
                     'success': True,
                     'order_id': order['orderId'],
                     'symbol': signal.symbol,
                     'quantity': quantity,
                     'price': current_price,
-                    'leverage': leverage
+                    'leverage': leverage,
+                    'order_value': order_value
                 }
 
         except Exception as e:
             logger.error(f"❌ Trade execution error: {e}")
+            
+            # Log failed trade to Google Sheets
+            if config.google_sheets_enabled and config.user_id in self.sheets_loggers:
+                trade_data = {
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'symbol': signal.symbol,
+                    'trade_type': signal.trade_type,
+                    'entry_price': '',
+                    'quantity': '',
+                    'leverage': '',
+                    'order_id': '',
+                    'stop_loss': '',
+                    'take_profit': '',
+                    'status': 'FAILED',
+                    'balance_used': '',
+                    'channel_id': signal.channel_id,
+                    'pnl': '',
+                    'notes': f'Error: {str(e)[:100]}'
+                }
+                self.sheets_loggers[config.user_id].log_trade(trade_data)
+            
             return {'success': False, 'error': str(e)}
 
     async def start_monitoring(self, user_id: int, bot_instance) -> bool:
@@ -625,6 +859,10 @@ class TradingBot:
                 if not success:
                     return False
                 telethon_client = self.user_monitoring_clients[user_id]
+
+            # Setup Google Sheets if enabled
+            if config.google_sheets_enabled:
+                self.setup_google_sheets(user_id)
 
             @telethon_client.on(events.NewMessage)
             async def message_handler(event):
@@ -680,7 +918,8 @@ class TradingBot:
 🆔 Order ID: {result['order_id']}
 📦 Quantity: {result['quantity']}
 💲 Entry: {result['price']}
-⚡ Leverage: {result['leverage']}x"""
+⚡ Leverage: {result['leverage']}x
+💵 Order Value: ${result['order_value']:.2f}"""
 
                             if 'sl_price' in result and result['sl_price']:
                                 notification += f"\n🛑 Stop Loss: {result['sl_price']:.6f}"
@@ -691,6 +930,9 @@ class TradingBot:
                                 notification += f"\n🎯 Take Profits:"
                                 for i, tp in enumerate(result['take_profit_ids']):
                                     notification += f"\n  TP{i+1}: {tp['price']:.6f} (ID: {tp['order_id']})"
+
+                            if user_config.google_sheets_enabled:
+                                notification += "\n📊 Logged to Google Sheets"
 
                             notification += f"\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
                             notification += f"\n\n🎉 Position is LIVE!"
@@ -767,10 +1009,13 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
                             callback_data="toggle_settings_source")],
         [InlineKeyboardButton(f"📊 SL/TP Orders: {'ON' if config.create_sl_tp else 'OFF'}", 
                             callback_data="toggle_sl_tp")],
+        [InlineKeyboardButton(f"📋 Google Sheets: {'ON' if config.google_sheets_enabled else 'OFF'}", 
+                            callback_data="toggle_sheets")],
         [InlineKeyboardButton(f"⚡ Leverage: {config.leverage}x", callback_data="set_leverage")],
         [InlineKeyboardButton(f"🛑 Stop Loss: {config.stop_loss_percent}%", callback_data="set_stop_loss")],
         [InlineKeyboardButton(f"🎯 Take Profit: {config.take_profit_percent}%", callback_data="set_take_profit")],
         [InlineKeyboardButton(f"💰 Balance: {config.balance_percent}%", callback_data="set_balance_percent")],
+        [InlineKeyboardButton(f"💵 Min Order: ${config.minimum_order_usd}", callback_data="set_min_order")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
 
@@ -787,17 +1032,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 📊 Enhanced Russian signal parsing
 • 💰 Uses your configured position sizes
 • 🔧 Interactive setup with buttons
+• 📋 Google Sheets integration for trade logging
+• 💵 $5 minimum order enforcement
+• 💳 Advanced balance checking
 
 <b>Setup Steps:</b>
 1️⃣ /setup_binance - Binance API
 2️⃣ /setup_telegram - Telegram API  
 3️⃣ /setup_channels - Select channels
 4️⃣ /setup_trading - Trading params + SL/TP
-5️⃣ /start_monitoring - Begin trading
+5️⃣ /setup_sheets - Google Sheets (optional)
+6️⃣ /start_monitoring - Begin trading
 
 <b>Commands:</b>
 /help - All commands
 /status - Configuration
+/balance - Check account balance
 /test_signal - Test parsing
 """
     await update.message.reply_text(welcome_text, parse_mode='HTML')
@@ -810,19 +1060,55 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /setup_telegram - Telegram API ✅  
 /setup_channels - Channel selection ✅
 /setup_trading - Trading parameters + SL/TP ✅
+/setup_sheets - Google Sheets integration ✅
 
 <b>Control:</b>
 /start_monitoring - Start monitoring ✅
 /stop_monitoring - Stop monitoring ✅
 /status - Current status ✅
+/balance - Check account balance ✅
 /test_signal - Test signal parsing ✅
 
 🎉 <b>NEW FEATURES:</b>
-• Choose Signal vs Bot settings
-• Auto SL/TP order creation
-• Enhanced parsing for Russian signals
+• Google Sheets logging for all trades
+• Advanced balance checking
+• $5 minimum order enforcement
+• Enhanced error handling and logging
 """
     await update.message.reply_text(help_text, parse_mode='HTML')
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check account balance"""
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    if not config.binance_api_key or not config.binance_api_secret:
+        await update.message.reply_text("❌ <b>Binance API not configured!</b> Use /setup_binance first.", parse_mode='HTML')
+        return
+
+    await update.message.reply_text("💰 <b>Checking account balance...</b>", parse_mode='HTML')
+
+    balance_info = await trading_bot.get_account_balance(config)
+
+    if balance_info['success']:
+        balance_text = f"""💳 <b>Account Balance</b>
+
+💰 <b>USDT Balance:</b> {balance_info['usdt_balance']:.2f} USDT
+🔓 <b>Available:</b> {balance_info['usdt_available']:.2f} USDT
+💼 <b>Wallet Balance:</b> {balance_info['usdt_wallet_balance']:.2f} USDT
+📊 <b>Total Margin:</b> {balance_info['total_margin_balance']:.2f} USDT
+📈 <b>Unrealized PNL:</b> {balance_info['total_unrealized_pnl']:.2f} USDT
+
+💵 <b>Trade Calculations:</b>
+Position Size ({config.balance_percent}%): ${balance_info['usdt_balance'] * config.balance_percent / 100:.2f}
+Minimum Order: ${config.minimum_order_usd}
+Status: {'✅ Can Trade' if balance_info['usdt_balance'] >= config.minimum_order_usd else '❌ Insufficient Balance'}
+
+⏰ Updated: {datetime.now().strftime('%H:%M:%S')}"""
+    else:
+        balance_text = f"❌ <b>Balance Check Failed</b>\n\n🚨 Error: {balance_info['error']}"
+
+    await update.message.reply_text(balance_text, parse_mode='HTML')
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -830,6 +1116,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
     sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
+    sheets_status = "🟢 ON" if config.google_sheets_enabled else "🔴 OFF"
 
     status_text = f"""📊 <b>Bot Status Dashboard v3.0</b>
 
@@ -838,6 +1125,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 {'✅' if config.telegram_api_id else '❌'} Telegram API  
 📡 Channels: <b>{len(config.monitored_channels)}</b>
 🔄 Monitoring: {'🟢 Active' if trading_bot.active_monitoring.get(user_id) else '🔴 Inactive'}
+📋 Google Sheets: <b>{sheets_status}</b>
 
 ⚙️ <b>Trading Settings:</b>
 🎯 Settings Source: <b>{settings_source}</b>
@@ -846,13 +1134,54 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🛑 Bot Stop Loss: <b>{config.stop_loss_percent}%</b>
 🎯 Bot Take Profit: <b>{config.take_profit_percent}%</b>
 💰 Position Size: <b>{config.balance_percent}%</b>
+💵 Minimum Order: <b>${config.minimum_order_usd}</b>
 
 ✅ <b>Enhanced Features:</b>
 • Auto SL/TP orders
 • Russian signal parsing
-• Configurable settings priority
+• Google Sheets logging
+• Advanced balance checking
+• $5 minimum order enforcement
 """
     await update.message.reply_text(status_text, parse_mode='HTML')
+
+# ================== GOOGLE SHEETS SETUP ==================
+
+async def setup_google_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Setup Google Sheets integration"""
+    sheets_help = """📋 <b>Google Sheets Setup</b>
+
+<b>Prerequisites:</b>
+1️⃣ Go to Google Cloud Console
+2️⃣ Create project & enable Google Sheets API
+3️⃣ Create Service Account credentials
+4️⃣ Download JSON key file
+5️⃣ Share your spreadsheet with service account email
+
+<b>Steps:</b>
+1. Put your credentials.json file in the same folder as this bot
+2. Use /toggle_sheets to enable Google Sheets
+3. Trades will be automatically logged to "Trading Bot Logs" spreadsheet
+
+<b>Current Status:</b>"""
+    
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    
+    if config.google_sheets_enabled:
+        sheets_help += f"""
+✅ Google Sheets: ENABLED
+📁 Credentials: {config.google_credentials_path or 'credentials.json'}
+📊 Spreadsheet: {config.spreadsheet_name}
+"""
+    else:
+        sheets_help += """
+❌ Google Sheets: DISABLED
+
+Use /toggle_sheets in trading setup to enable.
+"""
+
+    await update.message.reply_text(sheets_help, parse_mode='HTML')
 
 # ================== BINANCE SETUP ==================
 
@@ -865,7 +1194,7 @@ Send your Binance API Key:
 ⚠️ <b>Requirements:</b>
 • Futures trading enabled
 • API key with Futures permissions
-• Sufficient balance (minimum 5 USDT)""", parse_mode='HTML')
+• Sufficient balance (minimum $5 USDT)""", parse_mode='HTML')
     return WAITING_BINANCE_KEY
 
 async def handle_binance_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1061,52 +1390,37 @@ Use /setup_trading to configure parameters""",
 
     return ConversationHandler.END
 
-# ================== ENHANCED TRADING SETUP ==================
+# ================== TRADING SETUP ==================
 
 async def setup_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     keyboard_markup = create_settings_keyboard(user_id)
 
     await update.message.reply_text(
-        """⚙️ <b>Enhanced Trading Setup v3.0</b>
-
-🎯 <b>Settings Source:</b>
-• <b>Signal</b>: Use leverage/SL/TP from signals (fallback to bot)
-• <b>Bot</b>: Always use your configured settings
-
-📊 <b>SL/TP Orders:</b>
-• <b>ON</b>: Auto-create stop loss & take profit orders
-• <b>OFF</b>: Only create main position
-
-Click any parameter to change it:""",
+        "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
         reply_markup=keyboard_markup,
         parse_mode='HTML'
     )
-    return WAITING_LEVERAGE
 
-async def handle_trading_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return WAITING_SETTINGS_SOURCE
+
+async def handle_trading_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
-    await query.answer()
+    try:
+        await query.answer()
+    except:
+        pass
 
     if query.data == "trading_done":
-        settings_source = "Signal" if config.use_signal_settings else "Bot"
-        sl_tp_status = "ON" if config.create_sl_tp else "OFF"
-
         await query.edit_message_text(
-            f"""✅ <b>Trading setup complete!</b>
+            """✅ <b>Trading configuration complete!</b>
 
-⚙️ <b>Configuration:</b>
-🎯 Settings Source: <b>{settings_source}</b>
-📊 SL/TP Creation: <b>{sl_tp_status}</b>
-⚡ Leverage: <b>{config.leverage}x</b>
-🛑 Stop Loss: <b>{config.stop_loss_percent}%</b>
-🎯 Take Profit: <b>{config.take_profit_percent}%</b>
-💰 Position Size: <b>{config.balance_percent}%</b>
+All settings saved successfully.
 
-Ready to start: /start_monitoring""", 
+Next: /start_monitoring to begin trading""",
             parse_mode='HTML'
         )
         return ConversationHandler.END
@@ -1114,313 +1428,305 @@ Ready to start: /start_monitoring""",
     elif query.data == "toggle_settings_source":
         config.use_signal_settings = not config.use_signal_settings
         keyboard_markup = create_settings_keyboard(user_id)
-        await query.edit_message_reply_markup(reply_markup=keyboard_markup)
-        return WAITING_LEVERAGE
+        await query.edit_message_text(
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
 
     elif query.data == "toggle_sl_tp":
         config.create_sl_tp = not config.create_sl_tp
         keyboard_markup = create_settings_keyboard(user_id)
-        await query.edit_message_reply_markup(reply_markup=keyboard_markup)
-        return WAITING_LEVERAGE
+        await query.edit_message_text(
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+
+    elif query.data == "toggle_sheets":
+        config.google_sheets_enabled = not config.google_sheets_enabled
+        if config.google_sheets_enabled and not config.google_credentials_path:
+            config.google_credentials_path = "credentials.json"  # Default path
+        keyboard_markup = create_settings_keyboard(user_id)
+        await query.edit_message_text(
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
 
     elif query.data == "set_leverage":
-        await query.edit_message_text("⚡ <b>Set Bot Leverage</b>\n\nSend leverage (1-125):", parse_mode='HTML')
+        await query.edit_message_text(
+            "⚡ <b>Set Leverage</b>\n\nSend leverage value (1-125):",
+            parse_mode='HTML'
+        )
         return WAITING_LEVERAGE
 
     elif query.data == "set_stop_loss":
-        await query.edit_message_text("🛑 <b>Set Bot Stop Loss %</b>\n\nSend percentage (0.5-20):", parse_mode='HTML')
+        await query.edit_message_text(
+            "🛑 <b>Set Stop Loss</b>\n\nSend stop loss percentage (e.g., 5 for 5%):",
+            parse_mode='HTML'
+        )
         return WAITING_STOP_LOSS
 
     elif query.data == "set_take_profit":
-        await query.edit_message_text("🎯 <b>Set Bot Take Profit %</b>\n\nSend percentage (1-100):", parse_mode='HTML')
+        await query.edit_message_text(
+            "🎯 <b>Set Take Profit</b>\n\nSend take profit percentage (e.g., 10 for 10%):",
+            parse_mode='HTML'
+        )
         return WAITING_TAKE_PROFIT
 
     elif query.data == "set_balance_percent":
-        await query.edit_message_text("💰 <b>Set Position Size %</b>\n\nSend percentage per trade (0.1-10):", parse_mode='HTML')
+        await query.edit_message_text(
+            "💰 <b>Set Balance Percentage</b>\n\nSend percentage of balance to use per trade (e.g., 1 for 1%):",
+            parse_mode='HTML'
+        )
         return WAITING_BALANCE_PERCENT
 
-async def handle_leverage_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif query.data == "set_min_order":
+        await query.edit_message_text(
+            "💵 <b>Set Minimum Order</b>\n\nSend minimum order amount in USD (e.g., 5 for $5):",
+            parse_mode='HTML'
+        )
+        return WAITING_BALANCE_PERCENT  # Reuse this state
+
+    return WAITING_SETTINGS_SOURCE
+
+async def handle_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
     try:
-        leverage = int(update.message.text.strip())
+        leverage = int(update.message.text)
         if 1 <= leverage <= 125:
             config.leverage = leverage
-            await update.message.reply_text(f"✅ <b>Bot leverage set to {leverage}x</b>", parse_mode='HTML')
+            await update.message.reply_text(f"✅ <b>Leverage set to {leverage}x</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ Invalid! Enter 1-125", parse_mode='HTML')
-            return WAITING_LEVERAGE
+            await update.message.reply_text("❌ <b>Invalid leverage!</b> Must be between 1-125", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
-        return WAITING_LEVERAGE
+        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number between 1-125", parse_mode='HTML')
 
     return ConversationHandler.END
 
-async def handle_stop_loss_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
     try:
-        stop_loss = float(update.message.text.strip())
-        if 0.1 <= stop_loss <= 50:
-            config.stop_loss_percent = stop_loss
-            await update.message.reply_text(f"✅ <b>Bot stop loss set to {stop_loss}%</b>", parse_mode='HTML')
+        sl_percent = float(update.message.text)
+        if 0.1 <= sl_percent <= 50:
+            config.stop_loss_percent = sl_percent
+            await update.message.reply_text(f"✅ <b>Stop Loss set to {sl_percent}%</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ Invalid! Enter 0.1-50", parse_mode='HTML')
-            return WAITING_STOP_LOSS
+            await update.message.reply_text("❌ <b>Invalid percentage!</b> Must be between 0.1-50%", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
-        return WAITING_STOP_LOSS
+        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number (e.g., 5)", parse_mode='HTML')
 
     return ConversationHandler.END
 
-async def handle_take_profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id  
-    config = trading_bot.get_user_config(user_id)
-
-    try:
-        take_profit = float(update.message.text.strip())
-        if 1 <= take_profit <= 100:
-            config.take_profit_percent = take_profit
-            await update.message.reply_text(f"✅ <b>Bot take profit set to {take_profit}%</b>", parse_mode='HTML')
-        else:
-            await update.message.reply_text("❌ Invalid! Enter 1-100", parse_mode='HTML')
-            return WAITING_TAKE_PROFIT
-    except ValueError:
-        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
-        return WAITING_TAKE_PROFIT
-
-    return ConversationHandler.END
-
-async def handle_balance_percent_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_take_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
     try:
-        balance_percent = float(update.message.text.strip())
-        if 0.1 <= balance_percent <= 20:
-            config.balance_percent = balance_percent
-            await update.message.reply_text(f"✅ <b>Position size set to {balance_percent}%</b>", parse_mode='HTML')
+        tp_percent = float(update.message.text)
+        if 0.1 <= tp_percent <= 100:
+            config.take_profit_percent = tp_percent
+            await update.message.reply_text(f"✅ <b>Take Profit set to {tp_percent}%</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ Invalid! Enter 0.1-20", parse_mode='HTML')
-            return WAITING_BALANCE_PERCENT
+            await update.message.reply_text("❌ <b>Invalid percentage!</b> Must be between 0.1-100%", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ Invalid! Enter a number", parse_mode='HTML')
-        return WAITING_BALANCE_PERCENT
+        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number (e.g., 10)", parse_mode='HTML')
 
     return ConversationHandler.END
 
-# ================== MONITORING COMMANDS ==================
-
-async def start_monitoring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_balance_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
-    missing = []
-    if not config.binance_api_key:
-        missing.append("/setup_binance")
-    if not config.telegram_api_id:
-        missing.append("/setup_telegram")
+    try:
+        # Check if this is minimum order or balance percent based on the value range
+        value = float(update.message.text)
+        if value >= 1 and value <= 100:
+            if value <= 10:  # Likely balance percentage
+                config.balance_percent = value
+                await update.message.reply_text(f"✅ <b>Balance percentage set to {value}%</b>", parse_mode='HTML')
+            else:  # Likely minimum order amount
+                config.minimum_order_usd = value
+                await update.message.reply_text(f"✅ <b>Minimum order set to ${value}</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ <b>Invalid value!</b> Send a reasonable number", parse_mode='HTML')
+    except ValueError:
+        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number", parse_mode='HTML')
+
+    return ConversationHandler.END
+
+# ================== MONITORING CONTROLS ==================
+
+async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    # Validate configuration
+    if not config.binance_api_key or not config.telegram_api_id:
+        await update.message.reply_text("❌ <b>Configuration incomplete!</b> Complete setup first.", parse_mode='HTML')
+        return
+
     if not config.monitored_channels:
-        missing.append("/setup_channels")
-
-    if missing:
-        await update.message.reply_text(f"❌ <b>Setup incomplete!</b>\n\nMissing: {' '.join(missing)}", parse_mode='HTML')
+        await update.message.reply_text("❌ <b>No channels configured!</b> Use /setup_channels first.", parse_mode='HTML')
         return
 
-    if trading_bot.active_monitoring.get(user_id):
-        await update.message.reply_text("⚠️ <b>Already monitoring!</b> Use /stop_monitoring first", parse_mode='HTML')
-        return
-
-    await update.message.reply_text("🚀 <b>Starting enhanced monitoring...</b>", parse_mode='HTML')
+    await update.message.reply_text("🚀 <b>Starting monitoring...</b>", parse_mode='HTML')
 
     success = await trading_bot.start_monitoring(user_id, context.bot)
 
     if success:
-        settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
-        sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
+        status_msg = f"""✅ <b>MONITORING STARTED!</b>
 
-        await update.message.reply_text(
-            f"""🟢 <b>ENHANCED MONITORING STARTED!</b>
+📡 Monitoring: <b>{len(config.monitored_channels)}</b> channels
+⚙️ Settings: {'Signal Priority' if config.use_signal_settings else 'Bot Settings'}
+📊 SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'}
+📋 Google Sheets: {'Enabled' if config.google_sheets_enabled else 'Disabled'}
+💵 Min Order: ${config.minimum_order_usd}
 
-📡 Watching <b>{len(config.monitored_channels)}</b> channels
-⚙️ Settings Source: <b>{settings_source}</b>
-📊 SL/TP Creation: <b>{sl_tp_status}</b>
-⚡ Bot Leverage: <b>{config.leverage}x</b>
-🛑 Bot Stop Loss: <b>{config.stop_loss_percent}%</b>
-🎯 Bot Take Profit: <b>{config.take_profit_percent}%</b>
-💰 Position Size: <b>{config.balance_percent}%</b>
+🎯 <b>Ready to trade!</b>
+Use /stop_monitoring to stop."""
 
-✅ <b>Enhanced Features Active:</b>
-• Auto SL/TP order creation
-• Russian signal parsing (Плечо, Сл, Тп)
-• Configurable settings priority
-• Improved error handling
+        if config.google_sheets_enabled:
+            status_msg += f"\n\n📊 Trades will be logged to: {config.spreadsheet_name}"
 
-🎯 <b>Ready for advanced trading!</b>
-Send signals like:
-#BAKE/USDT
-LONG
-Плечо: 5x-50x
-Сл:На ваше усмотрение 
-Тп: 60%+""",
-            parse_mode='HTML'
-        )
+        await update.message.reply_text(status_msg, parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ <b>Failed to start monitoring</b>", parse_mode='HTML')
+        await update.message.reply_text("❌ <b>Failed to start monitoring!</b> Check configuration.", parse_mode='HTML')
 
-async def stop_monitoring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
-    if not trading_bot.active_monitoring.get(user_id):
-        await update.message.reply_text("ℹ️ <b>Not currently monitoring</b>", parse_mode='HTML')
-        return
-
     trading_bot.active_monitoring[user_id] = False
-    await update.message.reply_text("🔴 <b>Enhanced monitoring stopped</b>", parse_mode='HTML')
 
-# ================== TEST SIGNAL ==================
+    await update.message.reply_text("🛑 <b>Monitoring stopped!</b>", parse_mode='HTML')
+
+# ================== TEST FUNCTIONS ==================
 
 async def test_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    samples = [
-        """🚀 SIGNAL ALERT 🚀
-#BTCUSDT LONG
-Entry: 109642
-Target 1: 109890
-Target 2: 110350
-Stop Loss: 109000
+    test_signals = [
+        """#BTCUSDT
+LONG
+Entry: 45000
+TP1: 46000
+TP2: 47000
+SL: 44000
 Leverage: 10x""",
 
-        """#BAKE/USDT
-LONG
-Плечо: 5x-50x
-Сл:На ваше усмотрение 
-Тп: 60%+
-Осторожно 🛑""",
+        """#ETHUSDT
+SHORT
+Вход: 3000
+Тп1: 2900
+Тп2: 2800
+Сл: 3100
+Плечо: 5x""",
 
-        """#SOL/USDT
-LONG
-Entry: 135.5
-Плечо: 20х
-Сл: 130.0
-Тп: 145.0"""
+        """🚀 #SOLUSDT ЛОНГ 🚀
+📈 Entry: 150.50
+🎯 Target 1: 155.00
+🎯 Target 2: 160.00
+🛑 Stop Loss: 145.00
+⚡ 15x"""
     ]
 
     results = []
-    for i, msg in enumerate(samples, 1):
-        signal = trading_bot.parse_trading_signal(msg, "test")
+    for i, test_msg in enumerate(test_signals, 1):
+        signal = trading_bot.parse_trading_signal(test_msg, "test_channel")
         if signal:
-            result_text = f"✅ Sample {i}: {signal.symbol} {signal.trade_type}"
-            if signal.entry_price:
-                result_text += f" @ {signal.entry_price}"
-            if signal.leverage:
-                result_text += f" ({signal.leverage}x)"
-            results.append(result_text)
+            results.append(f"""<b>Test {i}: ✅ PARSED</b>
+Symbol: {signal.symbol}
+Type: {signal.trade_type}
+Entry: {signal.entry_price or 'N/A'}
+SL: {signal.stop_loss or 'N/A'}
+TP: {signal.take_profit or 'N/A'}
+Leverage: {signal.leverage or 'N/A'}""")
         else:
-            results.append(f"❌ Sample {i}: Failed to parse")
+            results.append(f"<b>Test {i}: ❌ FAILED</b>")
 
-    await update.message.reply_text(
-        f"""🧪 <b>Enhanced Signal Parser Test v3.0</b>
+    test_result = "🧪 <b>Signal Parser Test Results</b>\n\n" + "\n\n".join(results)
+    await update.message.reply_text(test_result, parse_mode='HTML')
 
-{chr(10).join(results)}
+# ================== CONVERSATION HANDLERS ==================
 
-✅ <b>Enhanced Features:</b>
-• Russian parsing (Плечо, Сл, Тп)
-• Multiple entry patterns
-• Flexible TP detection
-• Leverage range support
-• Settings priority system
+# Binance setup conversation
+binance_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('setup_binance', setup_binance)],
+    states={
+        WAITING_BINANCE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_key)],
+        WAITING_BINANCE_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_secret)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
 
-🚀 <b>Ready for advanced trading!</b>""",
-        parse_mode='HTML'
-    )
+# Telegram setup conversation
+telegram_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('setup_telegram', setup_telegram_api)],
+    states={
+        WAITING_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_id)],
+        WAITING_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_hash)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
 
-# ================== ERROR HANDLER ==================
+# Channel setup conversation
+channel_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('setup_channels', setup_channels)],
+    states={
+        WAITING_CHANNEL_SELECTION: [CallbackQueryHandler(handle_channel_selection)],
+        WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Error: {context.error}")
+# Trading setup conversation
+trading_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('setup_trading', setup_trading)],
+    states={
+        WAITING_SETTINGS_SOURCE: [CallbackQueryHandler(handle_trading_settings)],
+        WAITING_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_leverage)],
+        WAITING_STOP_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stop_loss)],
+        WAITING_TAKE_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_take_profit)],
+        WAITING_BALANCE_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_balance_percent)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
 
-# ================== MAIN FUNCTION ==================
+# ================== MAIN APPLICATION ==================
 
 def main():
-    BOT_TOKEN = '8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4'
-
+    """Start the bot"""
+    # Add your bot token here
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your actual bot token
+    
+    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
-    application.add_error_handler(error_handler)
 
-    # Basic commands
+    # Add conversation handlers
+    application.add_handler(binance_conv_handler)
+    application.add_handler(telegram_conv_handler)
+    application.add_handler(channel_conv_handler)
+    application.add_handler(trading_conv_handler)
+
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("start_monitoring", start_monitoring_command))
-    application.add_handler(CommandHandler("stop_monitoring", stop_monitoring_command))
+    application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("setup_sheets", setup_google_sheets))
+    application.add_handler(CommandHandler("start_monitoring", start_monitoring))
+    application.add_handler(CommandHandler("stop_monitoring", stop_monitoring))
     application.add_handler(CommandHandler("test_signal", test_signal))
 
-    # ALL CONVERSATION HANDLERS
-    binance_handler = ConversationHandler(
-        entry_points=[CommandHandler("setup_binance", setup_binance)],
-        states={
-            WAITING_BINANCE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_key)],
-            WAITING_BINANCE_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_secret)],
-        },
-        fallbacks=[CommandHandler("cancel", start)]
-    )
-
-    telegram_handler = ConversationHandler(
-        entry_points=[CommandHandler("setup_telegram", setup_telegram_api)],
-        states={
-            WAITING_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_id)],
-            WAITING_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_hash)],
-        },
-        fallbacks=[CommandHandler("cancel", start)]
-    )
-
-    channels_handler = ConversationHandler(
-        entry_points=[CommandHandler("setup_channels", setup_channels)],
-        states={
-            WAITING_CHANNEL_SELECTION: [
-                CallbackQueryHandler(handle_channel_selection,
-                    pattern=r"^(toggle_channel_.*|channels_done|clear_all_channels|add_manual_channel)$")
-            ],
-            WAITING_MANUAL_CHANNEL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", start)],
-        allow_reentry=True
-    )
-
-    trading_handler = ConversationHandler(
-        entry_points=[CommandHandler("setup_trading", setup_trading)],
-        states={
-            WAITING_LEVERAGE: [
-                CallbackQueryHandler(handle_trading_setup,
-                    pattern=r"^(set_leverage|set_stop_loss|set_take_profit|set_balance_percent|trading_done|toggle_settings_source|toggle_sl_tp)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_leverage_input)
-            ],
-            WAITING_STOP_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stop_loss_input)],
-            WAITING_TAKE_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_take_profit_input)],
-            WAITING_BALANCE_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_balance_percent_input)],
-        },
-        fallbacks=[CommandHandler("cancel", start)]
-    )
-
-    # Add ALL handlers
-    application.add_handler(binance_handler)
-    application.add_handler(telegram_handler)
-    application.add_handler(channels_handler)
-    application.add_handler(trading_handler)
-
-    logger.info("🚀 Enhanced Trading Bot v3.0 - READY!")
-    logger.info("✅ ENHANCED FEATURES:")
-    logger.info("   • Signal vs Bot settings choice")
-    logger.info("   • Auto SL/TP order creation")
-    logger.info("   • Russian signal parsing")
-    logger.info("   • Interactive setup with buttons")
-    logger.info("   • Improved error handling")
-
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 Bot starting...")
+    print("📋 Google Sheets integration: ENABLED")
+    print("💵 Minimum order enforcement: $5")
+    print("✅ Advanced balance checking: ENABLED")
+    
+    # Run the bot
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
