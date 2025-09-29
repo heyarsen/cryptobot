@@ -1,13 +1,11 @@
-Вот код чтобы получать сообщение с телеграм каналов
-
 from telethon import TelegramClient, events
 import requests
 
-api_id = 
-api_hash = 
+api_id = 23312577
+api_hash = 'e879a3e9fd3d45cee98ef55214092805'
 
 # List of private channel IDs
-channel_ids = []
+channel_ids = [-1002925960104, -1001630692598]
 
 MAKE_WEBHOOK_URL = 'https://hook.eu2.make.com/y2od16qhv046ht3lwbx3ovtoj5eu345l'
 
