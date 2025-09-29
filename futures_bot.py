@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Trading Bot v3.0 - COMPLETE WITH MAKE.COM WEBHOOK
-- Integrated with Make.com webhook: https://hook.eu2.make.com/y2od16qhv046ht3lwbx3ovtoj5eu345l
+Telegram Trading Bot v3.0 - COMPLETE WITH NEW MAKE.COM WEBHOOK
+- Integrated with Make.com webhook: https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava
 - Advanced webhook testing and troubleshooting
 - $5 minimum order enforcement
 - Enhanced signal parsing for Russian formats
@@ -54,7 +54,7 @@ from telethon.errors import ApiIdInvalidError
  WAITING_CHANNEL_SELECTION, WAITING_MANUAL_CHANNEL,
  WAITING_SETTINGS_SOURCE, WAITING_WEBHOOK_URL) = range(12)
 
-# Your Make.com Webhook URL
+# Your NEW Make.com Webhook URL
 DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava"
 
 # Logging setup
@@ -99,7 +99,7 @@ class BotConfig:
     use_signal_settings: bool = True
     create_sl_tp: bool = True
     make_webhook_enabled: bool = True  # Default enabled
-    make_webhook_url: str = DEFAULT_WEBHOOK_URL  # Your webhook URL
+    make_webhook_url: str = DEFAULT_WEBHOOK_URL  # Your NEW webhook URL
     minimum_order_usd: float = 5.0
 
     def __post_init__(self):
@@ -113,28 +113,35 @@ class MakeWebhookLogger:
     def send_trade_data(self, trade_data: Dict[str, Any]) -> bool:
         """Send trade data to Make.com webhook"""
         try:
+            # Create comprehensive payload
             payload = {
+                "text": f"Trade executed: {trade_data.get('symbol', '')} {trade_data.get('trade_type', '')} at {trade_data.get('entry_price', '')}",
                 "timestamp": trade_data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
-                "symbol": trade_data.get('symbol', ''),
-                "trade_type": trade_data.get('trade_type', ''),
+                "symbol": str(trade_data.get('symbol', '')),
+                "trade_type": str(trade_data.get('trade_type', '')),
                 "entry_price": str(trade_data.get('entry_price', '')),
                 "quantity": str(trade_data.get('quantity', '')),
                 "leverage": str(trade_data.get('leverage', '')),
                 "order_id": str(trade_data.get('order_id', '')),
                 "stop_loss": str(trade_data.get('stop_loss', '')),
                 "take_profit": str(trade_data.get('take_profit', '')),
-                "status": trade_data.get('status', ''),
+                "status": str(trade_data.get('status', '')),
                 "balance_used": str(trade_data.get('balance_used', '')),
                 "channel_id": str(trade_data.get('channel_id', '')),
                 "pnl": str(trade_data.get('pnl', '')),
-                "notes": trade_data.get('notes', ''),
+                "notes": str(trade_data.get('notes', '')),
                 "order_value": str(trade_data.get('order_value', '')),
                 "sl_order_id": str(trade_data.get('sl_order_id', '')),
                 "tp_order_ids": str(trade_data.get('tp_order_ids', '')),
                 "user_id": str(trade_data.get('user_id', '')),
                 "webhook_version": "3.0",
-                "bot_source": "Telegram Trading Bot"
+                "bot_source": "Telegram Trading Bot",
+                "time": datetime.now().strftime('%H:%M:%S'),
+                "date": datetime.now().strftime('%Y-%m-%d')
             }
+
+            # Remove empty values
+            clean_payload = {k: v for k, v in payload.items() if v and str(v).strip()}
 
             headers = {
                 'Content-Type': 'application/json',
@@ -144,7 +151,7 @@ class MakeWebhookLogger:
 
             response = requests.post(
                 self.webhook_url,
-                json=payload,
+                json=clean_payload,
                 headers=headers,
                 timeout=15
             )
@@ -164,44 +171,60 @@ class MakeWebhookLogger:
             return False
 
     def test_webhook(self, test_type="simple") -> Dict[str, Any]:
-        """Advanced webhook testing"""
+        """Flexible webhook testing with your new URL"""
         try:
             if test_type == "simple":
+                # Simple test - minimal data
                 test_data = {
-                    "test": True,
-                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "message": "Simple webhook test",
-                    "status": "TEST_SIMPLE"
+                    "text": "Simple webhook test from Trading Bot",
+                    "status": "TEST",
+                    "time": datetime.now().strftime('%H:%M:%S'),
+                    "date": datetime.now().strftime('%Y-%m-%d'),
+                    "webhook_version": "3.0"
+                }
+            elif test_type == "basic":
+                # Basic trade structure
+                test_data = {
+                    "text": "Basic trade test: BTCUSDT LONG",
+                    "symbol": "BTCUSDT",
+                    "trade_type": "LONG",
+                    "entry_price": "45000.50",
+                    "status": "TEST_BASIC",
+                    "time": datetime.now().strftime('%H:%M:%S'),
+                    "date": datetime.now().strftime('%Y-%m-%d')
                 }
             else:
+                # Full comprehensive test
+                current_time = datetime.now()
                 test_data = {
-                    "test": True,
-                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "text": f"FULL TEST: BTCUSDT LONG at 45000.50 - Order TEST_{current_time.strftime('%H%M%S')}",
+                    "timestamp": current_time.strftime('%Y-%m-%d %H:%M:%S'),
                     "symbol": "BTCUSDT",
                     "trade_type": "LONG",
                     "entry_price": "45000.50",
                     "quantity": "0.001",
                     "leverage": "10",
-                    "order_id": f"TEST_{datetime.now().strftime('%H%M%S')}",
+                    "order_id": f"TEST_{current_time.strftime('%H%M%S')}",
                     "stop_loss": "44000.00",
                     "take_profit": "46000.00, 47000.00",
                     "status": "TEST_EXECUTED",
                     "balance_used": "$50.00",
                     "channel_id": "test_channel_123",
                     "pnl": "0.00",
-                    "notes": "Advanced webhook test from Trading Bot",
+                    "notes": "Advanced webhook test - full trade simulation",
                     "order_value": "$50.00",
-                    "sl_order_id": "SL_TEST_123",
-                    "tp_order_ids": "TP1_TEST_124, TP2_TEST_125",
+                    "sl_order_id": f"SL_TEST_{current_time.strftime('%H%M%S')}",
+                    "tp_order_ids": f"TP1_TEST_{current_time.strftime('%H%M%S')}, TP2_TEST_{current_time.strftime('%H%M%S')}",
                     "user_id": "test_user",
                     "webhook_version": "3.0",
-                    "bot_source": "Telegram Trading Bot"
+                    "bot_source": "Telegram Trading Bot",
+                    "time": current_time.strftime('%H:%M:%S'),
+                    "date": current_time.strftime('%Y-%m-%d')
                 }
 
             headers = {
                 'Content-Type': 'application/json',
                 'User-Agent': 'TradingBot/3.0',
-                'X-Bot-Version': '3.0',
                 'X-Test-Type': test_type
             }
 
@@ -219,7 +242,7 @@ class MakeWebhookLogger:
                 'success': response.status_code == 200,
                 'status_code': response.status_code,
                 'response_time': response_time,
-                'response_text': response.text[:500],
+                'response_text': response.text[:500] if response.text else "No response",
                 'test_data': test_data
             }
 
@@ -1019,7 +1042,7 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = f"""🤖 <b>Telegram Trading Bot v3.0 - READY!</b>
 
-🎉 <b>YOUR MAKE.COM WEBHOOK IS INTEGRATED:</b>
+🎉 <b>YOUR NEW MAKE.COM WEBHOOK IS INTEGRATED:</b>
 🔗 {DEFAULT_WEBHOOK_URL[:50]}...
 
 <b>Features:</b>
@@ -1039,13 +1062,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 4️⃣ /setup_trading - Trading params
 5️⃣ /start_monitoring - Begin trading
 
-<b>Commands:</b>
-/help - All commands
-/status - Configuration
-/balance - Check account balance
-/test_signal - Test parsing
-/test_webhook - Test Make.com webhook
-/test_advanced - Advanced webhook test
+<b>Test Commands:</b>
+/test_simple - Simple webhook test
+/test_basic - Basic trade test
+/test_advanced - Full trade data test
 """
     await update.message.reply_text(welcome_text, parse_mode='HTML')
 
@@ -1065,17 +1085,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /balance - Check account balance ✅
 
 <b>Testing:</b>
+/test_simple - Simple webhook test ✅
+/test_basic - Basic trade test ✅
+/test_advanced - Full trade data test ✅
 /test_signal - Test signal parsing ✅
-/test_webhook - Simple webhook test ✅
-/test_advanced - Advanced webhook test ✅
 
-🔗 <b>YOUR WEBHOOK:</b>
+🔗 <b>YOUR NEW WEBHOOK:</b>
 {DEFAULT_WEBHOOK_URL[:50]}...
 
 <b>Make.com Setup:</b>
 1. Go to Make.com scenario with your webhook
 2. Click "Run Once" to activate
-3. Test with /test_webhook
+3. Test with /test_simple
 4. Add Google Sheets module
 5. Map webhook data to spreadsheet
 """
@@ -1154,50 +1175,83 @@ Status: {'✅ Ready' if config.make_webhook_enabled else '❌ Disabled'}
 
 # ================== WEBHOOK TESTING ==================
 
-async def test_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def test_webhook_simple(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Simple webhook test"""
-    user_id = update.effective_user.id
-    config = trading_bot.get_user_config(user_id)
-
-    await update.message.reply_text("🔄 <b>Testing Make.com webhook...</b>", parse_mode='HTML')
+    await update.message.reply_text("🔄 <b>Simple webhook test...</b>", parse_mode='HTML')
 
     webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
     result = webhook_logger.test_webhook("simple")
 
     if result['success']:
-        result_text = f"""✅ <b>Webhook Test Successful!</b>
+        await update.message.reply_text(
+            f"""✅ <b>Simple Webhook Test Successful!</b>
 
-📡 <b>Details:</b>
-Status Code: {result['status_code']}
-Response Time: {result['response_time']:.2f}s
-URL: {DEFAULT_WEBHOOK_URL[:50]}...
+📡 Status Code: {result['status_code']}
+⏱️ Response Time: {result['response_time']:.2f}s
 
-🎯 <b>Next Steps:</b>
-1. Check Make.com scenario logs
-2. Verify data appeared in scenario
-3. Add Google Sheets module if needed
-4. Test with /test_advanced for full data"""
+💡 <b>Data sent:</b>
+• text: "Simple webhook test from Trading Bot"
+• status: "TEST"
+• time: {datetime.now().strftime('%H:%M:%S')}
+• date: {datetime.now().strftime('%Y-%m-%d')}
+
+🎯 Perfect! Go to Make.com and add Google Sheets module.""", 
+            parse_mode='HTML'
+        )
     else:
-        result_text = f"""❌ <b>Webhook Test Failed</b>
+        await update.message.reply_text(
+            f"""❌ <b>Simple Test Failed</b>
 
-📡 <b>Details:</b>
-Status Code: {result['status_code']}
-Response Time: {result['response_time']:.2f}s
-Error: {result['response_text'][:200]}...
+Status: {result['status_code']}
+Error: {result['response_text'][:200]}
 
-💡 <b>Troubleshooting:</b>
-1. Go to your Make.com scenario
-2. Click "Run Once" to activate
-3. Ensure scenario is listening
-4. Try /test_advanced for detailed test"""
+🔧 <b>Quick Fix:</b>
+1. Go to Make.com scenario
+2. Click webhook module
+3. Click "Re-determine data structure"
+4. Click "Delete" to clear structure
+5. Click "Run Once"
+6. Test again with /test_simple""", 
+            parse_mode='HTML'
+        )
 
-    await update.message.reply_text(result_text, parse_mode='HTML')
+async def test_webhook_basic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Basic webhook test with trade structure"""
+    await update.message.reply_text("🔄 <b>Basic webhook test...</b>", parse_mode='HTML')
+
+    webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
+    result = webhook_logger.test_webhook("basic")
+
+    if result['success']:
+        await update.message.reply_text(
+            f"""✅ <b>Basic Webhook Test Successful!</b>
+
+📡 Status Code: {result['status_code']}
+⏱️ Response Time: {result['response_time']:.2f}s
+
+💡 <b>Trade data sent:</b>
+• text: "Basic trade test: BTCUSDT LONG"
+• symbol: "BTCUSDT"
+• trade_type: "LONG" 
+• entry_price: "45000.50"
+• status: "TEST_BASIC"
+
+🎯 Perfect! Your webhook accepts trade data.""", 
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            f"""❌ <b>Basic Test Failed</b>
+
+Status: {result['status_code']}
+Error: {result['response_text'][:200]}
+
+Try /test_simple first to establish basic connection.""", 
+            parse_mode='HTML'
+        )
 
 async def test_webhook_advanced(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Advanced webhook test with full trade data"""
-    user_id = update.effective_user.id
-    config = trading_bot.get_user_config(user_id)
-
     await update.message.reply_text("🚀 <b>Advanced webhook test...</b>", parse_mode='HTML')
 
     webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
@@ -1211,19 +1265,15 @@ Status Code: {result['status_code']}
 Response Time: {result['response_time']:.2f}s
 URL: {DEFAULT_WEBHOOK_URL[:50]}...
 
-📊 <b>Test Data Sent:</b>
-• Symbol: BTCUSDT
-• Trade Type: LONG
-• Entry Price: 45000.50
-• Quantity: 0.001
-• Leverage: 10x
-• Order ID: TEST_{datetime.now().strftime('%H%M%S')}
-• Stop Loss: 44000.00
-• Take Profit: 46000.00, 47000.00
-• Status: TEST_EXECUTED
+📊 <b>Full Test Data Sent:</b>
+• Complete trade execution data
+• All order details and IDs
+• Stop Loss & Take Profit info
+• Balance and position data
+• Comprehensive logging fields
 
-🎉 <b>Perfect!</b> Your webhook is working correctly.
-Check your Make.com scenario for the complete data."""
+🎉 <b>Perfect!</b> Your webhook is working with complete trade data.
+Check your Make.com scenario for all the fields."""
     else:
         result_text = f"""❌ <b>Advanced Webhook Test Failed</b>
 
@@ -1237,7 +1287,7 @@ Error: {result['response_text'][:200]}...
 2. Find scenario with your webhook
 3. Click "Run Once" button
 4. Wait for "Waiting for data..."
-5. Run this test again
+5. Run /test_simple first
 6. Click "OK" when data appears
 7. Add Google Sheets module
 8. Map all fields to spreadsheet columns
@@ -1245,7 +1295,7 @@ Error: {result['response_text'][:200]}...
 📞 <b>Still having issues?</b>
 • Check scenario is ON (not OFF)
 • Verify webhook URL is correct
-• Try creating new webhook in Make.com"""
+• Try /test_simple → /test_basic → /test_advanced"""
 
     await update.message.reply_text(result_text, parse_mode='HTML')
 
@@ -1765,7 +1815,7 @@ trading_conv_handler = ConversationHandler(
 def main():
     """Start the bot"""
     # Add your bot token here
-    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"  # Replace with your actual bot token
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your actual bot token
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1784,7 +1834,8 @@ def main():
     application.add_handler(CommandHandler("start_monitoring", start_monitoring))
     application.add_handler(CommandHandler("stop_monitoring", stop_monitoring))
     application.add_handler(CommandHandler("test_signal", test_signal))
-    application.add_handler(CommandHandler("test_webhook", test_webhook))
+    application.add_handler(CommandHandler("test_simple", test_webhook_simple))
+    application.add_handler(CommandHandler("test_basic", test_webhook_basic))
     application.add_handler(CommandHandler("test_advanced", test_webhook_advanced))
 
     print("🤖 Bot starting...")
