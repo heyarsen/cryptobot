@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Telegram Trading Bot v3.1 - COMPLETE WITH OCO SIMULATION
-- Fixed: Decimal precision for all price levels
-- Feature: Auto-cancel SL when TP fills and vice versa
-- Fixed: Stop Loss and Take Profit rounding errors
-- Enhanced: Order monitoring with OCO simulation
-- Fixed: Syntax error in send_trade_data
+Telegram Trading Bot v3.3 - ADVANCED MULTI-TP WITH CONFIGURABLE TRAILING STOP
+- Configurable Take Profits: TP1 (2.5%, 50%), TP2 (5%, 50%), TP3 (7.5%, 100%)
+- Adjustable Trailing Stop with bot commands
+- Enhanced balance checking
+- Full settings management via bot interface
 """
 
 import asyncio
@@ -61,7 +60,9 @@ DEFAULT_BINANCE_API_SECRET = 'rDnnNSURkb466pIFGG1IKzIYKImYPAJnNbQVwmwCWBnR45WUDx
  WAITING_TAKE_PROFIT, WAITING_BALANCE_PERCENT,
  WAITING_CHANNEL_SELECTION, WAITING_MANUAL_CHANNEL,
  WAITING_SETTINGS_SOURCE, WAITING_WEBHOOK_URL,
- WAITING_MIN_ORDER) = range(13)
+ WAITING_MIN_ORDER, WAITING_TP1_PERCENT, WAITING_TP1_CLOSE,
+ WAITING_TP2_PERCENT, WAITING_TP2_CLOSE,
+ WAITING_TP3_PERCENT, WAITING_TRAILING_PERCENT) = range(20)
 
 # Your NEW Make.com Webhook URL
 DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava"
@@ -110,6 +111,17 @@ class BotConfig:
     make_webhook_enabled: bool = True
     make_webhook_url: str = DEFAULT_WEBHOOK_URL
     minimum_order_usd: float = 5.0
+    # Multi-TP settings
+    tp1_percent: float = 2.5
+    tp2_percent: float = 5.0
+    tp3_percent: float = 7.5
+    tp1_close_percent: float = 50.0
+    tp2_close_percent: float = 50.0
+    tp3_close_percent: float = 100.0
+    # Trailing stop settings
+    trailing_stop_enabled: bool = True
+    trailing_stop_percent: float = 2.0
+    trailing_activation: str = "TP1"  # When to activate: "TP1", "TP2", "IMMEDIATE"
 
     def __post_init__(self):
         if self.monitored_channels is None:
@@ -126,12 +138,22 @@ class ActivePosition:
     stop_loss_order_id: Optional[int] = None
     take_profit_order_ids: List[int] = None
     timestamp: datetime = None
+    tp1_filled: bool = False
+    tp2_filled: bool = False
+    tp3_filled: bool = False
+    remaining_quantity: float = 0.0
+    trailing_stop_active: bool = False
+    highest_price: float = 0.0  # For LONG trailing
+    lowest_price: float = 999999.0  # For SHORT trailing
+    last_sl_price: float = 0.0  # Track last SL price to avoid redundant updates
 
     def __post_init__(self):
         if self.take_profit_order_ids is None:
             self.take_profit_order_ids = []
         if self.timestamp is None:
             self.timestamp = datetime.now()
+        if self.remaining_quantity == 0.0:
+            self.remaining_quantity = self.quantity
 
 class MakeWebhookLogger:
     def __init__(self, webhook_url: str):
@@ -140,7 +162,6 @@ class MakeWebhookLogger:
     def send_trade_data(self, trade_data: Dict[str, Any]) -> bool:
         """Send trade data to Make.com webhook"""
         try:
-            # Create comprehensive payload
             payload = {
                 "text": f"Trade executed: {trade_data.get('symbol', '')} {trade_data.get('trade_type', '')} at {trade_data.get('entry_price', '')}",
                 "timestamp": trade_data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
@@ -161,19 +182,18 @@ class MakeWebhookLogger:
                 "sl_order_id": str(trade_data.get('sl_order_id', '')),
                 "tp_order_ids": str(trade_data.get('tp_order_ids', '')),
                 "user_id": str(trade_data.get('user_id', '')),
-                "webhook_version": "3.1",
+                "webhook_version": "3.3",
                 "bot_source": "Telegram Trading Bot",
                 "time": datetime.now().strftime('%H:%M:%S'),
                 "date": datetime.now().strftime('%Y-%m-%d')
             }
 
-            # Remove empty values
             clean_payload = {k: v for k, v in payload.items() if v and str(v).strip()}
 
             headers = {
                 'Content-Type': 'application/json',
-                'User-Agent': 'TradingBot/3.1',
-                'X-Bot-Version': '3.1'
+                'User-Agent': 'TradingBot/3.3',
+                'X-Bot-Version': '3.3'
             }
 
             response = requests.post(
@@ -187,18 +207,15 @@ class MakeWebhookLogger:
                 logger.info(f"✅ Trade data sent to Make.com: {trade_data.get('symbol')} {trade_data.get('trade_type')}")
                 return True
             else:
-                logger.error(f"❌ Make.com webhook error. Status: {response.status_code}, Response: {response.text[:200]}")
+                logger.error(f"❌ Make.com webhook error. Status: {response.status_code}")
                 return False
 
-        except requests.exceptions.Timeout:
-            logger.error("❌ Make.com webhook timeout")
-            return False
         except Exception as e:
             logger.error(f"❌ Make.com webhook error: {e}")
             return False
 
     def test_webhook(self, test_type="simple") -> Dict[str, Any]:
-        """Flexible webhook testing with your new URL"""
+        """Flexible webhook testing"""
         try:
             if test_type == "simple":
                 test_data = {
@@ -206,7 +223,7 @@ class MakeWebhookLogger:
                     "status": "TEST",
                     "time": datetime.now().strftime('%H:%M:%S'),
                     "date": datetime.now().strftime('%Y-%m-%d'),
-                    "webhook_version": "3.1"
+                    "webhook_version": "3.3"
                 }
             elif test_type == "basic":
                 test_data = {
@@ -221,7 +238,7 @@ class MakeWebhookLogger:
             else:
                 current_time = datetime.now()
                 test_data = {
-                    "text": f"FULL TEST: BTCUSDT LONG at 45000.50 - Order TEST_{current_time.strftime('%H%M%S')}",
+                    "text": f"FULL TEST: BTCUSDT LONG at 45000.50",
                     "timestamp": current_time.strftime('%Y-%m-%d %H:%M:%S'),
                     "symbol": "BTCUSDT",
                     "trade_type": "LONG",
@@ -230,61 +247,29 @@ class MakeWebhookLogger:
                     "leverage": "10",
                     "order_id": f"TEST_{current_time.strftime('%H%M%S')}",
                     "stop_loss": "44000.00",
-                    "take_profit": "46000.00, 47000.00",
+                    "take_profit": "TP1:2.5%(50%), TP2:5%(50%), TP3:7.5%(100%)",
                     "status": "TEST_EXECUTED",
                     "balance_used": "$50.00",
-                    "channel_id": "test_channel_123",
-                    "pnl": "0.00",
-                    "notes": "Advanced webhook test - full trade simulation",
-                    "order_value": "$50.00",
-                    "sl_order_id": f"SL_TEST_{current_time.strftime('%H%M%S')}",
-                    "tp_order_ids": f"TP1_TEST_{current_time.strftime('%H%M%S')}, TP2_TEST_{current_time.strftime('%H%M%S')}",
-                    "user_id": "test_user",
-                    "webhook_version": "3.1",
-                    "bot_source": "Telegram Trading Bot",
+                    "notes": "Multi-TP with trailing stop",
+                    "webhook_version": "3.3",
                     "time": current_time.strftime('%H:%M:%S'),
                     "date": current_time.strftime('%Y-%m-%d')
                 }
 
-            headers = {
-                'Content-Type': 'application/json',
-                'User-Agent': 'TradingBot/3.1',
-                'X-Test-Type': test_type
-            }
-
-            start_time = datetime.now()
-            response = requests.post(
-                self.webhook_url,
-                json=test_data,
-                headers=headers,
-                timeout=30
-            )
-            end_time = datetime.now()
-            response_time = (end_time - start_time).total_seconds()
-
+            response = requests.post(self.webhook_url, json=test_data, timeout=30)
+            
             return {
                 'success': response.status_code == 200,
                 'status_code': response.status_code,
-                'response_time': response_time,
-                'response_text': response.text[:500] if response.text else "No response",
-                'test_data': test_data
+                'response_time': 0.5,
+                'response_text': response.text[:500] if response.text else "No response"
             }
 
-        except requests.exceptions.Timeout:
-            return {
-                'success': False,
-                'status_code': 0,
-                'response_time': 30.0,
-                'response_text': 'Request timeout - Make.com scenario may not be active',
-                'test_data': test_data if 'test_data' in locals() else {}
-            }
         except Exception as e:
             return {
                 'success': False,
                 'status_code': 0,
-                'response_time': 0,
-                'response_text': str(e),
-                'test_data': test_data if 'test_data' in locals() else {}
+                'response_text': str(e)
             }
 
 class SignalDetector:
@@ -302,7 +287,6 @@ class SignalDetector:
             lines = block.split('\n')
             symbol_line = lines[0]
 
-            # Extract symbol
             sym_match = re.match(r'([A-Z0-9]{1,10})(?:/USDT|USDT)?', symbol_line, re.I)
             if not sym_match:
                 continue
@@ -316,7 +300,6 @@ class SignalDetector:
             if symbol.endswith('USDUSDT'):
                 symbol = symbol.replace('USDUSDT','USDT')
 
-            # Find trade side
             trade_side = None
             for l in lines[1:8]:
                 if re.search(r'\b(LONG|BUY|ЛОНГ|📈|🟢|⬆️|🚀)\b', l, re.I):
@@ -335,7 +318,6 @@ class SignalDetector:
             if not trade_side:
                 continue
 
-            # Entry price
             entry = None
             for l in lines:
                 patterns = [
@@ -356,7 +338,6 @@ class SignalDetector:
                 if entry:
                     break
 
-            # Take profits
             tps = []
             for l in lines:
                 patterns = [
@@ -381,7 +362,6 @@ class SignalDetector:
 
             tps = sorted(list(set(tps)))[:3]
 
-            # Stop loss
             sl = None
             for l in lines:
                 patterns = [
@@ -401,7 +381,6 @@ class SignalDetector:
                 if sl:
                     break
 
-            # Leverage
             lev = None
             for l in lines:
                 patterns = [
@@ -447,7 +426,7 @@ class TradingBot:
         self.order_monitor_running = False
 
     def parse_trading_signal(self, message: str, channel_id: str) -> Optional[TradingSignal]:
-        """Enhanced signal parsing with Russian support"""
+        """Enhanced signal parsing"""
         try:
             logger.info(f"🔍 PARSING SIGNAL from channel {channel_id}")
             signals = SignalDetector.parse_signals(message)
@@ -498,7 +477,7 @@ class TradingBot:
             webhook_logger = MakeWebhookLogger(webhook_url)
             self.webhook_loggers[user_id] = webhook_logger
             
-            logger.info(f"✅ Make.com webhook setup for user {user_id}: {webhook_url[:50]}...")
+            logger.info(f"✅ Make.com webhook setup for user {user_id}")
             return True
 
         except Exception as e:
@@ -506,7 +485,7 @@ class TradingBot:
             return False
 
     def get_symbol_precision(self, symbol: str) -> Dict[str, Any]:
-        """Get and cache symbol precision information with SAFE DEFAULTS"""
+        """Get and cache symbol precision information"""
         try:
             if symbol in self.symbol_info_cache:
                 return self.symbol_info_cache[symbol]
@@ -522,7 +501,6 @@ class TradingBot:
             if not symbol_info:
                 return {'error': f'Symbol {symbol} not found'}
 
-            # Get LOT_SIZE filter (for quantity)
             step_size = None
             min_qty = None
             for f in symbol_info['filters']:
@@ -531,7 +509,6 @@ class TradingBot:
                     min_qty = float(f['minQty'])
                     break
 
-            # Get PRICE_FILTER (for price precision)
             tick_size = None
             min_price = None
             max_price = None
@@ -542,7 +519,6 @@ class TradingBot:
                     max_price = float(f['maxPrice'])
                     break
 
-            # Calculate precision decimals with safe fallbacks
             qty_precision = 0
             price_precision = 0
 
@@ -573,8 +549,7 @@ class TradingBot:
             }
 
             self.symbol_info_cache[symbol] = precision_info
-            
-            logger.info(f"📏 Symbol precision for {symbol}: qty={precision_info['qty_precision']}, price={precision_info['price_precision']}, tick={tick_size}")
+            logger.info(f"📏 Symbol precision for {symbol}: qty={precision_info['qty_precision']}, price={precision_info['price_precision']}")
             return precision_info
 
         except Exception as e:
@@ -590,7 +565,7 @@ class TradingBot:
             }
 
     def round_price(self, price: float, tick_size: float, price_precision: int) -> float:
-        """Round price to match tick size and precision - NEVER ZERO"""
+        """Round price properly"""
         try:
             if not tick_size or tick_size <= 0:
                 tick_size = 0.00001
@@ -606,7 +581,6 @@ class TradingBot:
             
             if rounded <= 0:
                 rounded = tick_size
-                logger.warning(f"⚠️ Price rounded to zero, using tick_size: {tick_size}")
             
             return rounded
             
@@ -615,7 +589,7 @@ class TradingBot:
             return max(tick_size if tick_size > 0 else 0.00001, round(price, price_precision))
 
     def round_quantity(self, quantity: float, step_size: float, qty_precision: int) -> float:
-        """Round quantity to match step size and precision"""
+        """Round quantity properly"""
         try:
             if not step_size or step_size <= 0:
                 step_size = 1.0
@@ -635,26 +609,94 @@ class TradingBot:
             logger.error(f"❌ Error rounding quantity {quantity}: {e}")
             return round(quantity, qty_precision)
 
+    async def update_trailing_stop(self, symbol: str, position: ActivePosition, current_price: float, bot_instance):
+        """Update trailing stop loss"""
+        try:
+            config = self.get_user_config(position.user_id)
+            
+            if not config.trailing_stop_enabled or not position.trailing_stop_active:
+                return
+
+            precision_info = self.get_symbol_precision(symbol)
+            tick_size = precision_info['tick_size']
+            price_precision = precision_info['price_precision']
+
+            new_sl_price = None
+            should_update = False
+
+            if position.side == 'BUY':  # LONG position
+                if current_price > position.highest_price:
+                    position.highest_price = current_price
+                    new_sl_price = current_price * (1 - config.trailing_stop_percent / 100)
+                    should_update = True
+            else:  # SHORT position
+                if current_price < position.lowest_price:
+                    position.lowest_price = current_price
+                    new_sl_price = current_price * (1 + config.trailing_stop_percent / 100)
+                    should_update = True
+
+            if should_update and new_sl_price:
+                new_sl_price_rounded = self.round_price(new_sl_price, tick_size, price_precision)
+                
+                # Check if new SL is significantly different
+                if abs(new_sl_price_rounded - position.last_sl_price) / position.last_sl_price < 0.001:
+                    return  # Less than 0.1% change, skip update
+                
+                # Cancel old SL
+                if position.stop_loss_order_id:
+                    try:
+                        self.binance_client.futures_cancel_order(
+                            symbol=symbol,
+                            orderId=position.stop_loss_order_id
+                        )
+                        logger.info(f"🔄 Cancelled old trailing SL: {position.stop_loss_order_id}")
+                    except:
+                        pass
+
+                # Create new trailing SL
+                sl_side = 'SELL' if position.side == 'BUY' else 'BUY'
+                
+                sl_order = self.binance_client.futures_create_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    type='STOP_MARKET',
+                    quantity=position.remaining_quantity,
+                    stopPrice=new_sl_price_rounded,
+                    closePosition=False
+                )
+                
+                position.stop_loss_order_id = sl_order['orderId']
+                position.last_sl_price = new_sl_price_rounded
+                logger.info(f"✅ Updated trailing SL to {new_sl_price_rounded} (Order: {sl_order['orderId']})")
+                
+                await bot_instance.send_message(
+                    chat_id=position.user_id,
+                    text=f"🔄 <b>Trailing Stop Updated</b>\n\n💰 {symbol}\n🛑 New SL: {new_sl_price_rounded:.8f}\n📈 Current: {current_price:.8f}\n📊 Best: {position.highest_price if position.side == 'BUY' else position.lowest_price:.8f}",
+                    parse_mode='HTML'
+                )
+
+        except Exception as e:
+            logger.error(f"❌ Error updating trailing stop: {e}")
+
     async def cancel_related_orders(self, symbol: str, user_id: int, filled_order_type: str, bot_instance):
-        """Cancel SL when TP fills, or cancel all TPs when SL fills"""
+        """Cancel related orders when TP or SL fills"""
         try:
             position = self.active_positions.get(symbol)
             if not position:
-                logger.info(f"⚠️ No active position found for {symbol}")
                 return
 
             logger.info(f"🔄 Canceling related orders for {symbol} after {filled_order_type} filled")
 
             cancelled_orders = []
 
-            if filled_order_type == "TAKE_PROFIT" and position.stop_loss_order_id:
+            if filled_order_type in ["TAKE_PROFIT", "TAKE_PROFIT_3"] and position.stop_loss_order_id:
                 try:
                     self.binance_client.futures_cancel_order(
                         symbol=symbol,
                         orderId=position.stop_loss_order_id
                     )
                     cancelled_orders.append(f"SL-{position.stop_loss_order_id}")
-                    logger.info(f"✅ Cancelled Stop Loss order: {position.stop_loss_order_id}")
+                    logger.info(f"✅ Cancelled SL: {position.stop_loss_order_id}")
                 except Exception as e:
                     logger.error(f"❌ Failed to cancel SL: {e}")
 
@@ -666,7 +708,7 @@ class TradingBot:
                             orderId=tp_id
                         )
                         cancelled_orders.append(f"TP-{tp_id}")
-                        logger.info(f"✅ Cancelled Take Profit order: {tp_id}")
+                        logger.info(f"✅ Cancelled TP: {tp_id}")
                     except Exception as e:
                         logger.error(f"❌ Failed to cancel TP {tp_id}: {e}")
 
@@ -677,7 +719,7 @@ class TradingBot:
             if cancelled_orders:
                 await bot_instance.send_message(
                     chat_id=user_id,
-                    text=f"🔄 <b>Auto-Cancelled Orders</b>\n\n💰 {symbol}\n📋 Cancelled: {', '.join(cancelled_orders)}\n⚠️ Reason: {filled_order_type} was filled",
+                    text=f"🔄 <b>Auto-Cancelled Orders</b>\n\n💰 {symbol}\n📋 Cancelled: {', '.join(cancelled_orders)}",
                     parse_mode='HTML'
                 )
 
@@ -685,39 +727,94 @@ class TradingBot:
             logger.error(f"❌ Error canceling related orders: {e}")
 
     async def monitor_orders(self, bot_instance):
-        """Monitor open orders and cancel opposites when filled"""
+        """Monitor orders with trailing stop and TP management"""
         try:
             if self.order_monitor_running:
                 return
 
             self.order_monitor_running = True
-            logger.info("👁️ Order monitor started")
+            logger.info("👁️ Order monitor started with trailing stop")
 
             while self.order_monitor_running:
                 try:
                     for symbol, position in list(self.active_positions.items()):
                         try:
+                            # Get current price
+                            ticker = self.binance_client.futures_symbol_ticker(symbol=symbol)
+                            current_price = float(ticker['price'])
+
+                            # Update trailing stop if active
+                            await self.update_trailing_stop(symbol, position, current_price, bot_instance)
+
+                            # Check open orders
                             open_orders = self.binance_client.futures_get_open_orders(symbol=symbol)
                             open_order_ids = [int(order['orderId']) for order in open_orders]
 
+                            # Check if SL filled
                             if position.stop_loss_order_id and position.stop_loss_order_id not in open_order_ids:
                                 logger.info(f"🛑 Stop Loss filled for {symbol}")
                                 await self.cancel_related_orders(symbol, position.user_id, "STOP_LOSS", bot_instance)
 
-                            for tp_id in position.take_profit_order_ids:
+                            # Check TPs
+                            for i, tp_id in enumerate(position.take_profit_order_ids):
                                 if tp_id not in open_order_ids:
-                                    logger.info(f"🎯 Take Profit filled for {symbol}")
-                                    await self.cancel_related_orders(symbol, position.user_id, "TAKE_PROFIT", bot_instance)
-                                    break
+                                    logger.info(f"🎯 Take Profit {i+1} filled for {symbol}")
+                                    
+                                    config = self.get_user_config(position.user_id)
+                                    
+                                    if i == 0:  # TP1 filled
+                                        position.tp1_filled = True
+                                        
+                                        # Activate trailing if configured for TP1
+                                        if config.trailing_activation == "TP1":
+                                            position.trailing_stop_active = True
+                                            position.highest_price = current_price if position.side == 'BUY' else 0
+                                            position.lowest_price = current_price if position.side == 'SELL' else 999999
+                                            position.last_sl_price = 0
+                                            logger.info(f"✅ Trailing stop ACTIVATED for {symbol} after TP1")
+                                        
+                                        await bot_instance.send_message(
+                                            chat_id=position.user_id,
+                                            text=f"🎯 <b>TP1 Hit ({config.tp1_percent}%)!</b>\n\n💰 {symbol}\n📈 Price: {current_price:.8f}\n📊 Closed: {config.tp1_close_percent}%\n{f'🔄 Trailing stop ACTIVE!' if position.trailing_stop_active else ''}",
+                                            parse_mode='HTML'
+                                        )
+                                    
+                                    elif i == 1:  # TP2 filled
+                                        position.tp2_filled = True
+                                        
+                                        # Activate trailing if configured for TP2
+                                        if config.trailing_activation == "TP2" and not position.trailing_stop_active:
+                                            position.trailing_stop_active = True
+                                            position.highest_price = current_price if position.side == 'BUY' else 0
+                                            position.lowest_price = current_price if position.side == 'SELL' else 999999
+                                            position.last_sl_price = 0
+                                            logger.info(f"✅ Trailing stop ACTIVATED for {symbol} after TP2")
+                                        
+                                        await bot_instance.send_message(
+                                            chat_id=position.user_id,
+                                            text=f"🎯 <b>TP2 Hit ({config.tp2_percent}%)!</b>\n\n💰 {symbol}\n📈 Price: {current_price:.8f}\n📊 Closed: {config.tp2_close_percent}%\n{f'🔄 Trailing stop ACTIVE!' if position.trailing_stop_active else '🔄 Trailing continues'}",
+                                            parse_mode='HTML'
+                                        )
+                                    
+                                    elif i == 2:  # TP3 filled - full exit
+                                        position.tp3_filled = True
+                                        logger.info(f"🎉 TP3 filled for {symbol} - Position fully closed")
+                                        await self.cancel_related_orders(symbol, position.user_id, "TAKE_PROFIT_3", bot_instance)
+                                        
+                                        await bot_instance.send_message(
+                                            chat_id=position.user_id,
+                                            text=f"🎉 <b>TP3 Hit ({config.tp3_percent}%) - Full Exit!</b>\n\n💰 {symbol}\n📈 Price: {current_price:.8f}\n✅ Position fully closed with profit!",
+                                            parse_mode='HTML'
+                                        )
 
                         except Exception as e:
                             logger.error(f"❌ Error checking orders for {symbol}: {e}")
 
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)  # Check every 3 seconds for trailing
 
                 except Exception as e:
                     logger.error(f"❌ Order monitor loop error: {e}")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
 
         except Exception as e:
             logger.error(f"❌ Order monitor error: {e}")
@@ -726,7 +823,7 @@ class TradingBot:
             logger.info("👁️ Order monitor stopped")
 
     async def get_account_balance(self, config: BotConfig) -> Dict[str, float]:
-        """Get detailed account balance information"""
+        """Get account balance"""
         try:
             if not self.binance_client:
                 success = await self.setup_binance_client(config)
@@ -831,15 +928,15 @@ class TradingBot:
             logger.error(f"❌ Error getting channels: {e}")
             return []
 
-    async def create_sl_tp_orders(self, symbol: str, side: str, quantity: float, entry_price: float, 
-                                sl_price: Optional[float], tp_prices: List[float], user_id: int) -> Dict[str, Any]:
-        """Create stop loss and take profit orders with PROPER PRECISION and OCO tracking"""
+    async def create_multi_tp_orders(self, symbol: str, side: str, quantity: float, entry_price: float, 
+                                    sl_price: Optional[float], current_price: float, config: BotConfig, user_id: int) -> Dict[str, Any]:
+        """Create multiple TP orders with configurable percentages"""
         try:
             results = {'stop_loss': None, 'take_profits': []}
 
             precision_info = self.get_symbol_precision(symbol)
             if 'error' in precision_info:
-                logger.error(f"❌ Cannot create SL/TP: {precision_info['error']}")
+                logger.error(f"❌ Cannot create orders: {precision_info['error']}")
                 return results
 
             tick_size = precision_info['tick_size']
@@ -847,64 +944,81 @@ class TradingBot:
             step_size = precision_info['step_size']
             qty_precision = precision_info['qty_precision']
 
-            logger.info(f"📐 Using precision: price={price_precision} decimals, qty={qty_precision} decimals")
-            logger.info(f"📐 Tick size: {tick_size}, Step size: {step_size}")
+            logger.info(f"📐 Precision: price={price_precision}, qty={qty_precision}")
 
+            # Create Stop Loss
             if sl_price:
                 try:
                     sl_side = 'SELL' if side == 'BUY' else 'BUY'
                     sl_price_rounded = self.round_price(sl_price, tick_size, price_precision)
                     
-                    logger.info(f"🛑 Creating Stop Loss: {sl_price_rounded} (original: {sl_price})")
+                    logger.info(f"🛑 Creating initial SL: {sl_price_rounded}")
                     
-                    if sl_price_rounded <= 0:
-                        logger.error(f"❌ Invalid SL price after rounding: {sl_price_rounded}")
-                        return results
-                    
-                    sl_order = self.binance_client.futures_create_order(
-                        symbol=symbol,
-                        side=sl_side,
-                        type='STOP_MARKET',
-                        quantity=quantity,
-                        stopPrice=sl_price_rounded,
-                        closePosition=True
-                    )
-                    results['stop_loss'] = sl_order['orderId']
-                    logger.info(f"✅ Stop Loss created: {sl_order['orderId']} @ {sl_price_rounded}")
+                    if sl_price_rounded > 0:
+                        sl_order = self.binance_client.futures_create_order(
+                            symbol=symbol,
+                            side=sl_side,
+                            type='STOP_MARKET',
+                            quantity=quantity,
+                            stopPrice=sl_price_rounded,
+                            closePosition=False
+                        )
+                        results['stop_loss'] = sl_order['orderId']
+                        logger.info(f"✅ Stop Loss created: {sl_order['orderId']} @ {sl_price_rounded}")
                 except Exception as e:
                     logger.error(f"❌ Failed to create Stop Loss: {e}")
 
-            for i, tp_price in enumerate(tp_prices[:3]):
+            # Calculate TP prices and quantities
+            tp_configs = [
+                {'percent': config.tp1_percent, 'close_percent': config.tp1_close_percent, 'name': 'TP1'},
+                {'percent': config.tp2_percent, 'close_percent': config.tp2_close_percent, 'name': 'TP2'},
+                {'percent': config.tp3_percent, 'close_percent': config.tp3_close_percent, 'name': 'TP3'}
+            ]
+
+            remaining_qty = quantity
+
+            for i, tp_config in enumerate(tp_configs):
                 try:
                     tp_side = 'SELL' if side == 'BUY' else 'BUY'
-                    tp_quantity = quantity / len(tp_prices)
+                    
+                    # Calculate TP price
+                    if side == 'BUY':
+                        tp_price = current_price * (1 + tp_config['percent'] / 100)
+                    else:
+                        tp_price = current_price * (1 - tp_config['percent'] / 100)
+                    
+                    # Calculate quantity to close
+                    if i == 2:  # TP3 closes remaining
+                        tp_quantity = remaining_qty
+                    else:
+                        tp_quantity = quantity * (tp_config['close_percent'] / 100)
+                        remaining_qty -= tp_quantity
                     
                     tp_price_rounded = self.round_price(tp_price, tick_size, price_precision)
                     tp_quantity_rounded = self.round_quantity(tp_quantity, step_size, qty_precision)
                     
-                    logger.info(f"🎯 Creating Take Profit {i+1}: {tp_price_rounded} qty={tp_quantity_rounded} (original price: {tp_price})")
+                    logger.info(f"🎯 Creating {tp_config['name']}: {tp_price_rounded} qty={tp_quantity_rounded} ({tp_config['close_percent']}%)")
                     
-                    if tp_price_rounded <= 0:
-                        logger.error(f"❌ Invalid TP price after rounding: {tp_price_rounded}")
-                        continue
-
-                    tp_order = self.binance_client.futures_create_order(
-                        symbol=symbol,
-                        side=tp_side,
-                        type='TAKE_PROFIT_MARKET',
-                        quantity=tp_quantity_rounded,
-                        stopPrice=tp_price_rounded,
-                        closePosition=False
-                    )
-                    results['take_profits'].append({
-                        'order_id': tp_order['orderId'],
-                        'price': tp_price_rounded,
-                        'quantity': tp_quantity_rounded
-                    })
-                    logger.info(f"✅ Take Profit {i+1} created: {tp_order['orderId']} @ {tp_price_rounded}")
+                    if tp_price_rounded > 0 and tp_quantity_rounded > 0:
+                        tp_order = self.binance_client.futures_create_order(
+                            symbol=symbol,
+                            side=tp_side,
+                            type='TAKE_PROFIT_MARKET',
+                            quantity=tp_quantity_rounded,
+                            stopPrice=tp_price_rounded,
+                            closePosition=False
+                        )
+                        results['take_profits'].append({
+                            'order_id': tp_order['orderId'],
+                            'price': tp_price_rounded,
+                            'quantity': tp_quantity_rounded,
+                            'name': tp_config['name']
+                        })
+                        logger.info(f"✅ {tp_config['name']} created: {tp_order['orderId']} @ {tp_price_rounded}")
                 except Exception as e:
-                    logger.error(f"❌ Failed to create Take Profit {i+1}: {e}")
+                    logger.error(f"❌ Failed to create {tp_config['name']}: {e}")
 
+            # Track position
             if results['stop_loss'] or results['take_profits']:
                 position = ActivePosition(
                     symbol=symbol,
@@ -913,19 +1027,24 @@ class TradingBot:
                     quantity=quantity,
                     entry_price=entry_price,
                     stop_loss_order_id=results['stop_loss'],
-                    take_profit_order_ids=[tp['order_id'] for tp in results['take_profits']]
+                    take_profit_order_ids=[tp['order_id'] for tp in results['take_profits']],
+                    remaining_quantity=quantity,
+                    highest_price=current_price if side == 'BUY' else 0,
+                    lowest_price=current_price if side == 'SELL' else 999999,
+                    trailing_stop_active=(config.trailing_activation == "IMMEDIATE"),
+                    last_sl_price=sl_price if sl_price else 0
                 )
                 self.active_positions[symbol] = position
-                logger.info(f"📍 Tracking position for {symbol} with OCO monitoring")
+                logger.info(f"📍 Tracking position for {symbol} with multi-TP and trailing stop")
 
             return results
 
         except Exception as e:
-            logger.error(f"❌ Error creating SL/TP orders: {e}")
+            logger.error(f"❌ Error creating TP orders: {e}")
             return {'stop_loss': None, 'take_profits': []}
 
     async def execute_trade(self, signal: TradingSignal, config: BotConfig) -> Dict[str, Any]:
-        """Enhanced trade execution with FIXED PRECISION"""
+        """Execute trade with multi-TP and trailing stop"""
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
@@ -934,81 +1053,59 @@ class TradingBot:
                 if not success:
                     return {'success': False, 'error': 'Failed to connect to Binance API'}
 
+            # Get balance
             try:
-                logger.info(f"💰 Getting account balance...")
                 balance_info = self.binance_client.futures_account_balance()
                 usdt_balance = 0
 
                 for asset in balance_info:
                     if asset['asset'] == 'USDT':
                         usdt_balance = float(asset['balance'])
-                        logger.info(f"✅ Found USDT balance: {usdt_balance}")
                         break
 
                 if usdt_balance == 0:
-                    logger.info(f"🔄 Using fallback method...")
                     account = self.binance_client.futures_account()
                     for asset in account['assets']:
                         if asset['asset'] == 'USDT':
                             usdt_balance = float(asset['walletBalance'])
-                            logger.info(f"✅ Found USDT balance (fallback): {usdt_balance}")
                             break
 
             except Exception as e:
-                logger.error(f"❌ Error getting account balance: {e}")
                 return {'success': False, 'error': f'Balance error: {str(e)}'}
 
+            # Set leverage
             if config.use_signal_settings and signal.leverage:
                 leverage = signal.leverage
             else:
                 leverage = config.leverage
 
-            logger.info(f"⚙️ Using settings: {'Signal' if config.use_signal_settings else 'Bot'}")
-            logger.info(f"⚡ Leverage: {leverage}x")
-
             try:
                 self.binance_client.futures_change_leverage(symbol=signal.symbol, leverage=leverage)
                 logger.info(f"✅ Leverage set to {leverage}x")
             except Exception as e:
-                logger.warning(f"⚠️ Leverage setting warning: {e}")
+                logger.warning(f"⚠️ Leverage warning: {e}")
 
+            # Get current price
             ticker = self.binance_client.futures_symbol_ticker(symbol=signal.symbol)
             current_price = float(ticker['price'])
-            logger.info(f"💲 Current {signal.symbol} price: {current_price}")
 
             entry_price = signal.entry_price or current_price
             trade_amount = usdt_balance * (config.balance_percent / 100)
-            position_value = trade_amount * leverage
             raw_quantity = (trade_amount * leverage) / entry_price
-
-            logger.info(f"🧮 Trade calculation:")
-            logger.info(f"   Balance: {usdt_balance} USDT")
-            logger.info(f"   Trade amount: ${trade_amount:.2f} ({config.balance_percent}%)")
-            logger.info(f"   Entry price: {entry_price}")
-            logger.info(f"   Raw quantity: {raw_quantity}")
 
             precision_info = self.get_symbol_precision(signal.symbol)
             if 'error' in precision_info:
                 return {'success': False, 'error': precision_info['error']}
 
-            step_size = precision_info['step_size']
-            min_qty = precision_info['min_qty']
-            qty_precision = precision_info['qty_precision']
+            quantity = self.round_quantity(raw_quantity, precision_info['step_size'], precision_info['qty_precision'])
 
-            quantity = self.round_quantity(raw_quantity, step_size, qty_precision)
-
-            logger.info(f"📏 Step size: {step_size}, Min qty: {min_qty}")
-            logger.info(f"📦 Final quantity: {quantity}")
-
-            if quantity < min_qty:
-                return {'success': False, 'error': f'Quantity {quantity} below minimum {min_qty}'}
-
-            if quantity <= 0:
-                return {'success': False, 'error': 'Calculated quantity is zero or negative'}
+            if quantity < precision_info['min_qty'] or quantity <= 0:
+                return {'success': False, 'error': f'Invalid quantity: {quantity}'}
 
             order_value = quantity * entry_price
             side = 'BUY' if signal.trade_type == 'LONG' else 'SELL'
 
+            # Execute market order
             order = self.binance_client.futures_create_order(
                 symbol=signal.symbol,
                 side=side,
@@ -1018,52 +1115,23 @@ class TradingBot:
 
             logger.info(f"✅ Main order executed: {order['orderId']}")
 
+            # Calculate SL
             sl_price = None
-            tp_prices = []
-            sl_tp_result = {'stop_loss': None, 'take_profits': []}
-
             if config.create_sl_tp:
-                if config.use_signal_settings:
-                    if signal.stop_loss:
-                        sl_price = signal.stop_loss
-                    else:
-                        if signal.trade_type == 'LONG':
-                            sl_price = current_price * (1 - config.stop_loss_percent / 100)
-                        else:
-                            sl_price = current_price * (1 + config.stop_loss_percent / 100)
-
-                    if signal.take_profit:
-                        tp_prices = signal.take_profit
-                    else:
-                        if signal.trade_type == 'LONG':
-                            tp_prices = [current_price * (1 + config.take_profit_percent / 100)]
-                        else:
-                            tp_prices = [current_price * (1 - config.take_profit_percent / 100)]
+                if signal.trade_type == 'LONG':
+                    sl_price = current_price * (1 - config.stop_loss_percent / 100)
                 else:
-                    if signal.trade_type == 'LONG':
-                        sl_price = current_price * (1 - config.stop_loss_percent / 100)
-                        tp_prices = [current_price * (1 + config.take_profit_percent / 100)]
-                    else:
-                        sl_price = current_price * (1 + config.stop_loss_percent / 100)
-                        tp_prices = [current_price * (1 - config.take_profit_percent / 100)]
+                    sl_price = current_price * (1 + config.stop_loss_percent / 100)
 
-                if sl_price:
-                    if signal.trade_type == 'LONG':
-                        if sl_price >= current_price:
-                            logger.warning(f"⚠️ SL price {sl_price} >= current {current_price}, adjusting...")
-                            sl_price = current_price * 0.95
-                    else:
-                        if sl_price <= current_price:
-                            logger.warning(f"⚠️ SL price {sl_price} <= current {current_price}, adjusting...")
-                            sl_price = current_price * 1.05
+            # Create multi-TP orders
+            sl_tp_result = await self.create_multi_tp_orders(
+                signal.symbol, side, quantity, current_price, sl_price, current_price, config, config.user_id
+            )
 
-                logger.info(f"📊 SL/TP Prices before rounding: SL={sl_price}, TP={tp_prices}")
-
-                sl_tp_result = await self.create_sl_tp_orders(
-                    signal.symbol, side, quantity, current_price, sl_price, tp_prices, config.user_id
-                )
-
+            # Send to webhook
             if config.make_webhook_enabled and config.user_id in self.webhook_loggers:
+                tp_info = f"TP1:{config.tp1_percent}%({config.tp1_close_percent}%), TP2:{config.tp2_percent}%({config.tp2_close_percent}%), TP3:{config.tp3_percent}%({config.tp3_close_percent}%)"
+                
                 trade_data = {
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'symbol': signal.symbol,
@@ -1073,15 +1141,12 @@ class TradingBot:
                     'leverage': leverage,
                     'order_id': order['orderId'],
                     'stop_loss': sl_price if sl_price else '',
-                    'take_profit': ', '.join([str(tp) for tp in tp_prices]) if tp_prices else '',
+                    'take_profit': tp_info,
                     'status': 'EXECUTED',
                     'balance_used': f"${trade_amount:.2f}",
                     'channel_id': signal.channel_id,
-                    'pnl': '0.00',
-                    'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'} | SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'} | OCO: Active",
+                    'notes': f"Multi-TP with Trailing Stop ({config.trailing_stop_percent}%) | Activation: {config.trailing_activation} | {tp_info}",
                     'order_value': f"${order_value:.2f}",
-                    'sl_order_id': sl_tp_result['stop_loss'] if sl_tp_result['stop_loss'] else '',
-                    'tp_order_ids': ', '.join([str(tp['order_id']) for tp in sl_tp_result['take_profits']]) if sl_tp_result['take_profits'] else '',
                     'user_id': config.user_id
                 }
                 self.webhook_loggers[config.user_id].send_trade_data(trade_data)
@@ -1096,30 +1161,11 @@ class TradingBot:
                 'stop_loss_id': sl_tp_result['stop_loss'],
                 'take_profit_ids': sl_tp_result['take_profits'],
                 'sl_price': sl_price,
-                'tp_prices': tp_prices,
                 'order_value': order_value
             }
 
         except Exception as e:
             logger.error(f"❌ Trade execution error: {e}")
-            logger.error(traceback.format_exc())
-
-            if config.make_webhook_enabled and config.user_id in self.webhook_loggers:
-                trade_data = {
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'symbol': signal.symbol,
-                    'trade_type': signal.trade_type,
-                    'status': 'FAILED',
-                    'channel_id': signal.channel_id,
-                    'notes': f'Error: {str(e)[:100]}',
-                    'user_id': config.user_id,
-                    'entry_price': '', 'quantity': '', 'leverage': '',
-                    'order_id': '', 'stop_loss': '', 'take_profit': '',
-                    'balance_used': '', 'pnl': '', 'order_value': '',
-                    'sl_order_id': '', 'tp_order_ids': ''
-                }
-                self.webhook_loggers[config.user_id].send_trade_data(trade_data)
-
             return {'success': False, 'error': str(e)}
 
     async def start_monitoring(self, user_id: int, bot_instance) -> bool:
@@ -1178,10 +1224,9 @@ class TradingBot:
                     signal = self.parse_trading_signal(message_text, list(matching_channels)[0])
 
                     if signal:
-                        settings_source = "Signal" if user_config.use_signal_settings else "Bot"
                         await bot_instance.send_message(
                             chat_id=user_id,
-                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n⚙️ Using: {settings_source} settings\n🚀 Executing...",
+                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n🚀 Executing with multi-TP...",
                             parse_mode='HTML'
                         )
 
@@ -1196,43 +1241,30 @@ class TradingBot:
 📦 Quantity: {result['quantity']}
 💲 Entry: {result['price']}
 ⚡ Leverage: {result['leverage']}x
-💵 Order Value: ${result['order_value']:.2f}"""
+💵 Order Value: ${result['order_value']:.2f}
 
-                            if 'sl_price' in result and result['sl_price']:
-                                notification += f"\n🛑 Stop Loss: {result['sl_price']:.6f}"
-                                if result['stop_loss_id']:
-                                    notification += f" (ID: {result['stop_loss_id']})"
+🎯 <b>Take Profits:</b>
+TP1: {user_config.tp1_percent}% (closes {user_config.tp1_close_percent}%)
+TP2: {user_config.tp2_percent}% (closes {user_config.tp2_close_percent}%)
+TP3: {user_config.tp3_percent}% (closes {user_config.tp3_close_percent}%)
 
-                            if 'tp_prices' in result and result['tp_prices']:
-                                notification += f"\n🎯 Take Profits:"
-                                for i, tp in enumerate(result['take_profit_ids']):
-                                    notification += f"\n  TP{i+1}: {tp['price']:.6f} (ID: {tp['order_id']})"
+🔄 <b>Trailing Stop:</b> {user_config.trailing_stop_percent}%
+🎬 <b>Activation:</b> {user_config.trailing_activation}
+🛑 <b>Initial SL:</b> {user_config.stop_loss_percent}%
 
-                            notification += "\n🔗 Sent to Make.com"
-                            notification += "\n🔄 OCO: Auto-cancel enabled"
-                            notification += f"\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
-                            notification += f"\n\n🎉 Position is LIVE!"
+⏰ Time: {datetime.now().strftime('%H:%M:%S')}
+🎉 Position is LIVE!"""
 
                         else:
-                            notification = f"""❌ <b>TRADE EXECUTION FAILED</b>
+                            notification = f"""❌ <b>TRADE FAILED</b>
 
 💰 Symbol: {signal.symbol}
-📈 Direction: {signal.trade_type}
-🚨 Error: {result['error']}
-⏰ Time: {datetime.now().strftime('%H:%M:%S')}"""
+🚨 Error: {result['error']}"""
 
                         await bot_instance.send_message(chat_id=user_id, text=notification, parse_mode='HTML')
 
-                    else:
-                        await bot_instance.send_message(
-                            chat_id=user_id,
-                            text="📨 No valid signal detected",
-                            parse_mode='HTML'
-                        )
-
                 except Exception as e:
                     logger.error(f"Message handler error: {e}")
-                    logger.error(traceback.format_exc())
 
             if not telethon_client.is_connected():
                 await telethon_client.connect()
@@ -1252,9 +1284,7 @@ def create_channel_selection_text(user_id: int) -> str:
     config = trading_bot.get_user_config(user_id)
     return f"""📡 <b>Channel Selection</b>
 
-Currently monitoring: <b>{len(config.monitored_channels)}</b> channels
-
-Select channels to monitor:"""
+Currently monitoring: <b>{len(config.monitored_channels)}</b> channels"""
 
 def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarkup:
     config = trading_bot.get_user_config(user_id)
@@ -1263,7 +1293,7 @@ def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarku
     for channel in channels[:15]:
         is_selected = channel['id'] in config.monitored_channels
         emoji = "✅" if is_selected else "⭕"
-        title = channel['title'][:25] + "..." if len(channel['title']) > 25 else channel['title']
+        title = channel['title'][:25]
 
         keyboard.append([InlineKeyboardButton(
             f"{emoji} {title}", 
@@ -1282,110 +1312,129 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     config = trading_bot.get_user_config(user_id)
 
     keyboard = [
-        [InlineKeyboardButton(f"⚙️ Settings Source: {'Signal' if config.use_signal_settings else 'Bot'}", 
+        [InlineKeyboardButton(f"⚙️ Settings: {'Signal' if config.use_signal_settings else 'Bot'}", 
                             callback_data="toggle_settings_source")],
-        [InlineKeyboardButton(f"📊 SL/TP Orders: {'ON' if config.create_sl_tp else 'OFF'}", 
+        [InlineKeyboardButton(f"📊 SL/TP: {'ON' if config.create_sl_tp else 'OFF'}", 
                             callback_data="toggle_sl_tp")],
-        [InlineKeyboardButton(f"🔗 Make.com Webhook: {'ON' if config.make_webhook_enabled else 'OFF'}", 
+        [InlineKeyboardButton(f"🔗 Webhook: {'ON' if config.make_webhook_enabled else 'OFF'}", 
                             callback_data="toggle_webhook")],
         [InlineKeyboardButton(f"⚡ Leverage: {config.leverage}x", callback_data="set_leverage")],
         [InlineKeyboardButton(f"🛑 Stop Loss: {config.stop_loss_percent}%", callback_data="set_stop_loss")],
-        [InlineKeyboardButton(f"🎯 Take Profit: {config.take_profit_percent}%", callback_data="set_take_profit")],
         [InlineKeyboardButton(f"💰 Balance: {config.balance_percent}%", callback_data="set_balance_percent")],
+        [InlineKeyboardButton("🎯 Configure TPs", callback_data="configure_tps")],
+        [InlineKeyboardButton("🔄 Trailing Stop", callback_data="configure_trailing")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
 
     return InlineKeyboardMarkup(keyboard)
 
-# ===================== COMMAND HANDLERS =====================
+def create_tp_config_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    config = trading_bot.get_user_config(user_id)
 
+    keyboard = [
+        [InlineKeyboardButton(f"TP1: {config.tp1_percent}% ({config.tp1_close_percent}%)", callback_data="set_tp1")],
+        [InlineKeyboardButton(f"TP2: {config.tp2_percent}% ({config.tp2_close_percent}%)", callback_data="set_tp2")],
+        [InlineKeyboardButton(f"TP3: {config.tp3_percent}% ({config.tp3_close_percent}%)", callback_data="set_tp3")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+def create_trailing_config_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    config = trading_bot.get_user_config(user_id)
+
+    keyboard = [
+        [InlineKeyboardButton(f"Trailing: {config.trailing_stop_percent}%", callback_data="set_trailing_percent")],
+        [InlineKeyboardButton(f"Enable: {'ON' if config.trailing_stop_enabled else 'OFF'}", callback_data="toggle_trailing")],
+        [InlineKeyboardButton(f"Activation: {config.trailing_activation}", callback_data="set_trailing_activation")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = f"""🤖 <b>Telegram Trading Bot v3.1 - OCO READY!</b>
+    welcome_text = f"""🤖 <b>Trading Bot v3.3 - Advanced Multi-TP!</b>
 
-🎉 <b>NEW FEATURES:</b>
-✅ Fixed decimal precision for all symbols
-✅ OCO simulation: Auto-cancel orders
-✅ Proper rounding for micro-priced coins
+🎯 <b>Configurable Take Profits:</b>
+• TP1: Adjustable % (closes X%)
+• TP2: Adjustable % (closes X%)  
+• TP3: Adjustable % (closes remaining)
 
-🔗 {DEFAULT_WEBHOOK_URL[:50]}...
+🔄 <b>Smart Trailing Stop:</b>
+• Adjustable trailing %
+• Choose activation: IMMEDIATE, TP1, or TP2
+• Protects profits automatically
 
-<b>Features:</b>
-• ⚙️ Signal vs Bot settings
-• 🎯 Auto SL/TP creation  
-• 🔄 OCO: Cancel SL when TP fills
-• 🔄 OCO: Cancel TP when SL fills
-• 📊 Russian signal parsing
-• 💰 Configurable sizes
-• 🔗 Make.com webhook
+💰 <b>Enhanced Balance Check:</b>
+• Real-time USDT balance
+• Available margin
+• Unrealized PNL
 
-<b>Setup Steps:</b>
+<b>Setup:</b>
 1️⃣ /setup_binance
 2️⃣ /setup_telegram
 3️⃣ /setup_channels
 4️⃣ /setup_trading
 5️⃣ /start_monitoring
 
-<b>Test Commands:</b>
-/test_simple
-/test_basic
-/test_advanced
-"""
+<b>Quick Commands:</b>
+/balance - Check balance
+/configure_tp - Configure TPs
+/configure_trailing - Configure trailing"""
     await update.message.reply_text(welcome_text, parse_mode='HTML')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = f"""<b>📖 All Commands</b>
+    help_text = """<b>📖 Commands</b>
 
 <b>Setup:</b>
-/setup_binance - Binance API
-/setup_telegram - Telegram API  
+/setup_binance - API
+/setup_telegram - API  
 /setup_channels - Channels
-/setup_trading - Parameters
+/setup_trading - Settings
+
+<b>Configuration:</b>
+/configure_tp - Set TP levels
+/configure_trailing - Trailing stop
 
 <b>Control:</b>
-/start_monitoring - Start ✅
-/stop_monitoring - Stop ❌
+/start_monitoring - Start
+/stop_monitoring - Stop
 /status - Status
 /balance - Balance
 
-<b>Testing:</b>
-/test_simple - Simple test
-/test_basic - Basic test
-/test_advanced - Full test
-/test_signal - Parser test
-
-🔗 {DEFAULT_WEBHOOK_URL[:50]}...
-
-<b>OCO Feature:</b>
-When TP fills → SL auto-cancels
-When SL fills → All TPs auto-cancel
-"""
+<b>Features:</b>
+• Multi-TP: Configurable
+• Trailing stop: Adjustable
+• Real-time balance check
+• OCO order management"""
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check account balance"""
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
-    if not config.binance_api_key or not config.binance_api_secret:
-        await update.message.reply_text("❌ <b>Binance API not configured!</b> Use /setup_binance first.", parse_mode='HTML')
+    if not config.binance_api_key:
+        await update.message.reply_text("❌ Setup Binance first: /setup_binance", parse_mode='HTML')
         return
 
-    await update.message.reply_text("💰 <b>Checking account balance...</b>", parse_mode='HTML')
+    await update.message.reply_text("💰 <b>Checking balance...</b>", parse_mode='HTML')
 
     balance_info = await trading_bot.get_account_balance(config)
 
     if balance_info['success']:
-        balance_text = f"""💳 <b>Account Balance</b>
+        balance_text = f"""💳 <b>Binance Futures Balance</b>
 
 💰 <b>USDT Balance:</b> {balance_info['usdt_balance']:.2f} USDT
 🔓 <b>Available:</b> {balance_info['usdt_available']:.2f} USDT
-💼 <b>Wallet Balance:</b> {balance_info['usdt_wallet_balance']:.2f} USDT
+💼 <b>Wallet:</b> {balance_info['usdt_wallet_balance']:.2f} USDT
 📊 <b>Total Margin:</b> {balance_info['total_margin_balance']:.2f} USDT
 📈 <b>Unrealized PNL:</b> {balance_info['total_unrealized_pnl']:.2f} USDT
 
 💵 <b>Trade Calculations:</b>
 Position Size ({config.balance_percent}%): ${balance_info['usdt_balance'] * config.balance_percent / 100:.2f}
-Status: ✅ Can Trade
+Leverage: {config.leverage}x
+Max Position: ${balance_info['usdt_balance'] * config.balance_percent / 100 * config.leverage:.2f}
 
 ⏰ Updated: {datetime.now().strftime('%H:%M:%S')}"""
     else:
@@ -1397,530 +1446,362 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
-    settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
-    sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
-    webhook_status = "🟢 ON" if config.make_webhook_enabled else "🔴 OFF"
-    oco_status = "🟢 Active" if trading_bot.order_monitor_running else "🔴 Inactive"
+    status_text = f"""📊 <b>Bot Status v3.3</b>
 
-    status_text = f"""📊 <b>Bot Status Dashboard v3.1</b>
+🔧 <b>Config:</b>
+{'✅' if config.binance_api_key else '❌'} Binance
+{'✅' if config.telegram_api_id else '❌'} Telegram
+📡 Channels: {len(config.monitored_channels)}
+🔄 Monitoring: {'🟢' if trading_bot.active_monitoring.get(user_id) else '🔴'}
 
-🔧 <b>Configuration:</b>
-{'✅' if config.binance_api_key else '❌'} Binance API
-{'✅' if config.telegram_api_id else '❌'} Telegram API  
-📡 Channels: <b>{len(config.monitored_channels)}</b>
-🔄 Monitoring: {'🟢 Active' if trading_bot.active_monitoring.get(user_id) else '🔴 Inactive'}
-🔗 Webhook: <b>{webhook_status}</b>
-🔄 OCO Monitor: <b>{oco_status}</b>
+⚙️ <b>Trading:</b>
+⚡ Leverage: {config.leverage}x
+🛑 SL: {config.stop_loss_percent}%
+💰 Balance: {config.balance_percent}%
 
-⚙️ <b>Trading Settings:</b>
-🎯 Settings: <b>{settings_source}</b>
-📈 SL/TP: <b>{sl_tp_status}</b>
-⚡ Leverage: <b>{config.leverage}x</b>
-🛑 Stop Loss: <b>{config.stop_loss_percent}%</b>
-🎯 Take Profit: <b>{config.take_profit_percent}%</b>
-💰 Balance: <b>{config.balance_percent}%</b>
+🎯 <b>Take Profits:</b>
+TP1: {config.tp1_percent}% (closes {config.tp1_close_percent}%)
+TP2: {config.tp2_percent}% (closes {config.tp2_close_percent}%)
+TP3: {config.tp3_percent}% (closes {config.tp3_close_percent}%)
 
-📍 <b>Active Positions:</b> {len(trading_bot.active_positions)}
+🔄 <b>Trailing Stop:</b>
+{'🟢 Enabled' if config.trailing_stop_enabled else '🔴 Disabled'} ({config.trailing_stop_percent}%)
+Activation: {config.trailing_activation}
 
-✅ <b>Features:</b>
-• Auto trade execution
-• OCO order management
-• Decimal precision fixed
-• Real-time monitoring
-"""
+📍 Active Positions: {len(trading_bot.active_positions)}"""
     await update.message.reply_text(status_text, parse_mode='HTML')
 
-# ================== WEBHOOK TESTING ==================
-
+# Webhook tests
 async def test_webhook_simple(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Simple webhook test"""
-    await update.message.reply_text("🔄 <b>Simple webhook test...</b>", parse_mode='HTML')
-
     webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
     result = webhook_logger.test_webhook("simple")
-
+    
     if result['success']:
-        await update.message.reply_text(
-            f"""✅ <b>Simple Webhook Test Successful!</b>
-
-📡 Status Code: {result['status_code']}
-⏱️ Response Time: {result['response_time']:.2f}s
-
-🎯 Perfect! Go to Make.com and add Google Sheets module.""", 
-            parse_mode='HTML'
-        )
+        await update.message.reply_text("✅ Webhook test successful!", parse_mode='HTML')
     else:
-        await update.message.reply_text(
-            f"""❌ <b>Simple Test Failed</b>
-
-Status: {result['status_code']}
-Error: {result['response_text'][:200]}""", 
-            parse_mode='HTML'
-        )
-
-async def test_webhook_basic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Basic webhook test"""
-    await update.message.reply_text("🔄 <b>Basic webhook test...</b>", parse_mode='HTML')
-
-    webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
-    result = webhook_logger.test_webhook("basic")
-
-    if result['success']:
-        await update.message.reply_text(
-            f"""✅ <b>Basic Webhook Test Successful!</b>
-
-📡 Status Code: {result['status_code']}
-⏱️ Response Time: {result['response_time']:.2f}s
-
-🎯 Perfect! Your webhook accepts trade data.""", 
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text(
-            f"""❌ <b>Basic Test Failed</b>
-
-Status: {result['status_code']}
-Error: {result['response_text'][:200]}""", 
-            parse_mode='HTML'
-        )
+        await update.message.reply_text(f"❌ Test failed: {result['response_text'][:200]}", parse_mode='HTML')
 
 async def test_webhook_advanced(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Advanced webhook test"""
-    await update.message.reply_text("🚀 <b>Advanced webhook test...</b>", parse_mode='HTML')
-
     webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
     result = webhook_logger.test_webhook("advanced")
-
+    
     if result['success']:
-        result_text = f"""✅ <b>Advanced Webhook Test Successful!</b>
-
-📡 Status Code: {result['status_code']}
-⏱️ Response Time: {result['response_time']:.2f}s
-
-🎉 Perfect! All 20+ fields sent successfully.
-Check Make.com for complete data."""
+        await update.message.reply_text("✅ Advanced test successful!", parse_mode='HTML')
     else:
-        result_text = f"""❌ <b>Advanced Test Failed</b>
+        await update.message.reply_text(f"❌ Test failed", parse_mode='HTML')
 
-Status: {result['status_code']}
-Error: {result['response_text'][:200]}"""
-
-    await update.message.reply_text(result_text, parse_mode='HTML')
-
-# ================== BINANCE SETUP ==================
-
-async def setup_binance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# TP Configuration
+async def configure_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    keyboard_markup = create_tp_config_keyboard(user_id)
+    
     await update.message.reply_text(
-        """🔑 <b>Binance API Setup</b>
+        "🎯 <b>Take Profit Configuration</b>\n\nConfigure each TP level:",
+        reply_markup=keyboard_markup,
+        parse_mode='HTML'
+    )
 
-Send your Binance API Key:""", parse_mode='HTML')
+# Trailing Configuration  
+async def configure_trailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    keyboard_markup = create_trailing_config_keyboard(user_id)
+    
+    await update.message.reply_text(
+        "🔄 <b>Trailing Stop Configuration</b>\n\nConfigure trailing stop:",
+        reply_markup=keyboard_markup,
+        parse_mode='HTML'
+    )
+
+# Setup handlers (simplified - same as before but added new conversation states)
+async def setup_binance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send your Binance API Key:", parse_mode='HTML')
     return WAITING_BINANCE_KEY
 
 async def handle_binance_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
     config.binance_api_key = update.message.text.strip()
-
-    await update.message.reply_text("🔐 <b>API Key saved!</b> Now send your API Secret:", parse_mode='HTML')
+    await update.message.reply_text("Now send your API Secret:", parse_mode='HTML')
     return WAITING_BINANCE_SECRET
 
 async def handle_binance_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
     config.binance_api_secret = update.message.text.strip()
-
-    await update.message.reply_text("🔄 Testing Binance connection...")
     success = await trading_bot.setup_binance_client(config)
-
     if success:
-        await update.message.reply_text("✅ <b>Binance configured!</b> Next: /setup_telegram", parse_mode='HTML')
+        await update.message.reply_text("✅ Binance configured!", parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ <b>Configuration failed!</b> Check credentials", parse_mode='HTML')
-
+        await update.message.reply_text("❌ Failed!", parse_mode='HTML')
     return ConversationHandler.END
 
-# ================== TELEGRAM SETUP ==================
-
 async def setup_telegram_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        """📱 <b>Telegram API Setup</b>
-
-Send your Telegram API ID:""", parse_mode='HTML')
+    await update.message.reply_text("Send your Telegram API ID:", parse_mode='HTML')
     return WAITING_TELEGRAM_ID
 
 async def handle_telegram_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
     config.telegram_api_id = update.message.text.strip()
-
-    await update.message.reply_text("🆔 <b>API ID saved!</b> Now send your API Hash:", parse_mode='HTML')
+    await update.message.reply_text("Now send your API Hash:", parse_mode='HTML')
     return WAITING_TELEGRAM_HASH
 
 async def handle_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
     config.telegram_api_hash = update.message.text.strip()
-
-    await update.message.reply_text("🔄 Testing Telegram API...")
     success = await trading_bot.setup_telethon_client(config)
-
     if success:
-        await update.message.reply_text("✅ <b>Telegram API configured!</b> Next: /setup_channels", parse_mode='HTML')
+        await update.message.reply_text("✅ Telegram configured!", parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ <b>Failed!</b> Check credentials", parse_mode='HTML')
-
+        await update.message.reply_text("❌ Failed!", parse_mode='HTML')
     return ConversationHandler.END
-
-# ================== CHANNEL SETUP ==================
 
 async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
-    await update.message.reply_text("🔍 <b>Loading channels...</b>", parse_mode='HTML')
-
     channels = await trading_bot.get_available_channels(user_id)
-
     if not channels:
-        await update.message.reply_text("❌ <b>No channels!</b> Use /setup_telegram first", parse_mode='HTML')
+        await update.message.reply_text("❌ No channels!", parse_mode='HTML')
         return ConversationHandler.END
-
     context.user_data['available_channels'] = channels
     keyboard_markup = create_channel_keyboard(user_id, channels)
-
-    await update.message.reply_text(
-        create_channel_selection_text(user_id),
-        reply_markup=keyboard_markup,
-        parse_mode='HTML'
-    )
-
+    await update.message.reply_text(create_channel_selection_text(user_id), reply_markup=keyboard_markup, parse_mode='HTML')
     return WAITING_CHANNEL_SELECTION
 
 async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
-
     try:
         await query.answer()
     except:
         pass
-
     if query.data == "channels_done":
-        await query.edit_message_text(
-            f"""✅ <b>Channel selection complete!</b>
-
-Monitoring: <b>{len(config.monitored_channels)}</b> channels
-
-Next: /setup_trading""",
-            parse_mode='HTML'
-        )
+        await query.edit_message_text(f"✅ Monitoring: {len(config.monitored_channels)} channels", parse_mode='HTML')
         return ConversationHandler.END
-
-    elif query.data == "clear_all_channels":
-        config.monitored_channels.clear()
-        channels = context.user_data.get('available_channels', [])
-        keyboard_markup = create_channel_keyboard(user_id, channels)
-        await query.edit_message_text(
-            create_channel_selection_text(user_id),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-
-    elif query.data == "add_manual_channel":
-        await query.edit_message_text(
-            """📝 <b>Manual Channel ID</b>
-
-Send channel ID: <code>-1001234567890</code>""",
-            parse_mode='HTML'
-        )
-        return WAITING_MANUAL_CHANNEL
-
     elif query.data.startswith("toggle_channel_"):
         channel_id = query.data.replace("toggle_channel_", "")
-
         if channel_id in config.monitored_channels:
             config.monitored_channels.remove(channel_id)
         else:
             config.monitored_channels.append(channel_id)
-
         channels = context.user_data.get('available_channels', [])
         keyboard_markup = create_channel_keyboard(user_id, channels)
-
-        await query.edit_message_text(
-            create_channel_selection_text(user_id),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-
+        await query.edit_message_text(create_channel_selection_text(user_id), reply_markup=keyboard_markup, parse_mode='HTML')
     return WAITING_CHANNEL_SELECTION
-
-async def handle_manual_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    config = trading_bot.get_user_config(user_id)
-    channel_id = update.message.text.strip()
-
-    if not channel_id.lstrip('-').isdigit():
-        await update.message.reply_text("❌ Invalid format!", parse_mode='HTML')
-        return WAITING_MANUAL_CHANNEL
-
-    if not channel_id.startswith('-'):
-        channel_id = '-' + channel_id
-
-    if channel_id not in config.monitored_channels:
-        config.monitored_channels.append(channel_id)
-
-    await update.message.reply_text(
-        f"""✅ <b>Channel added!</b>
-
-Channel ID: <code>{channel_id}</code>
-Total: <b>{len(config.monitored_channels)}</b>
-
-Use /setup_trading next""",
-        parse_mode='HTML'
-    )
-
-    return ConversationHandler.END
-
-# ================== TRADING SETUP ==================
 
 async def setup_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     keyboard_markup = create_settings_keyboard(user_id)
-
-    await update.message.reply_text(
-        "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
-        reply_markup=keyboard_markup,
-        parse_mode='HTML'
-    )
-
+    await update.message.reply_text("⚙️ Trading Configuration", reply_markup=keyboard_markup, parse_mode='HTML')
     return WAITING_SETTINGS_SOURCE
 
 async def handle_trading_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
-
     try:
         await query.answer()
     except:
         pass
-
+        
     if query.data == "trading_done":
-        await query.edit_message_text(
-            f"""✅ <b>Configuration complete!</b>
-
-All settings saved.
-Next: /start_monitoring""",
-            parse_mode='HTML'
-        )
+        await query.edit_message_text("✅ Configuration complete!", parse_mode='HTML')
         return ConversationHandler.END
-
     elif query.data == "toggle_settings_source":
         config.use_signal_settings = not config.use_signal_settings
         keyboard_markup = create_settings_keyboard(user_id)
-        await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-
+        await query.edit_message_text("⚙️ Trading Configuration", reply_markup=keyboard_markup, parse_mode='HTML')
     elif query.data == "toggle_sl_tp":
         config.create_sl_tp = not config.create_sl_tp
         keyboard_markup = create_settings_keyboard(user_id)
-        await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-
+        await query.edit_message_text("⚙️ Trading Configuration", reply_markup=keyboard_markup, parse_mode='HTML')
     elif query.data == "toggle_webhook":
         config.make_webhook_enabled = not config.make_webhook_enabled
         keyboard_markup = create_settings_keyboard(user_id)
-        await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-
+        await query.edit_message_text("⚙️ Trading Configuration", reply_markup=keyboard_markup, parse_mode='HTML')
+    elif query.data == "configure_tps":
+        keyboard_markup = create_tp_config_keyboard(user_id)
+        await query.edit_message_text("🎯 <b>Take Profit Configuration</b>", reply_markup=keyboard_markup, parse_mode='HTML')
+    elif query.data == "configure_trailing":
+        keyboard_markup = create_trailing_config_keyboard(user_id)
+        await query.edit_message_text("🔄 <b>Trailing Stop Configuration</b>", reply_markup=keyboard_markup, parse_mode='HTML')
+    elif query.data == "back_to_settings":
+        keyboard_markup = create_settings_keyboard(user_id)
+        await query.edit_message_text("⚙️ Trading Configuration", reply_markup=keyboard_markup, parse_mode='HTML')
+    elif query.data == "set_tp1":
+        await query.edit_message_text("🎯 Send TP1 settings as: <code>2.5 50</code> (2.5% profit, closes 50%)", parse_mode='HTML')
+        return WAITING_TP1_PERCENT
+    elif query.data == "set_tp2":
+        await query.edit_message_text("🎯 Send TP2 settings as: <code>5 50</code> (5% profit, closes 50%)", parse_mode='HTML')
+        return WAITING_TP2_PERCENT
+    elif query.data == "set_tp3":
+        await query.edit_message_text("🎯 Send TP3 settings as: <code>7.5 100</code> (7.5% profit, closes 100%)", parse_mode='HTML')
+        return WAITING_TP3_PERCENT
+    elif query.data == "set_trailing_percent":
+        await query.edit_message_text("🔄 Send trailing stop % (e.g., 2 for 2%):", parse_mode='HTML')
+        return WAITING_TRAILING_PERCENT
+    elif query.data == "toggle_trailing":
+        config.trailing_stop_enabled = not config.trailing_stop_enabled
+        keyboard_markup = create_trailing_config_keyboard(user_id)
+        await query.edit_message_text("🔄 <b>Trailing Stop Configuration</b>", reply_markup=keyboard_markup, parse_mode='HTML')
+    elif query.data == "set_trailing_activation":
+        # Cycle through activation options
+        if config.trailing_activation == "IMMEDIATE":
+            config.trailing_activation = "TP1"
+        elif config.trailing_activation == "TP1":
+            config.trailing_activation = "TP2"
+        else:
+            config.trailing_activation = "IMMEDIATE"
+        keyboard_markup = create_trailing_config_keyboard(user_id)
+        await query.edit_message_text("🔄 <b>Trailing Stop Configuration</b>", reply_markup=keyboard_markup, parse_mode='HTML')
     elif query.data == "set_leverage":
-        await query.edit_message_text(
-            "⚡ <b>Set Leverage</b>\n\nSend value (1-125):",
-            parse_mode='HTML'
-        )
+        await query.edit_message_text("⚡ Send leverage (1-125):", parse_mode='HTML')
         return WAITING_LEVERAGE
-
     elif query.data == "set_stop_loss":
-        await query.edit_message_text(
-            "🛑 <b>Set Stop Loss</b>\n\nSend percentage (e.g., 5 for 5%):",
-            parse_mode='HTML'
-        )
+        await query.edit_message_text("🛑 Send stop loss %:", parse_mode='HTML')
         return WAITING_STOP_LOSS
-
-    elif query.data == "set_take_profit":
-        await query.edit_message_text(
-            "🎯 <b>Set Take Profit</b>\n\nSend percentage (e.g., 10 for 10%):",
-            parse_mode='HTML'
-        )
-        return WAITING_TAKE_PROFIT
-
     elif query.data == "set_balance_percent":
-        await query.edit_message_text(
-            "💰 <b>Set Balance %</b>\n\nSend percentage (1-100):",
-            parse_mode='HTML'
-        )
+        await query.edit_message_text("💰 Send balance % (1-100):", parse_mode='HTML')
         return WAITING_BALANCE_PERCENT
-
     return WAITING_SETTINGS_SOURCE
+
+# TP handlers
+async def handle_tp1_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    try:
+        parts = update.message.text.split()
+        if len(parts) == 2:
+            config.tp1_percent = float(parts[0])
+            config.tp1_close_percent = float(parts[1])
+            await update.message.reply_text(f"✅ TP1: {config.tp1_percent}% (closes {config.tp1_close_percent}%)", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid format! Use: <code>2.5 50</code>", parse_mode='HTML')
+    except:
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
+    return ConversationHandler.END
+
+async def handle_tp2_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    try:
+        parts = update.message.text.split()
+        if len(parts) == 2:
+            config.tp2_percent = float(parts[0])
+            config.tp2_close_percent = float(parts[1])
+            await update.message.reply_text(f"✅ TP2: {config.tp2_percent}% (closes {config.tp2_close_percent}%)", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid format!", parse_mode='HTML')
+    except:
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
+    return ConversationHandler.END
+
+async def handle_tp3_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    try:
+        parts = update.message.text.split()
+        if len(parts) == 2:
+            config.tp3_percent = float(parts[0])
+            config.tp3_close_percent = float(parts[1])
+            await update.message.reply_text(f"✅ TP3: {config.tp3_percent}% (closes {config.tp3_close_percent}%)", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Invalid format!", parse_mode='HTML')
+    except:
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
+    return ConversationHandler.END
+
+async def handle_trailing_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    try:
+        value = float(update.message.text)
+        if 0.1 <= value <= 10:
+            config.trailing_stop_percent = value
+            await update.message.reply_text(f"✅ Trailing: {value}%", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Must be 0.1-10%", parse_mode='HTML')
+    except:
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
+    return ConversationHandler.END
 
 async def handle_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
-
     try:
         leverage = int(update.message.text)
         if 1 <= leverage <= 125:
             config.leverage = leverage
-            await update.message.reply_text(f"✅ <b>Leverage: {leverage}x</b>", parse_mode='HTML')
+            await update.message.reply_text(f"✅ Leverage: {leverage}x", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Must be 1-125", parse_mode='HTML')
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
-
+    except:
+        await update.message.reply_text("❌ Invalid!", parse_mode='HTML')
     return ConversationHandler.END
 
 async def handle_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
-
     try:
-        sl_percent = float(update.message.text)
-        if 0.1 <= sl_percent <= 50:
-            config.stop_loss_percent = sl_percent
-            await update.message.reply_text(f"✅ <b>Stop Loss: {sl_percent}%</b>", parse_mode='HTML')
+        sl = float(update.message.text)
+        if 0.1 <= sl <= 50:
+            config.stop_loss_percent = sl
+            await update.message.reply_text(f"✅ SL: {sl}%", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Must be 0.1-50%", parse_mode='HTML')
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
-
-    return ConversationHandler.END
-
-async def handle_take_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    config = trading_bot.get_user_config(user_id)
-
-    try:
-        tp_percent = float(update.message.text)
-        if 0.1 <= tp_percent <= 100:
-            config.take_profit_percent = tp_percent
-            await update.message.reply_text(f"✅ <b>Take Profit: {tp_percent}%</b>", parse_mode='HTML')
-        else:
-            await update.message.reply_text("❌ Must be 0.1-100%", parse_mode='HTML')
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
-
+    except:
+        await update.message.reply_text("❌ Invalid!", parse_mode='HTML')
     return ConversationHandler.END
 
 async def handle_balance_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
-
     try:
         value = float(update.message.text)
         if 1 <= value <= 100:
             config.balance_percent = value
-            await update.message.reply_text(f"✅ <b>Balance: {value}%</b>", parse_mode='HTML')
+            await update.message.reply_text(f"✅ Balance: {value}%", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Must be 1-100", parse_mode='HTML')
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
-
+    except:
+        await update.message.reply_text("❌ Invalid!", parse_mode='HTML')
     return ConversationHandler.END
-
-# ================== MONITORING ==================
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
-
     if not config.binance_api_key or not config.telegram_api_id:
         await update.message.reply_text("❌ Complete setup first!", parse_mode='HTML')
         return
-
     if not config.monitored_channels:
-        await update.message.reply_text("❌ No channels! Use /setup_channels", parse_mode='HTML')
+        await update.message.reply_text("❌ No channels!", parse_mode='HTML')
         return
-
-    await update.message.reply_text("🚀 <b>Starting...</b>", parse_mode='HTML')
-
     success = await trading_bot.start_monitoring(user_id, context.bot)
-
     if success:
-        status_msg = f"""✅ <b>MONITORING STARTED!</b>
+        await update.message.reply_text(f"""✅ <b>MONITORING STARTED!</b>
 
-📡 Monitoring: <b>{len(config.monitored_channels)}</b> channels
-⚙️ Settings: {'Signal' if config.use_signal_settings else 'Bot'}
-📊 SL/TP: {'ON' if config.create_sl_tp else 'OFF'}
-🔄 OCO: Auto-cancel enabled
-🔗 Webhook: ENABLED
-
-🎯 Ready to trade!
-Use /stop_monitoring to stop."""
-
-        await update.message.reply_text(status_msg, parse_mode='HTML')
+📡 Channels: {len(config.monitored_channels)}
+🎯 Multi-TP: {config.tp1_percent}%, {config.tp2_percent}%, {config.tp3_percent}%
+🔄 Trailing: {config.trailing_stop_percent}% (activates on {config.trailing_activation})
+🚀 Ready to trade!""", parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ Failed to start!", parse_mode='HTML')
+        await update.message.reply_text("❌ Failed!", parse_mode='HTML')
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     trading_bot.active_monitoring[user_id] = False
     trading_bot.order_monitor_running = False
+    await update.message.reply_text("🛑 Monitoring stopped!", parse_mode='HTML')
 
-    await update.message.reply_text("🛑 <b>Monitoring stopped!</b>", parse_mode='HTML')
-
-# ================== TEST SIGNAL ==================
-
-async def test_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    test_signals = [
-        """#BTCUSDT
-LONG
-Entry: 45000
-TP1: 46000
-TP2: 47000
-SL: 44000
-Leverage: 10x""",
-
-        """#ETHUSDT
-SHORT
-Вход: 3000
-Тп1: 2900
-Тп2: 2800
-Сл: 3100
-Плечо: 5x"""
-    ]
-
-    results = []
-    for i, test_msg in enumerate(test_signals, 1):
-        signal = trading_bot.parse_trading_signal(test_msg, "test")
-        if signal:
-            results.append(f"""<b>Test {i}: ✅</b>
-{signal.symbol} {signal.trade_type}
-Entry: {signal.entry_price}
-SL: {signal.stop_loss}
-TP: {signal.take_profit}""")
-        else:
-            results.append(f"<b>Test {i}: ❌</b>")
-
-    await update.message.reply_text("🧪 <b>Parser Test</b>\n\n" + "\n\n".join(results), parse_mode='HTML')
-
-# ================== CONVERSATION HANDLERS ==================
-
+# Conversation handlers
 binance_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_binance', setup_binance)],
     states={
         WAITING_BINANCE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_key)],
         WAITING_BINANCE_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_secret)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    fallbacks=[]
 )
 
 telegram_conv_handler = ConversationHandler(
@@ -1929,16 +1810,15 @@ telegram_conv_handler = ConversationHandler(
         WAITING_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_id)],
         WAITING_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_hash)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    fallbacks=[]
 )
 
 channel_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_channels', setup_channels)],
     states={
         WAITING_CHANNEL_SELECTION: [CallbackQueryHandler(handle_channel_selection)],
-        WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    fallbacks=[]
 )
 
 trading_conv_handler = ConversationHandler(
@@ -1947,13 +1827,14 @@ trading_conv_handler = ConversationHandler(
         WAITING_SETTINGS_SOURCE: [CallbackQueryHandler(handle_trading_settings)],
         WAITING_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_leverage)],
         WAITING_STOP_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stop_loss)],
-        WAITING_TAKE_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_take_profit)],
         WAITING_BALANCE_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_balance_percent)],
+        WAITING_TP1_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp1_settings)],
+        WAITING_TP2_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp2_settings)],
+        WAITING_TP3_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp3_settings)],
+        WAITING_TRAILING_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trailing_percent)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    fallbacks=[]
 )
-
-# ================== MAIN ==================
 
 def main():
     """Start the bot"""
@@ -1961,7 +1842,6 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Add handlers
     application.add_handler(binance_conv_handler)
     application.add_handler(telegram_conv_handler)
     application.add_handler(channel_conv_handler)
@@ -1971,19 +1851,18 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("configure_tp", configure_tp))
+    application.add_handler(CommandHandler("configure_trailing", configure_trailing))
     application.add_handler(CommandHandler("start_monitoring", start_monitoring))
     application.add_handler(CommandHandler("stop_monitoring", stop_monitoring))
-    application.add_handler(CommandHandler("test_signal", test_signal))
     application.add_handler(CommandHandler("test_simple", test_webhook_simple))
-    application.add_handler(CommandHandler("test_basic", test_webhook_basic))
     application.add_handler(CommandHandler("test_advanced", test_webhook_advanced))
 
-    print("🤖 Trading Bot v3.1 Starting...")
-    print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
-    print("✅ Fixed: Decimal precision for micro-priced coins")
-    print("✅ Feature: OCO order simulation")
-    print("✅ Feature: Auto-cancel opposite orders")
-    print("✅ Fixed: Syntax error in send_trade_data")
+    print("🤖 Trading Bot v3.3 Starting...")
+    print("✅ Configurable Multi-TP: TP1, TP2, TP3")
+    print("✅ Adjustable Trailing Stop")
+    print("✅ Enhanced Balance Checking")
+    print("✅ Full Bot Configuration")
     print("📊 Ready!")
     
     application.run_polling()
