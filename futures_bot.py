@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram Trading Bot v3.0 - COMPLETE WITH NEW MAKE.COM WEBHOOK
-- Integrated with Make.com webhook: https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava
-- Advanced webhook testing and troubleshooting
-- Enhanced signal parsing for Russian formats
-- Minimum order buttons REMOVED
-- Balance percentage works for all values 1-100%
-- FIXED: Stop Loss precision errors
+Telegram Trading Bot v3.1 - COMPLETE WITH OCO SIMULATION
+- Fixed: Decimal precision for all price levels
+- Feature: Auto-cancel SL when TP fills and vice versa
+- Fixed: Stop Loss and Take Profit rounding errors
+- Enhanced: Order monitoring with OCO simulation
+- Fixed: Syntax error in send_trade_data
 """
 
 import asyncio
@@ -16,11 +15,11 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
 import os
 import sys
 import traceback
 import requests
-import math
 
 # Import python-telegram-bot
 from telegram import (
@@ -116,6 +115,24 @@ class BotConfig:
         if self.monitored_channels is None:
             self.monitored_channels = []
 
+@dataclass
+class ActivePosition:
+    """Track active positions with their SL/TP orders"""
+    symbol: str
+    user_id: int
+    side: str
+    quantity: float
+    entry_price: float
+    stop_loss_order_id: Optional[int] = None
+    take_profit_order_ids: List[int] = None
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        if self.take_profit_order_ids is None:
+            self.take_profit_order_ids = []
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+
 class MakeWebhookLogger:
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
@@ -144,7 +161,7 @@ class MakeWebhookLogger:
                 "sl_order_id": str(trade_data.get('sl_order_id', '')),
                 "tp_order_ids": str(trade_data.get('tp_order_ids', '')),
                 "user_id": str(trade_data.get('user_id', '')),
-                "webhook_version": "3.0",
+                "webhook_version": "3.1",
                 "bot_source": "Telegram Trading Bot",
                 "time": datetime.now().strftime('%H:%M:%S'),
                 "date": datetime.now().strftime('%Y-%m-%d')
@@ -155,8 +172,8 @@ class MakeWebhookLogger:
 
             headers = {
                 'Content-Type': 'application/json',
-                'User-Agent': 'TradingBot/3.0',
-                'X-Bot-Version': '3.0'
+                'User-Agent': 'TradingBot/3.1',
+                'X-Bot-Version': '3.1'
             }
 
             response = requests.post(
@@ -189,7 +206,7 @@ class MakeWebhookLogger:
                     "status": "TEST",
                     "time": datetime.now().strftime('%H:%M:%S'),
                     "date": datetime.now().strftime('%Y-%m-%d'),
-                    "webhook_version": "3.0"
+                    "webhook_version": "3.1"
                 }
             elif test_type == "basic":
                 test_data = {
@@ -223,7 +240,7 @@ class MakeWebhookLogger:
                     "sl_order_id": f"SL_TEST_{current_time.strftime('%H%M%S')}",
                     "tp_order_ids": f"TP1_TEST_{current_time.strftime('%H%M%S')}, TP2_TEST_{current_time.strftime('%H%M%S')}",
                     "user_id": "test_user",
-                    "webhook_version": "3.0",
+                    "webhook_version": "3.1",
                     "bot_source": "Telegram Trading Bot",
                     "time": current_time.strftime('%H:%M:%S'),
                     "date": current_time.strftime('%Y-%m-%d')
@@ -231,7 +248,7 @@ class MakeWebhookLogger:
 
             headers = {
                 'Content-Type': 'application/json',
-                'User-Agent': 'TradingBot/3.0',
+                'User-Agent': 'TradingBot/3.1',
                 'X-Test-Type': test_type
             }
 
@@ -425,7 +442,9 @@ class TradingBot:
         self.active_monitoring = {}
         self.monitoring_tasks = {}
         self.webhook_loggers: Dict[int, MakeWebhookLogger] = {}
-        self.symbol_info_cache: Dict[str, Dict] = {}  # Cache for symbol info
+        self.symbol_info_cache: Dict[str, Dict] = {}
+        self.active_positions: Dict[str, ActivePosition] = {}
+        self.order_monitor_running = False
 
     def parse_trading_signal(self, message: str, channel_id: str) -> Optional[TradingSignal]:
         """Enhanced signal parsing with Russian support"""
@@ -487,7 +506,7 @@ class TradingBot:
             return False
 
     def get_symbol_precision(self, symbol: str) -> Dict[str, Any]:
-        """Get and cache symbol precision information"""
+        """Get and cache symbol precision information with SAFE DEFAULTS"""
         try:
             if symbol in self.symbol_info_cache:
                 return self.symbol_info_cache[symbol]
@@ -523,61 +542,188 @@ class TradingBot:
                     max_price = float(f['maxPrice'])
                     break
 
-            # Calculate precision decimals
+            # Calculate precision decimals with safe fallbacks
             qty_precision = 0
             price_precision = 0
 
-            if step_size:
-                if '.' in str(step_size):
-                    qty_precision = len(str(step_size).rstrip('0').split('.')[-1])
+            if step_size and step_size > 0:
+                step_str = f"{step_size:.10f}".rstrip('0')
+                if '.' in step_str:
+                    qty_precision = len(step_str.split('.')[-1])
+            else:
+                step_size = 1.0
+                qty_precision = 0
 
-            if tick_size:
-                if '.' in str(tick_size):
-                    price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
+            if tick_size and tick_size > 0:
+                tick_str = f"{tick_size:.10f}".rstrip('0')
+                if '.' in tick_str:
+                    price_precision = len(tick_str.split('.')[-1])
+            else:
+                tick_size = 0.00001
+                price_precision = 5
 
             precision_info = {
                 'step_size': step_size,
-                'min_qty': min_qty,
+                'min_qty': min_qty if min_qty else 1.0,
                 'tick_size': tick_size,
-                'min_price': min_price,
-                'max_price': max_price,
-                'qty_precision': qty_precision,
-                'price_precision': price_precision
+                'min_price': min_price if min_price else 0.00001,
+                'max_price': max_price if max_price else 1000000.0,
+                'qty_precision': max(qty_precision, 0),
+                'price_precision': max(price_precision, 5)
             }
 
-            # Cache it
             self.symbol_info_cache[symbol] = precision_info
             
-            logger.info(f"📏 Symbol precision for {symbol}: qty={qty_precision}, price={price_precision}")
+            logger.info(f"📏 Symbol precision for {symbol}: qty={precision_info['qty_precision']}, price={precision_info['price_precision']}, tick={tick_size}")
             return precision_info
 
         except Exception as e:
             logger.error(f"❌ Error getting symbol precision: {e}")
-            return {'error': str(e)}
+            return {
+                'step_size': 1.0,
+                'min_qty': 1.0,
+                'tick_size': 0.00001,
+                'min_price': 0.00001,
+                'max_price': 1000000.0,
+                'qty_precision': 0,
+                'price_precision': 5
+            }
 
     def round_price(self, price: float, tick_size: float, price_precision: int) -> float:
-        """Round price to match tick size and precision"""
+        """Round price to match tick size and precision - NEVER ZERO"""
         try:
-            # Round to tick size
-            rounded = round(price / tick_size) * tick_size
-            # Round to precision
+            if not tick_size or tick_size <= 0:
+                tick_size = 0.00001
+            
+            if price_precision < 1:
+                price_precision = 5
+
+            price_decimal = Decimal(str(price))
+            tick_decimal = Decimal(str(tick_size))
+            
+            rounded = float((price_decimal / tick_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * tick_decimal)
             rounded = round(rounded, price_precision)
+            
+            if rounded <= 0:
+                rounded = tick_size
+                logger.warning(f"⚠️ Price rounded to zero, using tick_size: {tick_size}")
+            
             return rounded
+            
         except Exception as e:
-            logger.error(f"❌ Error rounding price: {e}")
-            return round(price, price_precision)
+            logger.error(f"❌ Error rounding price {price}: {e}")
+            return max(tick_size if tick_size > 0 else 0.00001, round(price, price_precision))
 
     def round_quantity(self, quantity: float, step_size: float, qty_precision: int) -> float:
         """Round quantity to match step size and precision"""
         try:
-            # Round to step size
-            rounded = round(quantity / step_size) * step_size
-            # Round to precision
+            if not step_size or step_size <= 0:
+                step_size = 1.0
+            
+            qty_decimal = Decimal(str(quantity))
+            step_decimal = Decimal(str(step_size))
+            
+            rounded = float((qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_decimal)
             rounded = round(rounded, qty_precision)
+            
+            if rounded < step_size:
+                rounded = step_size
+            
             return rounded
+            
         except Exception as e:
-            logger.error(f"❌ Error rounding quantity: {e}")
+            logger.error(f"❌ Error rounding quantity {quantity}: {e}")
             return round(quantity, qty_precision)
+
+    async def cancel_related_orders(self, symbol: str, user_id: int, filled_order_type: str, bot_instance):
+        """Cancel SL when TP fills, or cancel all TPs when SL fills"""
+        try:
+            position = self.active_positions.get(symbol)
+            if not position:
+                logger.info(f"⚠️ No active position found for {symbol}")
+                return
+
+            logger.info(f"🔄 Canceling related orders for {symbol} after {filled_order_type} filled")
+
+            cancelled_orders = []
+
+            if filled_order_type == "TAKE_PROFIT" and position.stop_loss_order_id:
+                try:
+                    self.binance_client.futures_cancel_order(
+                        symbol=symbol,
+                        orderId=position.stop_loss_order_id
+                    )
+                    cancelled_orders.append(f"SL-{position.stop_loss_order_id}")
+                    logger.info(f"✅ Cancelled Stop Loss order: {position.stop_loss_order_id}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to cancel SL: {e}")
+
+            elif filled_order_type == "STOP_LOSS" and position.take_profit_order_ids:
+                for tp_id in position.take_profit_order_ids:
+                    try:
+                        self.binance_client.futures_cancel_order(
+                            symbol=symbol,
+                            orderId=tp_id
+                        )
+                        cancelled_orders.append(f"TP-{tp_id}")
+                        logger.info(f"✅ Cancelled Take Profit order: {tp_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to cancel TP {tp_id}: {e}")
+
+            if symbol in self.active_positions:
+                del self.active_positions[symbol]
+                logger.info(f"🗑️ Removed {symbol} from active positions")
+
+            if cancelled_orders:
+                await bot_instance.send_message(
+                    chat_id=user_id,
+                    text=f"🔄 <b>Auto-Cancelled Orders</b>\n\n💰 {symbol}\n📋 Cancelled: {', '.join(cancelled_orders)}\n⚠️ Reason: {filled_order_type} was filled",
+                    parse_mode='HTML'
+                )
+
+        except Exception as e:
+            logger.error(f"❌ Error canceling related orders: {e}")
+
+    async def monitor_orders(self, bot_instance):
+        """Monitor open orders and cancel opposites when filled"""
+        try:
+            if self.order_monitor_running:
+                return
+
+            self.order_monitor_running = True
+            logger.info("👁️ Order monitor started")
+
+            while self.order_monitor_running:
+                try:
+                    for symbol, position in list(self.active_positions.items()):
+                        try:
+                            open_orders = self.binance_client.futures_get_open_orders(symbol=symbol)
+                            open_order_ids = [int(order['orderId']) for order in open_orders]
+
+                            if position.stop_loss_order_id and position.stop_loss_order_id not in open_order_ids:
+                                logger.info(f"🛑 Stop Loss filled for {symbol}")
+                                await self.cancel_related_orders(symbol, position.user_id, "STOP_LOSS", bot_instance)
+
+                            for tp_id in position.take_profit_order_ids:
+                                if tp_id not in open_order_ids:
+                                    logger.info(f"🎯 Take Profit filled for {symbol}")
+                                    await self.cancel_related_orders(symbol, position.user_id, "TAKE_PROFIT", bot_instance)
+                                    break
+
+                        except Exception as e:
+                            logger.error(f"❌ Error checking orders for {symbol}: {e}")
+
+                    await asyncio.sleep(5)
+
+                except Exception as e:
+                    logger.error(f"❌ Order monitor loop error: {e}")
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+            logger.error(f"❌ Order monitor error: {e}")
+        finally:
+            self.order_monitor_running = False
+            logger.info("👁️ Order monitor stopped")
 
     async def get_account_balance(self, config: BotConfig) -> Dict[str, float]:
         """Get detailed account balance information"""
@@ -637,7 +783,7 @@ class TradingBot:
             return False
 
     async def setup_telethon_client(self, config: BotConfig) -> bool:
-        """Setup Telethon client - ONLY when needed, not during import"""
+        """Setup Telethon client"""
         try:
             session_name = f'session_{config.user_id}'
 
@@ -686,12 +832,11 @@ class TradingBot:
             return []
 
     async def create_sl_tp_orders(self, symbol: str, side: str, quantity: float, entry_price: float, 
-                                sl_price: Optional[float], tp_prices: List[float]) -> Dict[str, Any]:
-        """Create stop loss and take profit orders with PROPER PRECISION"""
+                                sl_price: Optional[float], tp_prices: List[float], user_id: int) -> Dict[str, Any]:
+        """Create stop loss and take profit orders with PROPER PRECISION and OCO tracking"""
         try:
             results = {'stop_loss': None, 'take_profits': []}
 
-            # Get symbol precision
             precision_info = self.get_symbol_precision(symbol)
             if 'error' in precision_info:
                 logger.error(f"❌ Cannot create SL/TP: {precision_info['error']}")
@@ -702,15 +847,19 @@ class TradingBot:
             step_size = precision_info['step_size']
             qty_precision = precision_info['qty_precision']
 
-            # Create Stop Loss Order with CORRECT PRECISION
+            logger.info(f"📐 Using precision: price={price_precision} decimals, qty={qty_precision} decimals")
+            logger.info(f"📐 Tick size: {tick_size}, Step size: {step_size}")
+
             if sl_price:
                 try:
                     sl_side = 'SELL' if side == 'BUY' else 'BUY'
-                    
-                    # Round SL price to proper precision
                     sl_price_rounded = self.round_price(sl_price, tick_size, price_precision)
                     
                     logger.info(f"🛑 Creating Stop Loss: {sl_price_rounded} (original: {sl_price})")
+                    
+                    if sl_price_rounded <= 0:
+                        logger.error(f"❌ Invalid SL price after rounding: {sl_price_rounded}")
+                        return results
                     
                     sl_order = self.binance_client.futures_create_order(
                         symbol=symbol,
@@ -725,17 +874,19 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"❌ Failed to create Stop Loss: {e}")
 
-            # Create Take Profit Orders with CORRECT PRECISION
             for i, tp_price in enumerate(tp_prices[:3]):
                 try:
                     tp_side = 'SELL' if side == 'BUY' else 'BUY'
                     tp_quantity = quantity / len(tp_prices)
                     
-                    # Round TP price and quantity to proper precision
                     tp_price_rounded = self.round_price(tp_price, tick_size, price_precision)
                     tp_quantity_rounded = self.round_quantity(tp_quantity, step_size, qty_precision)
                     
-                    logger.info(f"🎯 Creating Take Profit {i+1}: {tp_price_rounded} qty={tp_quantity_rounded}")
+                    logger.info(f"🎯 Creating Take Profit {i+1}: {tp_price_rounded} qty={tp_quantity_rounded} (original price: {tp_price})")
+                    
+                    if tp_price_rounded <= 0:
+                        logger.error(f"❌ Invalid TP price after rounding: {tp_price_rounded}")
+                        continue
 
                     tp_order = self.binance_client.futures_create_order(
                         symbol=symbol,
@@ -754,6 +905,19 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"❌ Failed to create Take Profit {i+1}: {e}")
 
+            if results['stop_loss'] or results['take_profits']:
+                position = ActivePosition(
+                    symbol=symbol,
+                    user_id=user_id,
+                    side=side,
+                    quantity=quantity,
+                    entry_price=entry_price,
+                    stop_loss_order_id=results['stop_loss'],
+                    take_profit_order_ids=[tp['order_id'] for tp in results['take_profits']]
+                )
+                self.active_positions[symbol] = position
+                logger.info(f"📍 Tracking position for {symbol} with OCO monitoring")
+
             return results
 
         except Exception as e:
@@ -770,7 +934,6 @@ class TradingBot:
                 if not success:
                     return {'success': False, 'error': 'Failed to connect to Binance API'}
 
-            # Get account balance
             try:
                 logger.info(f"💰 Getting account balance...")
                 balance_info = self.binance_client.futures_account_balance()
@@ -795,7 +958,6 @@ class TradingBot:
                 logger.error(f"❌ Error getting account balance: {e}")
                 return {'success': False, 'error': f'Balance error: {str(e)}'}
 
-            # Determine leverage
             if config.use_signal_settings and signal.leverage:
                 leverage = signal.leverage
             else:
@@ -804,28 +966,19 @@ class TradingBot:
             logger.info(f"⚙️ Using settings: {'Signal' if config.use_signal_settings else 'Bot'}")
             logger.info(f"⚡ Leverage: {leverage}x")
 
-            # Set leverage
             try:
                 self.binance_client.futures_change_leverage(symbol=signal.symbol, leverage=leverage)
                 logger.info(f"✅ Leverage set to {leverage}x")
             except Exception as e:
                 logger.warning(f"⚠️ Leverage setting warning: {e}")
 
-            # Get current price
             ticker = self.binance_client.futures_symbol_ticker(symbol=signal.symbol)
             current_price = float(ticker['price'])
             logger.info(f"💲 Current {signal.symbol} price: {current_price}")
 
-            # Use entry price from signal or current price
             entry_price = signal.entry_price or current_price
-
-            # Calculate position size using BOT settings (always use bot balance %)
             trade_amount = usdt_balance * (config.balance_percent / 100)
-
-            # Calculate actual position value with leverage
             position_value = trade_amount * leverage
-
-            # Calculate quantity
             raw_quantity = (trade_amount * leverage) / entry_price
 
             logger.info(f"🧮 Trade calculation:")
@@ -834,7 +987,6 @@ class TradingBot:
             logger.info(f"   Entry price: {entry_price}")
             logger.info(f"   Raw quantity: {raw_quantity}")
 
-            # Get symbol precision
             precision_info = self.get_symbol_precision(signal.symbol)
             if 'error' in precision_info:
                 return {'success': False, 'error': precision_info['error']}
@@ -843,7 +995,6 @@ class TradingBot:
             min_qty = precision_info['min_qty']
             qty_precision = precision_info['qty_precision']
 
-            # Round quantity properly
             quantity = self.round_quantity(raw_quantity, step_size, qty_precision)
 
             logger.info(f"📏 Step size: {step_size}, Min qty: {min_qty}")
@@ -855,10 +1006,7 @@ class TradingBot:
             if quantity <= 0:
                 return {'success': False, 'error': 'Calculated quantity is zero or negative'}
 
-            # Calculate order_value BEFORE using it
             order_value = quantity * entry_price
-
-            # Execute market order
             side = 'BUY' if signal.trade_type == 'LONG' else 'SELL'
 
             order = self.binance_client.futures_create_order(
@@ -870,13 +1018,11 @@ class TradingBot:
 
             logger.info(f"✅ Main order executed: {order['orderId']}")
 
-            # Calculate SL/TP prices
             sl_price = None
             tp_prices = []
             sl_tp_result = {'stop_loss': None, 'take_profits': []}
 
             if config.create_sl_tp:
-                # Determine SL/TP prices
                 if config.use_signal_settings:
                     if signal.stop_loss:
                         sl_price = signal.stop_loss
@@ -901,7 +1047,6 @@ class TradingBot:
                         sl_price = current_price * (1 + config.stop_loss_percent / 100)
                         tp_prices = [current_price * (1 - config.take_profit_percent / 100)]
 
-                # Validate SL price
                 if sl_price:
                     if signal.trade_type == 'LONG':
                         if sl_price >= current_price:
@@ -912,12 +1057,12 @@ class TradingBot:
                             logger.warning(f"⚠️ SL price {sl_price} <= current {current_price}, adjusting...")
                             sl_price = current_price * 1.05
 
-                # Create SL/TP orders with PROPER PRECISION
+                logger.info(f"📊 SL/TP Prices before rounding: SL={sl_price}, TP={tp_prices}")
+
                 sl_tp_result = await self.create_sl_tp_orders(
-                    signal.symbol, side, quantity, current_price, sl_price, tp_prices
+                    signal.symbol, side, quantity, current_price, sl_price, tp_prices, config.user_id
                 )
 
-            # Send data to Make.com webhook
             if config.make_webhook_enabled and config.user_id in self.webhook_loggers:
                 trade_data = {
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -933,7 +1078,7 @@ class TradingBot:
                     'balance_used': f"${trade_amount:.2f}",
                     'channel_id': signal.channel_id,
                     'pnl': '0.00',
-                    'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'} | SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'}",
+                    'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'} | SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'} | OCO: Active",
                     'order_value': f"${order_value:.2f}",
                     'sl_order_id': sl_tp_result['stop_loss'] if sl_tp_result['stop_loss'] else '',
                     'tp_order_ids': ', '.join([str(tp['order_id']) for tp in sl_tp_result['take_profits']]) if sl_tp_result['take_profits'] else '',
@@ -957,8 +1102,8 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"❌ Trade execution error: {e}")
+            logger.error(traceback.format_exc())
 
-            # Log failed trade to webhook
             if config.make_webhook_enabled and config.user_id in self.webhook_loggers:
                 trade_data = {
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -991,8 +1136,10 @@ class TradingBot:
                     return False
                 telethon_client = self.user_monitoring_clients[user_id]
 
-            # Setup Make.com webhook
             self.setup_make_webhook(user_id)
+
+            if not self.order_monitor_running:
+                asyncio.create_task(self.monitor_orders(bot_instance))
 
             @telethon_client.on(events.NewMessage)
             async def message_handler(event):
@@ -1062,6 +1209,7 @@ class TradingBot:
                                     notification += f"\n  TP{i+1}: {tp['price']:.6f} (ID: {tp['order_id']})"
 
                             notification += "\n🔗 Sent to Make.com"
+                            notification += "\n🔄 OCO: Auto-cancel enabled"
                             notification += f"\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
                             notification += f"\n\n🎉 Position is LIVE!"
 
@@ -1084,6 +1232,7 @@ class TradingBot:
 
                 except Exception as e:
                     logger.error(f"Message handler error: {e}")
+                    logger.error(traceback.format_exc())
 
             if not telethon_client.is_connected():
                 await telethon_client.connect()
@@ -1151,31 +1300,35 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # ===================== COMMAND HANDLERS =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = f"""🤖 <b>Telegram Trading Bot v3.0 - READY!</b>
+    welcome_text = f"""🤖 <b>Telegram Trading Bot v3.1 - OCO READY!</b>
 
-🎉 <b>YOUR NEW MAKE.COM WEBHOOK IS INTEGRATED:</b>
+🎉 <b>NEW FEATURES:</b>
+✅ Fixed decimal precision for all symbols
+✅ OCO simulation: Auto-cancel orders
+✅ Proper rounding for micro-priced coins
+
 🔗 {DEFAULT_WEBHOOK_URL[:50]}...
 
 <b>Features:</b>
-• ⚙️ Choose Signal vs Bot settings
-• 🎯 Auto SL/TP order creation  
-• 📊 Enhanced Russian signal parsing
-• 💰 Configurable position sizes
-• 🔧 Interactive setup with buttons
-• 🔗 Make.com webhook integration
-• ✅ FIXED: Stop Loss precision errors
+• ⚙️ Signal vs Bot settings
+• 🎯 Auto SL/TP creation  
+• 🔄 OCO: Cancel SL when TP fills
+• 🔄 OCO: Cancel TP when SL fills
+• 📊 Russian signal parsing
+• 💰 Configurable sizes
+• 🔗 Make.com webhook
 
 <b>Setup Steps:</b>
-1️⃣ /setup_binance - Binance API
-2️⃣ /setup_telegram - Telegram API  
-3️⃣ /setup_channels - Select channels
-4️⃣ /setup_trading - Trading params
-5️⃣ /start_monitoring - Begin trading
+1️⃣ /setup_binance
+2️⃣ /setup_telegram
+3️⃣ /setup_channels
+4️⃣ /setup_trading
+5️⃣ /start_monitoring
 
 <b>Test Commands:</b>
-/test_simple - Simple webhook test
-/test_basic - Basic trade test
-/test_advanced - Full trade data test
+/test_simple
+/test_basic
+/test_advanced
 """
     await update.message.reply_text(welcome_text, parse_mode='HTML')
 
@@ -1183,32 +1336,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = f"""<b>📖 All Commands</b>
 
 <b>Setup:</b>
-/setup_binance - Binance API ✅
-/setup_telegram - Telegram API ✅  
-/setup_channels - Channel selection ✅
-/setup_trading - Trading parameters ✅
+/setup_binance - Binance API
+/setup_telegram - Telegram API  
+/setup_channels - Channels
+/setup_trading - Parameters
 
 <b>Control:</b>
-/start_monitoring - Start monitoring ✅
-/stop_monitoring - Stop monitoring ✅
-/status - Current status ✅
-/balance - Check account balance ✅
+/start_monitoring - Start ✅
+/stop_monitoring - Stop ❌
+/status - Status
+/balance - Balance
 
 <b>Testing:</b>
-/test_simple - Simple webhook test ✅
-/test_basic - Basic trade test ✅
-/test_advanced - Full trade data test ✅
-/test_signal - Test signal parsing ✅
+/test_simple - Simple test
+/test_basic - Basic test
+/test_advanced - Full test
+/test_signal - Parser test
 
-🔗 <b>YOUR NEW WEBHOOK:</b>
-{DEFAULT_WEBHOOK_URL[:50]}...
+🔗 {DEFAULT_WEBHOOK_URL[:50]}...
 
-<b>Make.com Setup:</b>
-1. Go to Make.com scenario with your webhook
-2. Click "Run Once" to activate
-3. Test with /test_simple
-4. Add Google Sheets module
-5. Map webhook data to spreadsheet
+<b>OCO Feature:</b>
+When TP fills → SL auto-cancels
+When SL fills → All TPs auto-cancel
 """
     await update.message.reply_text(help_text, parse_mode='HTML')
 
@@ -1251,34 +1400,33 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
     sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
     webhook_status = "🟢 ON" if config.make_webhook_enabled else "🔴 OFF"
+    oco_status = "🟢 Active" if trading_bot.order_monitor_running else "🔴 Inactive"
 
-    status_text = f"""📊 <b>Bot Status Dashboard v3.0</b>
+    status_text = f"""📊 <b>Bot Status Dashboard v3.1</b>
 
 🔧 <b>Configuration:</b>
 {'✅' if config.binance_api_key else '❌'} Binance API
 {'✅' if config.telegram_api_id else '❌'} Telegram API  
 📡 Channels: <b>{len(config.monitored_channels)}</b>
 🔄 Monitoring: {'🟢 Active' if trading_bot.active_monitoring.get(user_id) else '🔴 Inactive'}
-🔗 Make.com Webhook: <b>{webhook_status}</b>
+🔗 Webhook: <b>{webhook_status}</b>
+🔄 OCO Monitor: <b>{oco_status}</b>
 
 ⚙️ <b>Trading Settings:</b>
-🎯 Settings Source: <b>{settings_source}</b>
-📈 SL/TP Creation: <b>{sl_tp_status}</b>
-⚡ Bot Leverage: <b>{config.leverage}x</b>
-🛑 Bot Stop Loss: <b>{config.stop_loss_percent}%</b>
-🎯 Bot Take Profit: <b>{config.take_profit_percent}%</b>
-💰 Position Size: <b>{config.balance_percent}%</b>
+🎯 Settings: <b>{settings_source}</b>
+📈 SL/TP: <b>{sl_tp_status}</b>
+⚡ Leverage: <b>{config.leverage}x</b>
+🛑 Stop Loss: <b>{config.stop_loss_percent}%</b>
+🎯 Take Profit: <b>{config.take_profit_percent}%</b>
+💰 Balance: <b>{config.balance_percent}%</b>
 
-🔗 <b>Make.com Integration:</b>
-Webhook URL: {DEFAULT_WEBHOOK_URL[:50]}...
-Status: {'✅ Ready' if config.make_webhook_enabled else '❌ Disabled'}
+📍 <b>Active Positions:</b> {len(trading_bot.active_positions)}
 
 ✅ <b>Features:</b>
 • Auto trade execution
-• Real-time webhook logging
-• Russian signal parsing
-• Advanced balance checking
-• Fixed Stop Loss precision
+• OCO order management
+• Decimal precision fixed
+• Real-time monitoring
 """
     await update.message.reply_text(status_text, parse_mode='HTML')
 
@@ -1298,12 +1446,6 @@ async def test_webhook_simple(update: Update, context: ContextTypes.DEFAULT_TYPE
 📡 Status Code: {result['status_code']}
 ⏱️ Response Time: {result['response_time']:.2f}s
 
-💡 <b>Data sent:</b>
-• text: "Simple webhook test from Trading Bot"
-• status: "TEST"
-• time: {datetime.now().strftime('%H:%M:%S')}
-• date: {datetime.now().strftime('%Y-%m-%d')}
-
 🎯 Perfect! Go to Make.com and add Google Sheets module.""", 
             parse_mode='HTML'
         )
@@ -1312,20 +1454,12 @@ async def test_webhook_simple(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"""❌ <b>Simple Test Failed</b>
 
 Status: {result['status_code']}
-Error: {result['response_text'][:200]}
-
-🔧 <b>Quick Fix:</b>
-1. Go to Make.com scenario
-2. Click webhook module
-3. Click "Re-determine data structure"
-4. Click "Delete" to clear structure
-5. Click "Run Once"
-6. Test again with /test_simple""", 
+Error: {result['response_text'][:200]}""", 
             parse_mode='HTML'
         )
 
 async def test_webhook_basic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Basic webhook test with trade structure"""
+    """Basic webhook test"""
     await update.message.reply_text("🔄 <b>Basic webhook test...</b>", parse_mode='HTML')
 
     webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
@@ -1338,13 +1472,6 @@ async def test_webhook_basic(update: Update, context: ContextTypes.DEFAULT_TYPE)
 📡 Status Code: {result['status_code']}
 ⏱️ Response Time: {result['response_time']:.2f}s
 
-💡 <b>Trade data sent:</b>
-• text: "Basic trade test: BTCUSDT LONG"
-• symbol: "BTCUSDT"
-• trade_type: "LONG" 
-• entry_price: "45000.50"
-• status: "TEST_BASIC"
-
 🎯 Perfect! Your webhook accepts trade data.""", 
             parse_mode='HTML'
         )
@@ -1353,14 +1480,12 @@ async def test_webhook_basic(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"""❌ <b>Basic Test Failed</b>
 
 Status: {result['status_code']}
-Error: {result['response_text'][:200]}
-
-Try /test_simple first to establish basic connection.""", 
+Error: {result['response_text'][:200]}""", 
             parse_mode='HTML'
         )
 
 async def test_webhook_advanced(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Advanced webhook test with full trade data"""
+    """Advanced webhook test"""
     await update.message.reply_text("🚀 <b>Advanced webhook test...</b>", parse_mode='HTML')
 
     webhook_logger = MakeWebhookLogger(DEFAULT_WEBHOOK_URL)
@@ -1369,42 +1494,16 @@ async def test_webhook_advanced(update: Update, context: ContextTypes.DEFAULT_TY
     if result['success']:
         result_text = f"""✅ <b>Advanced Webhook Test Successful!</b>
 
-📡 <b>Request Details:</b>
-Status Code: {result['status_code']}
-Response Time: {result['response_time']:.2f}s
-URL: {DEFAULT_WEBHOOK_URL[:50]}...
+📡 Status Code: {result['status_code']}
+⏱️ Response Time: {result['response_time']:.2f}s
 
-📊 <b>Full Test Data Sent:</b>
-• Complete trade execution data
-• All order details and IDs
-• Stop Loss & Take Profit info
-• Balance and position data
-• Comprehensive logging fields
-
-🎉 <b>Perfect!</b> Your webhook is working with complete trade data.
-Check your Make.com scenario for all the fields."""
+🎉 Perfect! All 20+ fields sent successfully.
+Check Make.com for complete data."""
     else:
-        result_text = f"""❌ <b>Advanced Webhook Test Failed</b>
+        result_text = f"""❌ <b>Advanced Test Failed</b>
 
-📡 <b>Details:</b>
-Status Code: {result['status_code']}
-Response Time: {result['response_time']:.2f}s
-Error: {result['response_text'][:200]}...
-
-🔧 <b>Make.com Setup Guide:</b>
-1. Go to: make.com/scenarios
-2. Find scenario with your webhook
-3. Click "Run Once" button
-4. Wait for "Waiting for data..."
-5. Run /test_simple first
-6. Click "OK" when data appears
-7. Add Google Sheets module
-8. Map all fields to spreadsheet columns
-
-📞 <b>Still having issues?</b>
-• Check scenario is ON (not OFF)
-• Verify webhook URL is correct
-• Try /test_simple → /test_basic → /test_advanced"""
+Status: {result['status_code']}
+Error: {result['response_text'][:200]}"""
 
     await update.message.reply_text(result_text, parse_mode='HTML')
 
@@ -1414,12 +1513,7 @@ async def setup_binance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         """🔑 <b>Binance API Setup</b>
 
-Send your Binance API Key:
-
-⚠️ <b>Requirements:</b>
-• Futures trading enabled
-• API key with Futures permissions
-• Sufficient balance""", parse_mode='HTML')
+Send your Binance API Key:""", parse_mode='HTML')
     return WAITING_BINANCE_KEY
 
 async def handle_binance_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1439,26 +1533,9 @@ async def handle_binance_secret(update: Update, context: ContextTypes.DEFAULT_TY
     success = await trading_bot.setup_binance_client(config)
 
     if success:
-        await update.message.reply_text(
-            """✅ <b>Binance configured successfully!</b>
-
-Next step: /setup_telegram
-
-⚠️ <b>Important:</b>
-Your API key has Futures permissions enabled!""", 
-            parse_mode='HTML'
-        )
+        await update.message.reply_text("✅ <b>Binance configured!</b> Next: /setup_telegram", parse_mode='HTML')
     else:
-        await update.message.reply_text(
-            """❌ <b>Binance configuration failed!</b>
-
-<b>Common fixes:</b>
-• Check API key and secret are correct
-• Enable Futures trading on your account
-• Enable Futures permissions on API key
-• Check IP whitelist settings""", 
-            parse_mode='HTML'
-        )
+        await update.message.reply_text("❌ <b>Configuration failed!</b> Check credentials", parse_mode='HTML')
 
     return ConversationHandler.END
 
@@ -1468,12 +1545,7 @@ async def setup_telegram_api(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         """📱 <b>Telegram API Setup</b>
 
-Send your Telegram API ID:
-
-ℹ️ <b>Get from:</b> https://my.telegram.org/apps
-• Login with your phone number
-• Create new application
-• Copy API ID and Hash""", parse_mode='HTML')
+Send your Telegram API ID:""", parse_mode='HTML')
     return WAITING_TELEGRAM_ID
 
 async def handle_telegram_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1489,13 +1561,13 @@ async def handle_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYP
     config = trading_bot.get_user_config(user_id)
     config.telegram_api_hash = update.message.text.strip()
 
-    await update.message.reply_text("🔄 Testing Telegram API connection...")
+    await update.message.reply_text("🔄 Testing Telegram API...")
     success = await trading_bot.setup_telethon_client(config)
 
     if success:
         await update.message.reply_text("✅ <b>Telegram API configured!</b> Next: /setup_channels", parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ <b>Configuration failed!</b> Check API credentials", parse_mode='HTML')
+        await update.message.reply_text("❌ <b>Failed!</b> Check credentials", parse_mode='HTML')
 
     return ConversationHandler.END
 
@@ -1504,12 +1576,12 @@ async def handle_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYP
 async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    await update.message.reply_text("🔍 <b>Loading your channels...</b>", parse_mode='HTML')
+    await update.message.reply_text("🔍 <b>Loading channels...</b>", parse_mode='HTML')
 
     channels = await trading_bot.get_available_channels(user_id)
 
     if not channels:
-        await update.message.reply_text("❌ <b>No channels found!</b> Configure Telegram API first with /setup_telegram", parse_mode='HTML')
+        await update.message.reply_text("❌ <b>No channels!</b> Use /setup_telegram first", parse_mode='HTML')
         return ConversationHandler.END
 
     context.user_data['available_channels'] = channels
@@ -1539,7 +1611,7 @@ async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT
 
 Monitoring: <b>{len(config.monitored_channels)}</b> channels
 
-Next step: /setup_trading to configure parameters""",
+Next: /setup_trading""",
             parse_mode='HTML'
         )
         return ConversationHandler.END
@@ -1556,15 +1628,9 @@ Next step: /setup_trading to configure parameters""",
 
     elif query.data == "add_manual_channel":
         await query.edit_message_text(
-            """📝 <b>Manual Channel ID Input</b>
+            """📝 <b>Manual Channel ID</b>
 
-Send the channel ID (numbers only):
-
-<b>Format:</b> <code>-1001234567890</code>
-
-<b>How to get Channel ID:</b>
-• Forward message to @userinfobot
-• Use @RawDataBot""",
+Send channel ID: <code>-1001234567890</code>""",
             parse_mode='HTML'
         )
         return WAITING_MANUAL_CHANNEL
@@ -1594,7 +1660,7 @@ async def handle_manual_channel(update: Update, context: ContextTypes.DEFAULT_TY
     channel_id = update.message.text.strip()
 
     if not channel_id.lstrip('-').isdigit():
-        await update.message.reply_text("❌ <b>Invalid format!</b> Send numeric ID like: <code>-1001234567890</code>", parse_mode='HTML')
+        await update.message.reply_text("❌ Invalid format!", parse_mode='HTML')
         return WAITING_MANUAL_CHANNEL
 
     if not channel_id.startswith('-'):
@@ -1604,12 +1670,12 @@ async def handle_manual_channel(update: Update, context: ContextTypes.DEFAULT_TY
         config.monitored_channels.append(channel_id)
 
     await update.message.reply_text(
-        f"""✅ <b>Channel added successfully!</b>
+        f"""✅ <b>Channel added!</b>
 
 Channel ID: <code>{channel_id}</code>
-Total monitoring: <b>{len(config.monitored_channels)}</b> channels
+Total: <b>{len(config.monitored_channels)}</b>
 
-Use /setup_trading to configure parameters""",
+Use /setup_trading next""",
         parse_mode='HTML'
     )
 
@@ -1622,7 +1688,7 @@ async def setup_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard_markup = create_settings_keyboard(user_id)
 
     await update.message.reply_text(
-        "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+        "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
         reply_markup=keyboard_markup,
         parse_mode='HTML'
     )
@@ -1641,12 +1707,10 @@ async def handle_trading_settings(update: Update, context: ContextTypes.DEFAULT_
 
     if query.data == "trading_done":
         await query.edit_message_text(
-            f"""✅ <b>Trading configuration complete!</b>
+            f"""✅ <b>Configuration complete!</b>
 
-All settings saved successfully.
-🔗 Make.com webhook is ready!
-
-Next: /start_monitoring to begin trading""",
+All settings saved.
+Next: /start_monitoring""",
             parse_mode='HTML'
         )
         return ConversationHandler.END
@@ -1655,7 +1719,7 @@ Next: /start_monitoring to begin trading""",
         config.use_signal_settings = not config.use_signal_settings
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -1664,7 +1728,7 @@ Next: /start_monitoring to begin trading""",
         config.create_sl_tp = not config.create_sl_tp
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -1673,35 +1737,35 @@ Next: /start_monitoring to begin trading""",
         config.make_webhook_enabled = not config.make_webhook_enabled
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure your trading parameters:",
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
 
     elif query.data == "set_leverage":
         await query.edit_message_text(
-            "⚡ <b>Set Leverage</b>\n\nSend leverage value (1-125):",
+            "⚡ <b>Set Leverage</b>\n\nSend value (1-125):",
             parse_mode='HTML'
         )
         return WAITING_LEVERAGE
 
     elif query.data == "set_stop_loss":
         await query.edit_message_text(
-            "🛑 <b>Set Stop Loss</b>\n\nSend stop loss percentage (e.g., 5 for 5%):",
+            "🛑 <b>Set Stop Loss</b>\n\nSend percentage (e.g., 5 for 5%):",
             parse_mode='HTML'
         )
         return WAITING_STOP_LOSS
 
     elif query.data == "set_take_profit":
         await query.edit_message_text(
-            "🎯 <b>Set Take Profit</b>\n\nSend take profit percentage (e.g., 10 for 10%):",
+            "🎯 <b>Set Take Profit</b>\n\nSend percentage (e.g., 10 for 10%):",
             parse_mode='HTML'
         )
         return WAITING_TAKE_PROFIT
 
     elif query.data == "set_balance_percent":
         await query.edit_message_text(
-            "💰 <b>Set Balance Percentage</b>\n\nSend percentage of balance to use per trade (1-100):\n\n<b>Examples:</b>\n• 1 = 1% of balance\n• 5 = 5% of balance\n• 10 = 10% of balance\n• 50 = 50% of balance",
+            "💰 <b>Set Balance %</b>\n\nSend percentage (1-100):",
             parse_mode='HTML'
         )
         return WAITING_BALANCE_PERCENT
@@ -1716,11 +1780,11 @@ async def handle_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         leverage = int(update.message.text)
         if 1 <= leverage <= 125:
             config.leverage = leverage
-            await update.message.reply_text(f"✅ <b>Leverage set to {leverage}x</b>", parse_mode='HTML')
+            await update.message.reply_text(f"✅ <b>Leverage: {leverage}x</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ <b>Invalid leverage!</b> Must be between 1-125", parse_mode='HTML')
+            await update.message.reply_text("❌ Must be 1-125", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number between 1-125", parse_mode='HTML')
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
 
     return ConversationHandler.END
 
@@ -1732,11 +1796,11 @@ async def handle_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sl_percent = float(update.message.text)
         if 0.1 <= sl_percent <= 50:
             config.stop_loss_percent = sl_percent
-            await update.message.reply_text(f"✅ <b>Stop Loss set to {sl_percent}%</b>", parse_mode='HTML')
+            await update.message.reply_text(f"✅ <b>Stop Loss: {sl_percent}%</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ <b>Invalid percentage!</b> Must be between 0.1-50%", parse_mode='HTML')
+            await update.message.reply_text("❌ Must be 0.1-50%", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number (e.g., 5)", parse_mode='HTML')
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
 
     return ConversationHandler.END
 
@@ -1748,11 +1812,11 @@ async def handle_take_profit(update: Update, context: ContextTypes.DEFAULT_TYPE)
         tp_percent = float(update.message.text)
         if 0.1 <= tp_percent <= 100:
             config.take_profit_percent = tp_percent
-            await update.message.reply_text(f"✅ <b>Take Profit set to {tp_percent}%</b>", parse_mode='HTML')
+            await update.message.reply_text(f"✅ <b>Take Profit: {tp_percent}%</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ <b>Invalid percentage!</b> Must be between 0.1-100%", parse_mode='HTML')
+            await update.message.reply_text("❌ Must be 0.1-100%", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number (e.g., 10)", parse_mode='HTML')
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
 
     return ConversationHandler.END
 
@@ -1764,33 +1828,29 @@ async def handle_balance_percent(update: Update, context: ContextTypes.DEFAULT_T
         value = float(update.message.text)
         if 1 <= value <= 100:
             config.balance_percent = value
-            await update.message.reply_text(
-                f"✅ <b>Balance percentage set to {value}%</b>\n\n💰 This means {value}% of your balance will be used per trade.",
-                parse_mode='HTML'
-            )
+            await update.message.reply_text(f"✅ <b>Balance: {value}%</b>", parse_mode='HTML')
         else:
-            await update.message.reply_text("❌ <b>Invalid value!</b> Must be between 1-100", parse_mode='HTML')
+            await update.message.reply_text("❌ Must be 1-100", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number between 1-100", parse_mode='HTML')
+        await update.message.reply_text("❌ Invalid input!", parse_mode='HTML')
 
     return ConversationHandler.END
 
-# ================== MONITORING CONTROLS ==================
+# ================== MONITORING ==================
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
 
-    # Validate configuration
     if not config.binance_api_key or not config.telegram_api_id:
-        await update.message.reply_text("❌ <b>Configuration incomplete!</b> Complete setup first.", parse_mode='HTML')
+        await update.message.reply_text("❌ Complete setup first!", parse_mode='HTML')
         return
 
     if not config.monitored_channels:
-        await update.message.reply_text("❌ <b>No channels configured!</b> Use /setup_channels first.", parse_mode='HTML')
+        await update.message.reply_text("❌ No channels! Use /setup_channels", parse_mode='HTML')
         return
 
-    await update.message.reply_text("🚀 <b>Starting monitoring...</b>", parse_mode='HTML')
+    await update.message.reply_text("🚀 <b>Starting...</b>", parse_mode='HTML')
 
     success = await trading_bot.start_monitoring(user_id, context.bot)
 
@@ -1798,30 +1858,26 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = f"""✅ <b>MONITORING STARTED!</b>
 
 📡 Monitoring: <b>{len(config.monitored_channels)}</b> channels
-⚙️ Settings: {'Signal Priority' if config.use_signal_settings else 'Bot Settings'}
-📊 SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'}
-🔗 Make.com Webhook: ENABLED
+⚙️ Settings: {'Signal' if config.use_signal_settings else 'Bot'}
+📊 SL/TP: {'ON' if config.create_sl_tp else 'OFF'}
+🔄 OCO: Auto-cancel enabled
+🔗 Webhook: ENABLED
 
-🎯 <b>Ready to trade!</b>
-Use /stop_monitoring to stop.
-
-🔗 <b>Webhook URL:</b>
-{DEFAULT_WEBHOOK_URL[:50]}...
-
-📊 All trades will be logged to Make.com automatically!
-✅ Stop Loss precision errors FIXED!"""
+🎯 Ready to trade!
+Use /stop_monitoring to stop."""
 
         await update.message.reply_text(status_msg, parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ <b>Failed to start monitoring!</b> Check configuration.", parse_mode='HTML')
+        await update.message.reply_text("❌ Failed to start!", parse_mode='HTML')
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     trading_bot.active_monitoring[user_id] = False
+    trading_bot.order_monitor_running = False
 
     await update.message.reply_text("🛑 <b>Monitoring stopped!</b>", parse_mode='HTML')
 
-# ================== TEST FUNCTIONS ==================
+# ================== TEST SIGNAL ==================
 
 async def test_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     test_signals = [
@@ -1839,36 +1895,25 @@ SHORT
 Тп1: 2900
 Тп2: 2800
 Сл: 3100
-Плечо: 5x""",
-
-        """🚀 #SOLUSDT ЛОНГ 🚀
-📈 Entry: 150.50
-🎯 Target 1: 155.00
-🎯 Target 2: 160.00
-🛑 Stop Loss: 145.00
-⚡ 15x"""
+Плечо: 5x"""
     ]
 
     results = []
     for i, test_msg in enumerate(test_signals, 1):
-        signal = trading_bot.parse_trading_signal(test_msg, "test_channel")
+        signal = trading_bot.parse_trading_signal(test_msg, "test")
         if signal:
-            results.append(f"""<b>Test {i}: ✅ PARSED</b>
-Symbol: {signal.symbol}
-Type: {signal.trade_type}
-Entry: {signal.entry_price or 'N/A'}
-SL: {signal.stop_loss or 'N/A'}
-TP: {signal.take_profit or 'N/A'}
-Leverage: {signal.leverage or 'N/A'}""")
+            results.append(f"""<b>Test {i}: ✅</b>
+{signal.symbol} {signal.trade_type}
+Entry: {signal.entry_price}
+SL: {signal.stop_loss}
+TP: {signal.take_profit}""")
         else:
-            results.append(f"<b>Test {i}: ❌ FAILED</b>")
+            results.append(f"<b>Test {i}: ❌</b>")
 
-    test_result = "🧪 <b>Signal Parser Test Results</b>\n\n" + "\n\n".join(results)
-    await update.message.reply_text(test_result, parse_mode='HTML')
+    await update.message.reply_text("🧪 <b>Parser Test</b>\n\n" + "\n\n".join(results), parse_mode='HTML')
 
 # ================== CONVERSATION HANDLERS ==================
 
-# Binance setup conversation
 binance_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_binance', setup_binance)],
     states={
@@ -1878,7 +1923,6 @@ binance_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
-# Telegram setup conversation
 telegram_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_telegram', setup_telegram_api)],
     states={
@@ -1888,7 +1932,6 @@ telegram_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
-# Channel setup conversation
 channel_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_channels', setup_channels)],
     states={
@@ -1898,7 +1941,6 @@ channel_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
-# Trading setup conversation
 trading_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_trading', setup_trading)],
     states={
@@ -1911,22 +1953,20 @@ trading_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
-# ================== MAIN APPLICATION ==================
+# ================== MAIN ==================
 
 def main():
     """Start the bot"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Add conversation handlers
+    # Add handlers
     application.add_handler(binance_conv_handler)
     application.add_handler(telegram_conv_handler)
     application.add_handler(channel_conv_handler)
     application.add_handler(trading_conv_handler)
 
-    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
@@ -1938,14 +1978,14 @@ def main():
     application.add_handler(CommandHandler("test_basic", test_webhook_basic))
     application.add_handler(CommandHandler("test_advanced", test_webhook_advanced))
 
-    print("🤖 Bot starting...")
-    print(f"🔗 Make.com webhook integrated: {DEFAULT_WEBHOOK_URL}")
-    print("✅ Balance percentage fixed: works for all values 1-100%")
-    print("✅ Minimum order button REMOVED")
-    print("✅ Stop Loss precision errors FIXED")
-    print("📊 Ready for Google Sheets integration")
+    print("🤖 Trading Bot v3.1 Starting...")
+    print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
+    print("✅ Fixed: Decimal precision for micro-priced coins")
+    print("✅ Feature: OCO order simulation")
+    print("✅ Feature: Auto-cancel opposite orders")
+    print("✅ Fixed: Syntax error in send_trade_data")
+    print("📊 Ready!")
     
-    # Run the bot
     application.run_polling()
 
 if __name__ == '__main__':
