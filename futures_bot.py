@@ -1492,7 +1492,7 @@ Questions? Check the /settings menu!""",
 def main():
     """Main function"""
     # Use your bot token here
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your actual bot token
+    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"  # Replace with your actual bot token
     
     application = Application.builder().token(BOT_TOKEN).build()
     
