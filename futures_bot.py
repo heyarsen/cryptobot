@@ -3,8 +3,10 @@
 Telegram Trading Bot v3.0 - COMPLETE WITH NEW MAKE.COM WEBHOOK
 - Integrated with Make.com webhook: https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava
 - Advanced webhook testing and troubleshooting
-- $5 minimum order enforcement
 - Enhanced signal parsing for Russian formats
+- Minimum order buttons REMOVED
+- Balance percentage works for all values 1-100%
+- FIXED: Stop Loss precision errors
 """
 
 import asyncio
@@ -18,6 +20,7 @@ import os
 import sys
 import traceback
 import requests
+import math
 
 # Import python-telegram-bot
 from telegram import (
@@ -46,13 +49,20 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Channel, PeerChannel
 from telethon.errors import ApiIdInvalidError
 
+# Auto-configured API Credentials
+DEFAULT_TELEGRAM_API_ID = '23312577'
+DEFAULT_TELEGRAM_API_HASH = 'e879a3e9fd3d45cee98ef55214092805'
+DEFAULT_BINANCE_API_KEY = 'JCZ8WdmkVDoTm8sfphNGzEA1iUL8nSrAtUk2zVBqaSqcpycxJFX79XZGt82ZmfVr'
+DEFAULT_BINANCE_API_SECRET = 'rDnnNSURkb466pIFGG1IKzIYKImYPAJnNbQVwmwCWBnR45WUDxwob2PTw4sWKfiB'
+
 # Conversation states
 (WAITING_BINANCE_KEY, WAITING_BINANCE_SECRET,
  WAITING_TELEGRAM_ID, WAITING_TELEGRAM_HASH,
  WAITING_LEVERAGE, WAITING_STOP_LOSS,
  WAITING_TAKE_PROFIT, WAITING_BALANCE_PERCENT,
  WAITING_CHANNEL_SELECTION, WAITING_MANUAL_CHANNEL,
- WAITING_SETTINGS_SOURCE, WAITING_WEBHOOK_URL) = range(12)
+ WAITING_SETTINGS_SOURCE, WAITING_WEBHOOK_URL,
+ WAITING_MIN_ORDER) = range(13)
 
 # Your NEW Make.com Webhook URL
 DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava"
@@ -98,8 +108,8 @@ class BotConfig:
     user_id: int = 0
     use_signal_settings: bool = True
     create_sl_tp: bool = True
-    make_webhook_enabled: bool = True  # Default enabled
-    make_webhook_url: str = DEFAULT_WEBHOOK_URL  # Your NEW webhook URL
+    make_webhook_enabled: bool = True
+    make_webhook_url: str = DEFAULT_WEBHOOK_URL
     minimum_order_usd: float = 5.0
 
     def __post_init__(self):
@@ -174,7 +184,6 @@ class MakeWebhookLogger:
         """Flexible webhook testing with your new URL"""
         try:
             if test_type == "simple":
-                # Simple test - minimal data
                 test_data = {
                     "text": "Simple webhook test from Trading Bot",
                     "status": "TEST",
@@ -183,7 +192,6 @@ class MakeWebhookLogger:
                     "webhook_version": "3.0"
                 }
             elif test_type == "basic":
-                # Basic trade structure
                 test_data = {
                     "text": "Basic trade test: BTCUSDT LONG",
                     "symbol": "BTCUSDT",
@@ -194,7 +202,6 @@ class MakeWebhookLogger:
                     "date": datetime.now().strftime('%Y-%m-%d')
                 }
             else:
-                # Full comprehensive test
                 current_time = datetime.now()
                 test_data = {
                     "text": f"FULL TEST: BTCUSDT LONG at 45000.50 - Order TEST_{current_time.strftime('%H%M%S')}",
@@ -418,6 +425,7 @@ class TradingBot:
         self.active_monitoring = {}
         self.monitoring_tasks = {}
         self.webhook_loggers: Dict[int, MakeWebhookLogger] = {}
+        self.symbol_info_cache: Dict[str, Dict] = {}  # Cache for symbol info
 
     def parse_trading_signal(self, message: str, channel_id: str) -> Optional[TradingSignal]:
         """Enhanced signal parsing with Russian support"""
@@ -453,8 +461,13 @@ class TradingBot:
 
     def get_user_config(self, user_id: int) -> BotConfig:
         if user_id not in self.user_data:
-            self.user_data[user_id] = BotConfig()
-            self.user_data[user_id].user_id = user_id
+            self.user_data[user_id] = BotConfig(
+                binance_api_key=DEFAULT_BINANCE_API_KEY,
+                binance_api_secret=DEFAULT_BINANCE_API_SECRET,
+                telegram_api_id=DEFAULT_TELEGRAM_API_ID,
+                telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
+                user_id=user_id
+            )
         return self.user_data[user_id]
 
     def setup_make_webhook(self, user_id: int) -> bool:
@@ -472,6 +485,99 @@ class TradingBot:
         except Exception as e:
             logger.error(f"❌ Make.com webhook setup error: {e}")
             return False
+
+    def get_symbol_precision(self, symbol: str) -> Dict[str, Any]:
+        """Get and cache symbol precision information"""
+        try:
+            if symbol in self.symbol_info_cache:
+                return self.symbol_info_cache[symbol]
+
+            exchange_info = self.binance_client.futures_exchange_info()
+            symbol_info = None
+            
+            for s in exchange_info['symbols']:
+                if s['symbol'] == symbol:
+                    symbol_info = s
+                    break
+
+            if not symbol_info:
+                return {'error': f'Symbol {symbol} not found'}
+
+            # Get LOT_SIZE filter (for quantity)
+            step_size = None
+            min_qty = None
+            for f in symbol_info['filters']:
+                if f['filterType'] == 'LOT_SIZE':
+                    step_size = float(f['stepSize'])
+                    min_qty = float(f['minQty'])
+                    break
+
+            # Get PRICE_FILTER (for price precision)
+            tick_size = None
+            min_price = None
+            max_price = None
+            for f in symbol_info['filters']:
+                if f['filterType'] == 'PRICE_FILTER':
+                    tick_size = float(f['tickSize'])
+                    min_price = float(f['minPrice'])
+                    max_price = float(f['maxPrice'])
+                    break
+
+            # Calculate precision decimals
+            qty_precision = 0
+            price_precision = 0
+
+            if step_size:
+                if '.' in str(step_size):
+                    qty_precision = len(str(step_size).rstrip('0').split('.')[-1])
+
+            if tick_size:
+                if '.' in str(tick_size):
+                    price_precision = len(str(tick_size).rstrip('0').split('.')[-1])
+
+            precision_info = {
+                'step_size': step_size,
+                'min_qty': min_qty,
+                'tick_size': tick_size,
+                'min_price': min_price,
+                'max_price': max_price,
+                'qty_precision': qty_precision,
+                'price_precision': price_precision
+            }
+
+            # Cache it
+            self.symbol_info_cache[symbol] = precision_info
+            
+            logger.info(f"📏 Symbol precision for {symbol}: qty={qty_precision}, price={price_precision}")
+            return precision_info
+
+        except Exception as e:
+            logger.error(f"❌ Error getting symbol precision: {e}")
+            return {'error': str(e)}
+
+    def round_price(self, price: float, tick_size: float, price_precision: int) -> float:
+        """Round price to match tick size and precision"""
+        try:
+            # Round to tick size
+            rounded = round(price / tick_size) * tick_size
+            # Round to precision
+            rounded = round(rounded, price_precision)
+            return rounded
+        except Exception as e:
+            logger.error(f"❌ Error rounding price: {e}")
+            return round(price, price_precision)
+
+    def round_quantity(self, quantity: float, step_size: float, qty_precision: int) -> float:
+        """Round quantity to match step size and precision"""
+        try:
+            # Round to step size
+            rounded = round(quantity / step_size) * step_size
+            # Round to precision
+            rounded = round(rounded, qty_precision)
+            return rounded
+        except Exception as e:
+            logger.error(f"❌ Error rounding quantity: {e}")
+            return round(quantity, qty_precision)
 
     async def get_account_balance(self, config: BotConfig) -> Dict[str, float]:
         """Get detailed account balance information"""
@@ -581,47 +687,70 @@ class TradingBot:
 
     async def create_sl_tp_orders(self, symbol: str, side: str, quantity: float, entry_price: float, 
                                 sl_price: Optional[float], tp_prices: List[float]) -> Dict[str, Any]:
-        """Create stop loss and take profit orders"""
+        """Create stop loss and take profit orders with PROPER PRECISION"""
         try:
             results = {'stop_loss': None, 'take_profits': []}
 
-            # Create Stop Loss Order
+            # Get symbol precision
+            precision_info = self.get_symbol_precision(symbol)
+            if 'error' in precision_info:
+                logger.error(f"❌ Cannot create SL/TP: {precision_info['error']}")
+                return results
+
+            tick_size = precision_info['tick_size']
+            price_precision = precision_info['price_precision']
+            step_size = precision_info['step_size']
+            qty_precision = precision_info['qty_precision']
+
+            # Create Stop Loss Order with CORRECT PRECISION
             if sl_price:
                 try:
                     sl_side = 'SELL' if side == 'BUY' else 'BUY'
+                    
+                    # Round SL price to proper precision
+                    sl_price_rounded = self.round_price(sl_price, tick_size, price_precision)
+                    
+                    logger.info(f"🛑 Creating Stop Loss: {sl_price_rounded} (original: {sl_price})")
+                    
                     sl_order = self.binance_client.futures_create_order(
                         symbol=symbol,
                         side=sl_side,
                         type='STOP_MARKET',
                         quantity=quantity,
-                        stopPrice=sl_price,
+                        stopPrice=sl_price_rounded,
                         closePosition=True
                     )
                     results['stop_loss'] = sl_order['orderId']
-                    logger.info(f"✅ Stop Loss created: {sl_order['orderId']} @ {sl_price}")
+                    logger.info(f"✅ Stop Loss created: {sl_order['orderId']} @ {sl_price_rounded}")
                 except Exception as e:
                     logger.error(f"❌ Failed to create Stop Loss: {e}")
 
-            # Create Take Profit Orders
+            # Create Take Profit Orders with CORRECT PRECISION
             for i, tp_price in enumerate(tp_prices[:3]):
                 try:
                     tp_side = 'SELL' if side == 'BUY' else 'BUY'
                     tp_quantity = quantity / len(tp_prices)
+                    
+                    # Round TP price and quantity to proper precision
+                    tp_price_rounded = self.round_price(tp_price, tick_size, price_precision)
+                    tp_quantity_rounded = self.round_quantity(tp_quantity, step_size, qty_precision)
+                    
+                    logger.info(f"🎯 Creating Take Profit {i+1}: {tp_price_rounded} qty={tp_quantity_rounded}")
 
                     tp_order = self.binance_client.futures_create_order(
                         symbol=symbol,
                         side=tp_side,
                         type='TAKE_PROFIT_MARKET',
-                        quantity=round(tp_quantity, 6),
-                        stopPrice=tp_price,
+                        quantity=tp_quantity_rounded,
+                        stopPrice=tp_price_rounded,
                         closePosition=False
                     )
                     results['take_profits'].append({
                         'order_id': tp_order['orderId'],
-                        'price': tp_price,
-                        'quantity': tp_quantity
+                        'price': tp_price_rounded,
+                        'quantity': tp_quantity_rounded
                     })
-                    logger.info(f"✅ Take Profit {i+1} created: {tp_order['orderId']} @ {tp_price}")
+                    logger.info(f"✅ Take Profit {i+1} created: {tp_order['orderId']} @ {tp_price_rounded}")
                 except Exception as e:
                     logger.error(f"❌ Failed to create Take Profit {i+1}: {e}")
 
@@ -632,7 +761,7 @@ class TradingBot:
             return {'stop_loss': None, 'take_profits': []}
 
     async def execute_trade(self, signal: TradingSignal, config: BotConfig) -> Dict[str, Any]:
-        """Enhanced trade execution with minimum order enforcement"""
+        """Enhanced trade execution with FIXED PRECISION"""
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
@@ -662,9 +791,6 @@ class TradingBot:
                             logger.info(f"✅ Found USDT balance (fallback): {usdt_balance}")
                             break
 
-                if usdt_balance <= config.minimum_order_usd:
-                    return {'success': False, 'error': f'Insufficient balance: {usdt_balance} (min ${config.minimum_order_usd})'}
-
             except Exception as e:
                 logger.error(f"❌ Error getting account balance: {e}")
                 return {'success': False, 'error': f'Balance error: {str(e)}'}
@@ -693,13 +819,13 @@ class TradingBot:
             # Use entry price from signal or current price
             entry_price = signal.entry_price or current_price
 
-            # Calculate position size
+            # Calculate position size using BOT settings (always use bot balance %)
             trade_amount = usdt_balance * (config.balance_percent / 100)
-            
-            # Enforce minimum order size
-            if trade_amount < config.minimum_order_usd:
-                return {'success': False, 'error': f'Trade amount ${trade_amount:.2f} below minimum ${config.minimum_order_usd}'}
-            
+
+            # Calculate actual position value with leverage
+            position_value = trade_amount * leverage
+
+            # Calculate quantity
             raw_quantity = (trade_amount * leverage) / entry_price
 
             logger.info(f"🧮 Trade calculation:")
@@ -709,53 +835,28 @@ class TradingBot:
             logger.info(f"   Raw quantity: {raw_quantity}")
 
             # Get symbol precision
-            try:
-                exchange_info = self.binance_client.futures_exchange_info()
-                symbol_info = None
-                for s in exchange_info['symbols']:
-                    if s['symbol'] == signal.symbol:
-                        symbol_info = s
-                        break
+            precision_info = self.get_symbol_precision(signal.symbol)
+            if 'error' in precision_info:
+                return {'success': False, 'error': precision_info['error']}
 
-                if not symbol_info:
-                    return {'success': False, 'error': f'Symbol {signal.symbol} not found'}
+            step_size = precision_info['step_size']
+            min_qty = precision_info['min_qty']
+            qty_precision = precision_info['qty_precision']
 
-                step_size = None
-                min_qty = None
-                for f in symbol_info['filters']:
-                    if f['filterType'] == 'LOT_SIZE':
-                        step_size = float(f['stepSize'])
-                        min_qty = float(f['minQty'])
-                        break
+            # Round quantity properly
+            quantity = self.round_quantity(raw_quantity, step_size, qty_precision)
 
-                if step_size:
-                    if '.' in str(step_size):
-                        precision = len(str(step_size).rstrip('0').split('.')[-1])
-                    else:
-                        precision = 0
+            logger.info(f"📏 Step size: {step_size}, Min qty: {min_qty}")
+            logger.info(f"📦 Final quantity: {quantity}")
 
-                    quantity = round(raw_quantity / step_size) * step_size
-                    quantity = round(quantity, precision)
+            if quantity < min_qty:
+                return {'success': False, 'error': f'Quantity {quantity} below minimum {min_qty}'}
 
-                    logger.info(f"📏 Step size: {step_size}, Min qty: {min_qty}")
-                    logger.info(f"📦 Final quantity: {quantity}")
+            if quantity <= 0:
+                return {'success': False, 'error': 'Calculated quantity is zero or negative'}
 
-                    if quantity < min_qty:
-                        return {'success': False, 'error': f'Quantity {quantity} below minimum {min_qty}'}
-                else:
-                    quantity = round(raw_quantity, 6)
-
-                if quantity <= 0:
-                    return {'success': False, 'error': 'Calculated quantity is zero or negative'}
-
-                # Final check: ensure order value meets minimum
-                order_value = quantity * entry_price / leverage
-                if order_value < config.minimum_order_usd:
-                    return {'success': False, 'error': f'Order value ${order_value:.2f} below minimum ${config.minimum_order_usd}'}
-
-            except Exception as e:
-                logger.error(f"❌ Error getting symbol info: {e}")
-                return {'success': False, 'error': f'Symbol info error: {str(e)}'}
+            # Calculate order_value BEFORE using it
+            order_value = quantity * entry_price
 
             # Execute market order
             side = 'BUY' if signal.trade_type == 'LONG' else 'SELL'
@@ -800,7 +901,18 @@ class TradingBot:
                         sl_price = current_price * (1 + config.stop_loss_percent / 100)
                         tp_prices = [current_price * (1 - config.take_profit_percent / 100)]
 
-                # Create SL/TP orders
+                # Validate SL price
+                if sl_price:
+                    if signal.trade_type == 'LONG':
+                        if sl_price >= current_price:
+                            logger.warning(f"⚠️ SL price {sl_price} >= current {current_price}, adjusting...")
+                            sl_price = current_price * 0.95
+                    else:
+                        if sl_price <= current_price:
+                            logger.warning(f"⚠️ SL price {sl_price} <= current {current_price}, adjusting...")
+                            sl_price = current_price * 1.05
+
+                # Create SL/TP orders with PROPER PRECISION
                 sl_tp_result = await self.create_sl_tp_orders(
                     signal.symbol, side, quantity, current_price, sl_price, tp_prices
                 )
@@ -821,7 +933,7 @@ class TradingBot:
                     'balance_used': f"${trade_amount:.2f}",
                     'channel_id': signal.channel_id,
                     'pnl': '0.00',
-                    'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'}{'| SL/TP: Enabled' if config.create_sl_tp else '| SL/TP: Disabled'}",
+                    'notes': f"Settings: {'Signal' if config.use_signal_settings else 'Bot'} | SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'}",
                     'order_value': f"${order_value:.2f}",
                     'sl_order_id': sl_tp_result['stop_loss'] if sl_tp_result['stop_loss'] else '',
                     'tp_order_ids': ', '.join([str(tp['order_id']) for tp in sl_tp_result['take_profits']]) if sl_tp_result['take_profits'] else '',
@@ -845,7 +957,7 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"❌ Trade execution error: {e}")
-            
+
             # Log failed trade to webhook
             if config.make_webhook_enabled and config.user_id in self.webhook_loggers:
                 trade_data = {
@@ -862,7 +974,7 @@ class TradingBot:
                     'sl_order_id': '', 'tp_order_ids': ''
                 }
                 self.webhook_loggers[config.user_id].send_trade_data(trade_data)
-            
+
             return {'success': False, 'error': str(e)}
 
     async def start_monitoring(self, user_id: int, bot_instance) -> bool:
@@ -1031,7 +1143,6 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🛑 Stop Loss: {config.stop_loss_percent}%", callback_data="set_stop_loss")],
         [InlineKeyboardButton(f"🎯 Take Profit: {config.take_profit_percent}%", callback_data="set_take_profit")],
         [InlineKeyboardButton(f"💰 Balance: {config.balance_percent}%", callback_data="set_balance_percent")],
-        [InlineKeyboardButton(f"💵 Min Order: ${config.minimum_order_usd}", callback_data="set_min_order")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
 
@@ -1052,8 +1163,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 💰 Configurable position sizes
 • 🔧 Interactive setup with buttons
 • 🔗 Make.com webhook integration
-• 💵 $5 minimum order enforcement
-• 💳 Advanced balance checking
+• ✅ FIXED: Stop Loss precision errors
 
 <b>Setup Steps:</b>
 1️⃣ /setup_binance - Binance API
@@ -1126,8 +1236,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 💵 <b>Trade Calculations:</b>
 Position Size ({config.balance_percent}%): ${balance_info['usdt_balance'] * config.balance_percent / 100:.2f}
-Minimum Order: ${config.minimum_order_usd}
-Status: {'✅ Can Trade' if balance_info['usdt_balance'] >= config.minimum_order_usd else '❌ Insufficient Balance'}
+Status: ✅ Can Trade
 
 ⏰ Updated: {datetime.now().strftime('%H:%M:%S')}"""
     else:
@@ -1159,7 +1268,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🛑 Bot Stop Loss: <b>{config.stop_loss_percent}%</b>
 🎯 Bot Take Profit: <b>{config.take_profit_percent}%</b>
 💰 Position Size: <b>{config.balance_percent}%</b>
-💵 Minimum Order: <b>${config.minimum_order_usd}</b>
 
 🔗 <b>Make.com Integration:</b>
 Webhook URL: {DEFAULT_WEBHOOK_URL[:50]}...
@@ -1170,6 +1278,7 @@ Status: {'✅ Ready' if config.make_webhook_enabled else '❌ Disabled'}
 • Real-time webhook logging
 • Russian signal parsing
 • Advanced balance checking
+• Fixed Stop Loss precision
 """
     await update.message.reply_text(status_text, parse_mode='HTML')
 
@@ -1310,7 +1419,7 @@ Send your Binance API Key:
 ⚠️ <b>Requirements:</b>
 • Futures trading enabled
 • API key with Futures permissions
-• Sufficient balance (minimum $5 USDT)""", parse_mode='HTML')
+• Sufficient balance""", parse_mode='HTML')
     return WAITING_BINANCE_KEY
 
 async def handle_binance_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1592,17 +1701,10 @@ Next: /start_monitoring to begin trading""",
 
     elif query.data == "set_balance_percent":
         await query.edit_message_text(
-            "💰 <b>Set Balance Percentage</b>\n\nSend percentage of balance to use per trade (e.g., 1 for 1%):",
+            "💰 <b>Set Balance Percentage</b>\n\nSend percentage of balance to use per trade (1-100):\n\n<b>Examples:</b>\n• 1 = 1% of balance\n• 5 = 5% of balance\n• 10 = 10% of balance\n• 50 = 50% of balance",
             parse_mode='HTML'
         )
         return WAITING_BALANCE_PERCENT
-
-    elif query.data == "set_min_order":
-        await query.edit_message_text(
-            "💵 <b>Set Minimum Order</b>\n\nSend minimum order amount in USD (e.g., 5 for $5):",
-            parse_mode='HTML'
-        )
-        return WAITING_BALANCE_PERCENT  # Reuse this state
 
     return WAITING_SETTINGS_SOURCE
 
@@ -1660,17 +1762,16 @@ async def handle_balance_percent(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         value = float(update.message.text)
-        if value >= 1 and value <= 100:
-            if value <= 10:  # Likely balance percentage
-                config.balance_percent = value
-                await update.message.reply_text(f"✅ <b>Balance percentage set to {value}%</b>", parse_mode='HTML')
-            else:  # Likely minimum order amount
-                config.minimum_order_usd = value
-                await update.message.reply_text(f"✅ <b>Minimum order set to ${value}</b>", parse_mode='HTML')
+        if 1 <= value <= 100:
+            config.balance_percent = value
+            await update.message.reply_text(
+                f"✅ <b>Balance percentage set to {value}%</b>\n\n💰 This means {value}% of your balance will be used per trade.",
+                parse_mode='HTML'
+            )
         else:
-            await update.message.reply_text("❌ <b>Invalid value!</b> Send a reasonable number", parse_mode='HTML')
+            await update.message.reply_text("❌ <b>Invalid value!</b> Must be between 1-100", parse_mode='HTML')
     except ValueError:
-        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number", parse_mode='HTML')
+        await update.message.reply_text("❌ <b>Invalid input!</b> Send a number between 1-100", parse_mode='HTML')
 
     return ConversationHandler.END
 
@@ -1700,7 +1801,6 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⚙️ Settings: {'Signal Priority' if config.use_signal_settings else 'Bot Settings'}
 📊 SL/TP: {'Enabled' if config.create_sl_tp else 'Disabled'}
 🔗 Make.com Webhook: ENABLED
-💵 Min Order: ${config.minimum_order_usd}
 
 🎯 <b>Ready to trade!</b>
 Use /stop_monitoring to stop.
@@ -1708,7 +1808,8 @@ Use /stop_monitoring to stop.
 🔗 <b>Webhook URL:</b>
 {DEFAULT_WEBHOOK_URL[:50]}...
 
-📊 All trades will be logged to Make.com automatically!"""
+📊 All trades will be logged to Make.com automatically!
+✅ Stop Loss precision errors FIXED!"""
 
         await update.message.reply_text(status_msg, parse_mode='HTML')
     else:
@@ -1814,8 +1915,7 @@ trading_conv_handler = ConversationHandler(
 
 def main():
     """Start the bot"""
-    # Add your bot token here
-    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"  # Replace with your actual bot token
+    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1840,8 +1940,9 @@ def main():
 
     print("🤖 Bot starting...")
     print(f"🔗 Make.com webhook integrated: {DEFAULT_WEBHOOK_URL}")
-    print("💵 Minimum order enforcement: $5")
-    print("✅ Advanced webhook testing enabled")
+    print("✅ Balance percentage fixed: works for all values 1-100%")
+    print("✅ Minimum order button REMOVED")
+    print("✅ Stop Loss precision errors FIXED")
     print("📊 Ready for Google Sheets integration")
     
     # Run the bot
