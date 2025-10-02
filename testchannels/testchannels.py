@@ -63,7 +63,9 @@ DEFAULT_BINANCE_API_SECRET = 'R26Tvlq8rRjK4HCqhG5EstMXGAqHr1B22DH3IuTRjHOiEanmIl
  WAITING_MIN_ORDER, WAITING_TP1_PERCENT, WAITING_TP1_CLOSE,
  WAITING_TP2_PERCENT, WAITING_TP2_CLOSE,
  WAITING_TP3_PERCENT, WAITING_TP3_CLOSE,
- WAITING_TRAILING_CALLBACK, WAITING_TRAILING_ACTIVATION) = range(21)
+ WAITING_TRAILING_CALLBACK, WAITING_TRAILING_ACTIVATION,
+ WAITING_CHANNEL_LINK, WAITING_USDT_AMOUNT,
+ WAITING_TP_CONFIG, WAITING_TP_LEVEL_PERCENT, WAITING_TP_LEVEL_CLOSE) = range(26)
 
 # Your NEW Make.com Webhook URL
 DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/pnfx5xy1q8caxq4qc2yhmnrkmio1ixqj"
@@ -95,6 +97,12 @@ class TradingSignal:
         if self.take_profit is None:
             self.take_profit = []
 
+@dataclass
+class TakeProfitLevel:
+    """Individual take profit level configuration"""
+    percentage: float  # Price percentage (e.g., 1.0 for 1%)
+    close_percentage: float  # Percentage of position to close (e.g., 50.0 for 50%)
+    
 @dataclass 
 class BotConfig:
     binance_api_key: str = ""
@@ -115,10 +123,21 @@ class BotConfig:
     trailing_enabled: bool = False
     trailing_activation_percent: float = 2.0
     trailing_callback_percent: float = 0.5
+    # New features
+    use_fixed_usdt_amount: bool = False
+    fixed_usdt_amount: float = 100.0
+    custom_take_profits: List[TakeProfitLevel] = None
 
     def __post_init__(self):
         if self.monitored_channels is None:
             self.monitored_channels = []
+        if self.custom_take_profits is None:
+            # Default: 1% close 50%, 2.5% close 50% of remaining, 5% close all remaining
+            self.custom_take_profits = [
+                TakeProfitLevel(1.0, 50.0),
+                TakeProfitLevel(2.5, 50.0),
+                TakeProfitLevel(5.0, 100.0)
+            ]
 
 @dataclass
 class ActivePosition:
@@ -460,6 +479,69 @@ class TradingBot:
              [KeyboardButton("⚙️ Settings")]],
             resize_keyboard=True
         )
+
+    async def extract_channel_id_from_link(self, link: str, user_id: int) -> Optional[str]:
+        """Extract channel ID from t.me link"""
+        try:
+            # Clean the link
+            link = link.strip()
+            if not link.startswith('http'):
+                if not link.startswith('t.me/'):
+                    link = 't.me/' + link.lstrip('@/')
+                link = 'https://' + link
+            
+            # Extract username from link
+            import re
+            match = re.search(r't\.me/([^/?]+)', link)
+            if not match:
+                return None
+            
+            username = match.group(1)
+            
+            # Get Telethon client
+            telethon_client = self.user_monitoring_clients.get(user_id)
+            if not telethon_client:
+                config = self.get_user_config(user_id)
+                await self.setup_telethon_client(config)
+                telethon_client = self.user_monitoring_clients.get(user_id)
+            
+            if not telethon_client:
+                return None
+            
+            # Resolve the entity
+            try:
+                entity = await telethon_client.get_entity(username)
+                if hasattr(entity, 'id'):
+                    return str(-abs(entity.id))
+            except Exception as e:
+                logger.error(f"Error resolving channel {username}: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error extracting channel ID from link: {e}")
+            return None
+        
+        return None
+
+    def extract_channel_id_from_forward(self, message) -> Optional[str]:
+        """Extract channel ID from forwarded message"""
+        try:
+            if hasattr(message, 'forward') and message.forward:
+                forward = message.forward
+                if hasattr(forward, 'from_id') and forward.from_id:
+                    if hasattr(forward.from_id, 'channel_id'):
+                        return str(-abs(forward.from_id.channel_id))
+                    elif hasattr(forward.from_id, 'user_id'):
+                        return str(forward.from_id.user_id)
+                        
+                # Try alternative forward attributes
+                if hasattr(forward, 'chat_id') and forward.chat_id:
+                    return str(-abs(forward.chat_id))
+                    
+        except Exception as e:
+            logger.error(f"Error extracting channel ID from forward: {e}")
+            
+        return None
 
     def to_bingx_symbol(self, symbol: str) -> str:
         try:
@@ -1009,13 +1091,21 @@ class TradingBot:
             logger.info(f"💲 Current {signal.symbol} price: {current_price}")
 
             entry_price = signal.entry_price or current_price
-            trade_amount = usdt_balance * (config.balance_percent / 100)
+            
+            # Calculate trade amount based on user preference
+            if config.use_fixed_usdt_amount:
+                trade_amount = min(config.fixed_usdt_amount, usdt_balance)
+                logger.info(f"💰 Using fixed USDT amount: ${trade_amount:.2f}")
+            else:
+                trade_amount = usdt_balance * (config.balance_percent / 100)
+                logger.info(f"💰 Using percentage of balance: ${trade_amount:.2f} ({config.balance_percent}%)")
+            
             position_value = trade_amount * leverage
             raw_quantity = (trade_amount * leverage) / entry_price
 
             logger.info(f"🧮 Trade calculation:")
             logger.info(f"   Balance: {usdt_balance} USDT")
-            logger.info(f"   Trade amount: ${trade_amount:.2f} ({config.balance_percent}%)")
+            logger.info(f"   Trade amount: ${trade_amount:.2f}")
             logger.info(f"   Entry price: {entry_price}")
             logger.info(f"   Raw quantity: {raw_quantity}")
 
@@ -1083,34 +1173,29 @@ class TradingBot:
                                 normalized = [current_price * 0.975, current_price * 0.95, current_price * 0.925]
                         tp_prices = normalized
                     else:
-                        # Default ladder: 2.5%, 5%, 7.5%
-                        if signal.trade_type == 'LONG':
-                            tp_prices = [
-                                current_price * 1.025,
-                                current_price * 1.05,
-                                current_price * 1.075
-                            ]
-                        else:
-                            tp_prices = [
-                                current_price * 0.975,
-                                current_price * 0.95,
-                                current_price * 0.925
-                            ]
+                        # Use custom take profit levels
+                        tp_prices = []
+                        for tp_level in config.custom_take_profits:
+                            if signal.trade_type == 'LONG':
+                                tp_price = current_price * (1 + tp_level.percentage / 100)
+                            else:
+                                tp_price = current_price * (1 - tp_level.percentage / 100)
+                            tp_prices.append(tp_price)
                 else:
+                    # Use bot settings with custom take profit levels
                     if signal.trade_type == 'LONG':
                         sl_price = current_price * (1 - config.stop_loss_percent / 100)
-                        tp_prices = [
-                            current_price * 1.025,
-                            current_price * 1.05,
-                            current_price * 1.075
-                        ]
                     else:
                         sl_price = current_price * (1 + config.stop_loss_percent / 100)
-                        tp_prices = [
-                            current_price * 0.975,
-                            current_price * 0.95,
-                            current_price * 0.925
-                        ]
+                    
+                    # Use custom take profit levels
+                    tp_prices = []
+                    for tp_level in config.custom_take_profits:
+                        if signal.trade_type == 'LONG':
+                            tp_price = current_price * (1 + tp_level.percentage / 100)
+                        else:
+                            tp_price = current_price * (1 - tp_level.percentage / 100)
+                        tp_prices.append(tp_price)
 
                 if sl_price:
                     if signal.trade_type == 'LONG':
@@ -1149,14 +1234,16 @@ class TradingBot:
                         logger.info(f"🛑 Stop Loss order placed: {sl_order}")
                         sl_tp_result['stop_loss'] = sl_order.get('id')
 
-                    # Split quantities: 50%, 50% of remaining, then all remaining (50/25/25 effectively or 50/50/0 if 2 targets)
-                    tp_targets = tp_prices[:3]
+                    # Use custom take profit levels with their specific close percentages
+                    tp_targets = tp_prices[:len(config.custom_take_profits)]
+                    
                     # Discretize TP targets to tick steps relative to current mark to avoid collapsing to same price
                     try:
                         latest_for_tp = self.exchange.fetch_ticker(market_symbol)
                         mark_for_tp = float(latest_for_tp.get('last') or latest_for_tp.get('info', {}).get('price') or current_price)
                     except Exception:
                         mark_for_tp = current_price
+                    
                     adjusted_tp_targets = []
                     prev_ticks = 0
                     for tp_abs in tp_targets:
@@ -1176,14 +1263,20 @@ class TradingBot:
                                 need_ticks = prev_ticks + 1
                             adjusted_tp_targets.append(mark_for_tp - need_ticks * precision_info['tick_size'])
                             prev_ticks = need_ticks
+                    
                     tp_targets = adjusted_tp_targets
+                    
+                    # Calculate quantities based on custom close percentages
                     quantities = []
-                    if len(tp_targets) >= 3:
-                        quantities = [quantity * 0.5, quantity * 0.25, quantity * 0.25]
-                    elif len(tp_targets) == 2:
-                        quantities = [quantity * 0.5, quantity * 0.5]
-                    else:
-                        quantities = [quantity]
+                    remaining_quantity = quantity
+                    
+                    for i, tp_level in enumerate(config.custom_take_profits[:len(tp_targets)]):
+                        if i == len(tp_targets) - 1:  # Last TP level closes all remaining
+                            quantities.append(remaining_quantity)
+                        else:
+                            close_qty = remaining_quantity * (tp_level.close_percentage / 100)
+                            quantities.append(close_qty)
+                            remaining_quantity -= close_qty
 
                     for tp, q in zip(tp_targets, quantities):
                         each_qty = self.round_quantity(q, precision_info['step_size'], precision_info['qty_precision'])
@@ -1471,8 +1564,12 @@ def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarku
         )])
 
     keyboard.append([
-        InlineKeyboardButton("➕ Manual", callback_data="add_manual_channel"),
-        InlineKeyboardButton("🧹 Clear", callback_data="clear_all_channels")
+        InlineKeyboardButton("➕ Manual ID", callback_data="add_manual_channel"),
+        InlineKeyboardButton("🔗 Add Link", callback_data="add_channel_link")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("📤 Forward Message", callback_data="add_forwarded_channel"),
+        InlineKeyboardButton("🧹 Clear All", callback_data="clear_all_channels")
     ])
     keyboard.append([InlineKeyboardButton("✅ Done", callback_data="channels_done")])
 
@@ -1480,6 +1577,12 @@ def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarku
 
 def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     config = trading_bot.get_user_config(user_id)
+
+    # Format trade amount display
+    if config.use_fixed_usdt_amount:
+        trade_amount_text = f"💵 Fixed: ${config.fixed_usdt_amount:.0f} USDT"
+    else:
+        trade_amount_text = f"💰 Percentage: {config.balance_percent}%"
 
     keyboard = [
         [InlineKeyboardButton(f"⚙️ Settings Source: {'Signal' if config.use_signal_settings else 'Bot'}", 
@@ -1490,11 +1593,11 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
                             callback_data="toggle_webhook")],
         [InlineKeyboardButton(f"⚡ Leverage: {config.leverage}x", callback_data="set_leverage")],
         [InlineKeyboardButton(f"🛑 Stop Loss: {config.stop_loss_percent}%", callback_data="set_stop_loss")],
-        [InlineKeyboardButton(f"🎯 Take Profit: {config.take_profit_percent}%", callback_data="set_take_profit")],
+        [InlineKeyboardButton(f"🎯 Custom Take Profits ({len(config.custom_take_profits)} levels)", callback_data="configure_take_profits")],
         [InlineKeyboardButton(f"🧵 Trailing: {'ON' if config.trailing_enabled else 'OFF'}", callback_data="toggle_trailing")],
         [InlineKeyboardButton(f"🔔 Trailing Activation: {config.trailing_activation_percent}%", callback_data="set_trailing_activation")],
         [InlineKeyboardButton(f"↩️ Trailing Callback: {config.trailing_callback_percent}%", callback_data="set_trailing_callback")],
-        [InlineKeyboardButton(f"💰 Balance: {config.balance_percent}%", callback_data="set_balance_percent")],
+        [InlineKeyboardButton(trade_amount_text, callback_data="toggle_trade_amount_mode")],
         [InlineKeyboardButton("📡 Manage Channels", callback_data="manage_channels"), InlineKeyboardButton("🔄 Enable OCO Monitor", callback_data="enable_oco")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
@@ -1504,29 +1607,31 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # ===================== COMMAND HANDLERS =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = f"""🤖 <b>Telegram Trading Bot v3.1 - OCO READY!</b>
+    welcome_text = f"""🤖 <b>Telegram Trading Bot v3.2 - ENHANCED!</b>
 
 🎉 <b>NEW FEATURES:</b>
-✅ Fixed decimal precision for all symbols
-✅ OCO simulation: Auto-cancel orders
-✅ Proper rounding for micro-priced coins
+✅ Add channels via links (t.me/channel)
+✅ Add channels by forwarding messages
+✅ Custom multi-level take profits
+✅ Fixed USDT amount trading
+✅ Configurable TP percentages
 
 🔗 {DEFAULT_WEBHOOK_URL[:50]}...
 
 <b>Features:</b>
+• 📡 Easy channel management (links/forwards)
+• 🎯 Custom TP levels (1%→50%, 2.5%→50%, etc.)
+• 💵 Fixed USDT amounts or percentage
 • ⚙️ Signal vs Bot settings
-• 🎯 Auto SL/TP creation  
-• 🔄 OCO: Cancel SL when TP fills
-• 🔄 OCO: Cancel TP when SL fills
+• 🔄 OCO: Auto-cancel orders
 • 📊 Russian signal parsing
-• 💰 Configurable sizes
 • 🔗 Make.com webhook
 
 <b>Setup Steps:</b>
 1️⃣ /setup_binance
 2️⃣ /setup_telegram
-3️⃣ /setup_channels
-4️⃣ /setup_trading
+3️⃣ /setup_channels (now with links!)
+4️⃣ /setup_trading (new TP config!)
 5️⃣ /start_monitoring
 
 <b>Test Commands:</b>
@@ -1661,8 +1766,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📈 SL/TP: <b>{sl_tp_status}</b>
 ⚡ Leverage: <b>{config.leverage}x</b>
 🛑 Stop Loss: <b>{config.stop_loss_percent}%</b>
-🎯 Take Profit: <b>{config.take_profit_percent}%</b>
-💰 Balance: <b>{config.balance_percent}%</b>
+🎯 Take Profits: <b>{len(config.custom_take_profits)} levels</b>
+💰 Trade Amount: <b>{'$' + str(int(config.fixed_usdt_amount)) + ' USDT' if config.use_fixed_usdt_amount else str(config.balance_percent) + '%'}</b>
 
 📍 <b>Active Positions:</b> {len(trading_bot.active_positions)}
 
@@ -1845,14 +1950,47 @@ async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_CHANNEL_SELECTION
 
 async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = update.effective_user.id
-    config = trading_bot.get_user_config(user_id)
+    # Handle both callback queries and forwarded messages
+    if update.callback_query:
+        query = update.callback_query
+        user_id = update.effective_user.id
+        config = trading_bot.get_user_config(user_id)
 
-    try:
-        await query.answer()
-    except:
-        pass
+        try:
+            await query.answer()
+        except:
+            pass
+    elif update.message and update.message.forward_from_chat:
+        # Handle forwarded message
+        user_id = update.effective_user.id
+        config = trading_bot.get_user_config(user_id)
+        
+        forward_from_chat = update.message.forward_from_chat
+        if forward_from_chat and hasattr(forward_from_chat, 'id'):
+            channel_id = str(-abs(forward_from_chat.id))
+            channel_name = getattr(forward_from_chat, 'title', 'Unknown Channel')
+            
+            if channel_id not in config.monitored_channels:
+                config.monitored_channels.append(channel_id)
+                
+            await update.message.reply_text(
+                f"""✅ <b>Channel Added from Forward!</b>
+
+📡 Channel: {channel_name}
+🆔 ID: <code>{channel_id}</code>
+📊 Total channels: <b>{len(config.monitored_channels)}</b>
+
+Use /setup_channels to continue managing channels.""",
+                parse_mode='HTML'
+            )
+            return WAITING_CHANNEL_SELECTION
+        else:
+            await update.message.reply_text("❌ Could not extract channel from forwarded message", parse_mode='HTML')
+            return WAITING_CHANNEL_SELECTION
+    else:
+        return WAITING_CHANNEL_SELECTION
+
+    query = update.callback_query
 
     if query.data == "channels_done":
         await query.edit_message_text(
@@ -1883,6 +2021,29 @@ Send channel ID: <code>-1001234567890</code>""",
             parse_mode='HTML'
         )
         return WAITING_MANUAL_CHANNEL
+    
+    elif query.data == "add_channel_link":
+        await query.edit_message_text(
+            """🔗 <b>Add Channel via Link</b>
+
+Send channel link:
+• <code>https://t.me/channel_name</code>
+• <code>t.me/channel_name</code>
+• <code>@channel_name</code>
+• <code>channel_name</code>""",
+            parse_mode='HTML'
+        )
+        return WAITING_CHANNEL_LINK
+    
+    elif query.data == "add_forwarded_channel":
+        await query.edit_message_text(
+            """📤 <b>Add Channel via Forward</b>
+
+Forward any message from the channel you want to monitor.
+The bot will automatically extract the channel ID.""",
+            parse_mode='HTML'
+        )
+        return WAITING_CHANNEL_SELECTION  # Stay in same state to handle forwarded messages
 
     elif query.data.startswith("toggle_channel_"):
         channel_id = query.data.replace("toggle_channel_", "")
@@ -1927,6 +2088,55 @@ Total: <b>{len(config.monitored_channels)}</b>
 Use /setup_trading next""",
         parse_mode='HTML'
     )
+
+    return ConversationHandler.END
+
+async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    link = update.message.text.strip()
+
+    await update.message.reply_text("🔍 <b>Resolving channel link...</b>", parse_mode='HTML')
+
+    channel_id = await trading_bot.extract_channel_id_from_link(link, user_id)
+
+    if channel_id:
+        if channel_id not in config.monitored_channels:
+            config.monitored_channels.append(channel_id)
+            
+        # Try to get channel info for display
+        try:
+            telethon_client = trading_bot.user_monitoring_clients.get(user_id)
+            if telethon_client:
+                entity = await telethon_client.get_entity(int(channel_id))
+                channel_name = getattr(entity, 'title', 'Unknown Channel')
+            else:
+                channel_name = 'Channel'
+        except:
+            channel_name = 'Channel'
+
+        await update.message.reply_text(
+            f"""✅ <b>Channel Added!</b>
+
+📡 Channel: {channel_name}
+🆔 ID: <code>{channel_id}</code>
+📊 Total channels: <b>{len(config.monitored_channels)}</b>
+
+Use /setup_channels to manage or continue setup.""",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            """❌ <b>Failed to resolve channel</b>
+
+Please check:
+• Channel link is correct
+• Channel is public or you're a member
+• Telegram API is configured
+
+Try again or use manual ID method.""",
+            parse_mode='HTML'
+        )
 
     return ConversationHandler.END
 
@@ -2052,6 +2262,41 @@ Next: /start_monitoring""",
         if not trading_bot.order_monitor_running:
             asyncio.create_task(trading_bot.monitor_orders(context.bot))
         await query.edit_message_text("🔄 <b>OCO Monitor enabled</b>", parse_mode='HTML')
+
+    elif query.data == "toggle_trade_amount_mode":
+        config.use_fixed_usdt_amount = not config.use_fixed_usdt_amount
+        if config.use_fixed_usdt_amount:
+            await query.edit_message_text(
+                f"💵 <b>Set Fixed USDT Amount</b>\n\nCurrent: ${config.fixed_usdt_amount:.0f}\nSend new amount:",
+                parse_mode='HTML'
+            )
+            return WAITING_USDT_AMOUNT
+        else:
+            keyboard_markup = create_settings_keyboard(user_id)
+            await query.edit_message_text(
+                "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+                reply_markup=keyboard_markup,
+                parse_mode='HTML'
+            )
+
+    elif query.data == "configure_take_profits":
+        tp_text = "🎯 <b>Current Take Profit Levels:</b>\n\n"
+        for i, tp in enumerate(config.custom_take_profits, 1):
+            tp_text += f"TP{i}: {tp.percentage}% → Close {tp.close_percentage}%\n"
+        
+        tp_keyboard = [
+            [InlineKeyboardButton("➕ Add Level", callback_data="add_tp_level")],
+            [InlineKeyboardButton("🗑️ Clear All", callback_data="clear_tp_levels")],
+            [InlineKeyboardButton("🔄 Reset Default", callback_data="reset_tp_default")],
+            [InlineKeyboardButton("✅ Done", callback_data="tp_config_done")]
+        ]
+        
+        await query.edit_message_text(
+            tp_text,
+            reply_markup=InlineKeyboardMarkup(tp_keyboard),
+            parse_mode='HTML'
+        )
+        return WAITING_TP_CONFIG
 
     return WAITING_SETTINGS_SOURCE
 
@@ -2229,6 +2474,129 @@ TP: {signal.take_profit}""")
 
     await update.message.reply_text("🧪 <b>Parser Test</b>\n\n" + "\n\n".join(results), parse_mode='HTML')
 
+async def handle_usdt_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        amount = float(update.message.text)
+        if amount > 0:
+            config.fixed_usdt_amount = amount
+            await update.message.reply_text(f"✅ <b>Fixed USDT Amount: ${amount:.0f}</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Amount must be positive", parse_mode='HTML')
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount!", parse_mode='HTML')
+
+    return ConversationHandler.END
+
+async def handle_tp_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+
+    try:
+        await query.answer()
+    except:
+        pass
+
+    if query.data == "tp_config_done":
+        keyboard_markup = create_settings_keyboard(user_id)
+        await query.edit_message_text(
+            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+        return WAITING_SETTINGS_SOURCE
+
+    elif query.data == "add_tp_level":
+        await query.edit_message_text(
+            "🎯 <b>Add Take Profit Level</b>\n\nSend percentage (e.g., 2.5 for 2.5%):",
+            parse_mode='HTML'
+        )
+        return WAITING_TP_LEVEL_PERCENT
+
+    elif query.data == "clear_tp_levels":
+        config.custom_take_profits.clear()
+        await query.edit_message_text(
+            "🗑️ <b>All take profit levels cleared!</b>\n\nAdd new levels or reset to default.",
+            parse_mode='HTML'
+        )
+        return WAITING_TP_CONFIG
+
+    elif query.data == "reset_tp_default":
+        config.custom_take_profits = [
+            TakeProfitLevel(1.0, 50.0),
+            TakeProfitLevel(2.5, 50.0),
+            TakeProfitLevel(5.0, 100.0)
+        ]
+        tp_text = "🔄 <b>Reset to Default:</b>\n\n"
+        for i, tp in enumerate(config.custom_take_profits, 1):
+            tp_text += f"TP{i}: {tp.percentage}% → Close {tp.close_percentage}%\n"
+        
+        tp_keyboard = [
+            [InlineKeyboardButton("➕ Add Level", callback_data="add_tp_level")],
+            [InlineKeyboardButton("🗑️ Clear All", callback_data="clear_tp_levels")],
+            [InlineKeyboardButton("🔄 Reset Default", callback_data="reset_tp_default")],
+            [InlineKeyboardButton("✅ Done", callback_data="tp_config_done")]
+        ]
+        
+        await query.edit_message_text(
+            tp_text,
+            reply_markup=InlineKeyboardMarkup(tp_keyboard),
+            parse_mode='HTML'
+        )
+
+    return WAITING_TP_CONFIG
+
+async def handle_tp_level_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    try:
+        percentage = float(update.message.text)
+        if 0.1 <= percentage <= 100:
+            context.user_data['tp_percentage'] = percentage
+            await update.message.reply_text(
+                f"🎯 <b>TP Level: {percentage}%</b>\n\nNow send the percentage of position to close (e.g., 50 for 50%):",
+                parse_mode='HTML'
+            )
+            return WAITING_TP_LEVEL_CLOSE
+        else:
+            await update.message.reply_text("❌ Percentage must be between 0.1 and 100", parse_mode='HTML')
+            return WAITING_TP_LEVEL_PERCENT
+    except ValueError:
+        await update.message.reply_text("❌ Invalid percentage!", parse_mode='HTML')
+        return WAITING_TP_LEVEL_PERCENT
+
+async def handle_tp_level_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    config = trading_bot.get_user_config(user_id)
+    
+    try:
+        close_percentage = float(update.message.text)
+        if 1 <= close_percentage <= 100:
+            tp_percentage = context.user_data.get('tp_percentage', 1.0)
+            
+            # Add the new take profit level
+            new_tp = TakeProfitLevel(tp_percentage, close_percentage)
+            config.custom_take_profits.append(new_tp)
+            
+            # Sort by percentage
+            config.custom_take_profits.sort(key=lambda x: x.percentage)
+            
+            await update.message.reply_text(
+                f"✅ <b>Added TP Level!</b>\n\n🎯 {tp_percentage}% → Close {close_percentage}%\n\nTotal levels: {len(config.custom_take_profits)}",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text("❌ Close percentage must be between 1 and 100", parse_mode='HTML')
+            return WAITING_TP_LEVEL_CLOSE
+    except ValueError:
+        await update.message.reply_text("❌ Invalid percentage!", parse_mode='HTML')
+        return WAITING_TP_LEVEL_CLOSE
+
+    return ConversationHandler.END
+
 # ================== CONVERSATION HANDLERS ==================
 
 binance_conv_handler = ConversationHandler(
@@ -2252,8 +2620,12 @@ telegram_conv_handler = ConversationHandler(
 channel_conv_handler = ConversationHandler(
     entry_points=[CommandHandler('setup_channels', setup_channels)],
     states={
-        WAITING_CHANNEL_SELECTION: [CallbackQueryHandler(handle_channel_selection)],
+        WAITING_CHANNEL_SELECTION: [
+            CallbackQueryHandler(handle_channel_selection),
+            MessageHandler(filters.FORWARDED, handle_channel_selection)
+        ],
         WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
+        WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
@@ -2268,6 +2640,10 @@ trading_conv_handler = ConversationHandler(
         WAITING_BALANCE_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_balance_percent)],
         WAITING_TRAILING_ACTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trailing_activation)],
         WAITING_TRAILING_CALLBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trailing_callback)],
+        WAITING_USDT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_usdt_amount)],
+        WAITING_TP_CONFIG: [CallbackQueryHandler(handle_tp_config)],
+        WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
+        WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
@@ -2299,12 +2675,13 @@ def main():
     application.add_handler(CommandHandler("test_basic", test_webhook_basic))
     application.add_handler(CommandHandler("test_advanced", test_webhook_advanced))
 
-    print("🤖 Trading Bot v3.1 Starting...")
+    print("🤖 Trading Bot v3.2 Starting...")
     print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
-    print("✅ Fixed: Decimal precision for micro-priced coins")
+    print("✅ NEW: Add channels via links and forwards")
+    print("✅ NEW: Custom multi-level take profits")
+    print("✅ NEW: Fixed USDT amount trading")
     print("✅ Feature: OCO order simulation")
     print("✅ Feature: Auto-cancel opposite orders")
-    print("✅ Fixed: Syntax error in send_trade_data")
     print("📊 Ready!")
     
     application.run_polling()
