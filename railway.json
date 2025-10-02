@@ -3,6 +3,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python futures_bot.py"
+    "startCommand": "python futures_bot.py && python testchannels/testchannels.py"
   }
 }
