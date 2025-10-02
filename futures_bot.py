@@ -48,8 +48,8 @@ from telethon.tl.types import Channel, PeerChannel
 from telethon.errors import ApiIdInvalidError
 
 # Auto-configured API Credentials
-DEFAULT_TELEGRAM_API_ID = '23312577'
-DEFAULT_TELEGRAM_API_HASH = 'e879a3e9fd3d45cee98ef55214092805'
+DEFAULT_TELEGRAM_API_ID = '28270452'
+DEFAULT_TELEGRAM_API_HASH = '8bb0aa3065dd515fb6e105f1fc60fdb6'
 DEFAULT_BINANCE_API_KEY = '3JEEuTwUP14EKSieV6b16hoE7DB4oqh2w21w8hcaMNaIldeBajXqebpNDzyuAchRzVUeeU18gf1pMKDHMQ1w'
 DEFAULT_BINANCE_API_SECRET = 'xZdmDhlQt3NxsrAl4YGjnOvjxCYnwkCFpOMTziEP8biujFRYOniDnNqczDjcOGSZIhpXa30FYHm9sJRv8PMsYw'
 
@@ -66,7 +66,7 @@ DEFAULT_BINANCE_API_SECRET = 'xZdmDhlQt3NxsrAl4YGjnOvjxCYnwkCFpOMTziEP8biujFRYOn
  WAITING_TRAILING_CALLBACK, WAITING_TRAILING_ACTIVATION) = range(21)
 
 # Your NEW Make.com Webhook URL
-DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava"
+DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/pnfx5xy1q8caxq4qc2yhmnrkmio1ixqj"
 
 # Logging setup
 logging.basicConfig(
@@ -130,12 +130,15 @@ class ActivePosition:
     entry_price: float
     stop_loss_order_id: Optional[int] = None
     take_profit_order_ids: List[int] = None
+    filled_take_profit_order_ids: List[int] = None
     trailing_order_id: Optional[int] = None
     timestamp: datetime = None
 
     def __post_init__(self):
         if self.take_profit_order_ids is None:
             self.take_profit_order_ids = []
+        if self.filled_take_profit_order_ids is None:
+            self.filled_take_profit_order_ids = []
         if self.timestamp is None:
             self.timestamp = datetime.now()
 
@@ -687,29 +690,62 @@ class TradingBot:
 
 # (moved trailing handlers below class to avoid breaking class methods)
 
-    async def cancel_related_orders(self, symbol: str, user_id: int, filled_order_type: str, bot_instance):
-        """Cancel SL when TP fills, or cancel all TPs when SL fills"""
+    async def cancel_related_orders(self, symbol: str, user_id: int, filled_order_type: str, bot_instance, filled_tp_id: Optional[int] = None):
+        """Cancel SL/trailing when ALL TPs fill, or cancel all TPs when SL fills"""
         try:
             position = self.active_positions.get(symbol)
             if not position:
                 logger.info(f"⚠️ No active position found for {symbol}")
                 return
 
-            logger.info(f"🔄 Canceling related orders for {symbol} after {filled_order_type} filled")
-
             cancelled_orders = []
 
-            if filled_order_type == "TAKE_PROFIT" and position.stop_loss_order_id:
-                try:
-                    if self.exchange:
-                        self.exchange.cancel_order(position.stop_loss_order_id, self.to_bingx_symbol(symbol))
-                    cancelled_orders.append(f"SL-{position.stop_loss_order_id}")
-                    logger.info(f"✅ Cancelled Stop Loss order: {position.stop_loss_order_id}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to cancel SL: {e}")
+            if filled_order_type == "TAKE_PROFIT":
+                # Add the filled TP to the tracking list
+                if filled_tp_id and filled_tp_id not in position.filled_take_profit_order_ids:
+                    position.filled_take_profit_order_ids.append(filled_tp_id)
+                    logger.info(f"📝 Marked TP {filled_tp_id} as filled for {symbol}")
 
-            elif filled_order_type == "STOP_LOSS" and position.take_profit_order_ids:
-                for tp_id in position.take_profit_order_ids:
+                # Check if ALL take profits are filled
+                remaining_tps = [tp_id for tp_id in position.take_profit_order_ids if tp_id not in position.filled_take_profit_order_ids]
+                
+                if remaining_tps:
+                    # Still have unfilled TPs, don't cancel SL/trailing yet
+                    logger.info(f"🎯 Take Profit {filled_tp_id} filled for {symbol}, but {len(remaining_tps)} TPs remaining. Keeping SL/trailing active.")
+                    await bot_instance.send_message(
+                        chat_id=user_id,
+                        text=f"🎯 <b>Take Profit Filled</b>\n\n💰 {symbol}\n✅ TP {filled_tp_id} executed\n📊 Remaining TPs: {len(remaining_tps)}\n🛡️ SL/Trailing still active",
+                        parse_mode='HTML'
+                    )
+                    return
+                else:
+                    # ALL take profits are filled, now cancel SL and trailing
+                    logger.info(f"🎉 ALL Take Profits filled for {symbol}! Canceling SL and trailing stop.")
+                    
+                    # Cancel Stop Loss
+                    if position.stop_loss_order_id:
+                        try:
+                            if self.exchange:
+                                self.exchange.cancel_order(position.stop_loss_order_id, self.to_bingx_symbol(symbol))
+                            cancelled_orders.append(f"SL-{position.stop_loss_order_id}")
+                            logger.info(f"✅ Cancelled Stop Loss order: {position.stop_loss_order_id}")
+                        except Exception as e:
+                            logger.error(f"❌ Failed to cancel SL: {e}")
+
+                    # Cancel Trailing Stop
+                    if position.trailing_order_id:
+                        try:
+                            if self.exchange:
+                                self.exchange.cancel_order(position.trailing_order_id, self.to_bingx_symbol(symbol))
+                            cancelled_orders.append(f"TRAIL-{position.trailing_order_id}")
+                            logger.info(f"✅ Cancelled Trailing order: {position.trailing_order_id}")
+                        except Exception as e:
+                            logger.error(f"❌ Failed to cancel Trailing: {e}")
+
+            elif filled_order_type == "STOP_LOSS":
+                # Cancel all remaining take profit orders
+                remaining_tps = [tp_id for tp_id in position.take_profit_order_ids if tp_id not in position.filled_take_profit_order_ids]
+                for tp_id in remaining_tps:
                     try:
                         if self.exchange:
                             self.exchange.cancel_order(tp_id, self.to_bingx_symbol(symbol))
@@ -718,24 +754,27 @@ class TradingBot:
                     except Exception as e:
                         logger.error(f"❌ Failed to cancel TP {tp_id}: {e}")
 
-            if symbol in self.active_positions:
-                del self.active_positions[symbol]
-                logger.info(f"🗑️ Removed {symbol} from active positions")
+                # Cancel trailing order too
+                if position.trailing_order_id:
+                    try:
+                        if self.exchange:
+                            self.exchange.cancel_order(position.trailing_order_id, self.to_bingx_symbol(symbol))
+                        cancelled_orders.append(f"TRAIL-{position.trailing_order_id}")
+                        logger.info(f"✅ Cancelled Trailing order: {position.trailing_order_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to cancel Trailing: {e}")
 
-            # Always cancel trailing order too
-            if position.trailing_order_id:
-                try:
-                    if self.exchange:
-                        self.exchange.cancel_order(position.trailing_order_id, self.to_bingx_symbol(symbol))
-                    cancelled_orders.append(f"TRAIL-{position.trailing_order_id}")
-                    logger.info(f"✅ Cancelled Trailing order: {position.trailing_order_id}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to cancel Trailing: {e}")
+            # Remove position from active positions only when all orders are handled
+            if filled_order_type == "STOP_LOSS" or (filled_order_type == "TAKE_PROFIT" and not remaining_tps):
+                if symbol in self.active_positions:
+                    del self.active_positions[symbol]
+                    logger.info(f"🗑️ Removed {symbol} from active positions")
 
             if cancelled_orders:
+                reason = "ALL Take Profits filled" if filled_order_type == "TAKE_PROFIT" else f"{filled_order_type} was filled"
                 await bot_instance.send_message(
                     chat_id=user_id,
-                    text=f"🔄 <b>Auto-Cancelled Orders</b>\n\n💰 {symbol}\n📋 Cancelled: {', '.join(cancelled_orders)}\n⚠️ Reason: {filled_order_type} was filled",
+                    text=f"🔄 <b>Auto-Cancelled Orders</b>\n\n💰 {symbol}\n📋 Cancelled: {', '.join(cancelled_orders)}\n⚠️ Reason: {reason}",
                     parse_mode='HTML'
                 )
 
@@ -776,7 +815,7 @@ class TradingBot:
                                     continue
 
                             for tp_id in position.take_profit_order_ids:
-                                if tp_id not in open_order_ids:
+                                if tp_id not in open_order_ids and tp_id not in position.filled_take_profit_order_ids:
                                     # Verify TP truly filled (not canceled/expired)
                                     tp_filled = False
                                     try:
@@ -786,9 +825,9 @@ class TradingBot:
                                     except Exception:
                                         tp_filled = False
                                     if tp_filled:
-                                        logger.info(f"🎯 Take Profit filled for {symbol}")
-                                        await self.cancel_related_orders(symbol, position.user_id, "TAKE_PROFIT", bot_instance)
-                                        break
+                                        logger.info(f"🎯 Take Profit {tp_id} filled for {symbol}")
+                                        await self.cancel_related_orders(symbol, position.user_id, "TAKE_PROFIT", bot_instance, filled_tp_id=tp_id)
+                                        # Don't break here - continue checking other TPs in case multiple filled simultaneously
 
                         except Exception as e:
                             logger.error(f"❌ Error checking orders for {symbol}: {e}")
@@ -2237,7 +2276,7 @@ trading_conv_handler = ConversationHandler(
 
 def main():
     """Start the bot"""
-    BOT_TOKEN = "7877710025:AAGjvASxPrV4jfwleq0XczdHB88U98W_zEc"
+    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
     application = Application.builder().token(BOT_TOKEN).build()
 
