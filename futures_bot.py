@@ -2276,7 +2276,7 @@ trading_conv_handler = ConversationHandler(
 
 def main():
     """Start the bot"""
-    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
+    BOT_TOKEN = "7877710025:AAGjvASxPrV4jfwleq0XczdHB88U98W_zEc"
     
     application = Application.builder().token(BOT_TOKEN).build()
 
