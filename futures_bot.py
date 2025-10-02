@@ -66,7 +66,7 @@ DEFAULT_BINANCE_API_SECRET = 'xZdmDhlQt3NxsrAl4YGjnOvjxCYnwkCFpOMTziEP8biujFRYOn
  WAITING_TRAILING_CALLBACK, WAITING_TRAILING_ACTIVATION) = range(21)
 
 # Your NEW Make.com Webhook URL
-DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/pnfx5xy1q8caxq4qc2yhmnrkmio1ixqj"
+DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/whf9it0leksyn2hffklu1rho7wywsava"
 
 # Logging setup
 logging.basicConfig(
