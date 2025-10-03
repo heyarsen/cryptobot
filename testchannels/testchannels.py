@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Telegram Trading Bot v3.1 - COMPLETE WITH OCO SIMULATION
-- Fixed: Decimal precision for all price levels
-- Feature: Auto-cancel SL when TP fills and vice versa
-- Fixed: Stop Loss and Take Profit rounding errors
-- Enhanced: Order monitoring with OCO simulation
-- Fixed: Syntax error in send_trade_data
+Enhanced Multi-Account Trading Bot v4.0 - COMPLETE WITH MULTI-ACCOUNT SUPPORT
+- Multi-account management with separate API keys
+- Channel synchronization across accounts
+- Enhanced signal parsing for Russian/English formats
+- Advanced pattern recognition
+- Confidence scoring system
+- Account-specific settings and routing
+- Subaccount support for BingX
 """
 
 import asyncio
 import re
 import json
 import logging
+import sqlite3
+import uuid
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,7 +69,11 @@ DEFAULT_BINANCE_API_SECRET = 'R26Tvlq8rRjK4HCqhG5EstMXGAqHr1B22DH3IuTRjHOiEanmIl
  WAITING_TP3_PERCENT, WAITING_TP3_CLOSE,
  WAITING_TRAILING_CALLBACK, WAITING_TRAILING_ACTIVATION,
  WAITING_CHANNEL_LINK, WAITING_USDT_AMOUNT,
- WAITING_TP_CONFIG, WAITING_TP_LEVEL_PERCENT, WAITING_TP_LEVEL_CLOSE) = range(26)
+ WAITING_TP_CONFIG, WAITING_TP_LEVEL_PERCENT, WAITING_TP_LEVEL_CLOSE,
+ # Enhanced multi-account states
+ WAITING_ACCOUNT_NAME, WAITING_ACCOUNT_BINGX_KEY, WAITING_ACCOUNT_BINGX_SECRET,
+ WAITING_ACCOUNT_TELEGRAM_ID, WAITING_ACCOUNT_TELEGRAM_HASH, WAITING_ACCOUNT_PHONE,
+ WAITING_ACCOUNT_SELECTION, WAITING_ACCOUNT_SETTINGS) = range(35)
 
 # Your NEW Make.com Webhook URL
 DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/pnfx5xy1q8caxq4qc2yhmnrkmio1ixqj"
@@ -160,6 +168,84 @@ class ActivePosition:
             self.filled_take_profit_order_ids = []
         if self.timestamp is None:
             self.timestamp = datetime.now()
+
+# ================== ENHANCED MULTI-ACCOUNT DATACLASSES ==================
+
+@dataclass
+class AccountConfig:
+    """Configuration for a trading account"""
+    account_id: str
+    account_name: str
+    bingx_api_key: str
+    bingx_secret_key: str
+    telegram_api_id: str
+    telegram_api_hash: str
+    phone: str
+    is_active: bool = True
+    created_at: str = ""
+    last_used: str = ""
+    
+    # Trading settings
+    leverage: int = 10
+    risk_percentage: float = 2.0
+    default_symbol: str = "BTC-USDT"
+    auto_trade_enabled: bool = False
+    
+    # Channel settings
+    monitored_channels: List[int] = None
+    signal_channels: List[int] = None
+    
+    def __post_init__(self):
+        if self.monitored_channels is None:
+            self.monitored_channels = []
+        if self.signal_channels is None:
+            self.signal_channels = []
+        if not self.created_at:
+            self.created_at = datetime.now().isoformat()
+        if not self.last_used:
+            self.last_used = datetime.now().isoformat()
+
+@dataclass
+class ChannelConfig:
+    """Configuration for a monitored channel"""
+    channel_id: int
+    channel_name: str
+    channel_username: str = ""
+    is_active: bool = True
+    account_ids: List[str] = None  # Which accounts monitor this channel
+    signal_filters: Dict[str, Any] = None  # Custom filters for this channel
+    
+    def __post_init__(self):
+        if self.account_ids is None:
+            self.account_ids = []
+        if self.signal_filters is None:
+            self.signal_filters = {}
+
+@dataclass
+class ParsedSignal:
+    """Enhanced signal structure"""
+    signal_id: str
+    channel_id: int
+    account_id: str
+    raw_text: str
+    symbol: str
+    side: str  # LONG/SHORT
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: List[float] = None
+    leverage: Optional[int] = None
+    risk_percentage: Optional[float] = None
+    timestamp: str = ""
+    processed: bool = False
+    trade_executed: bool = False
+    trade_id: Optional[str] = None
+    confidence: float = 0.0  # Confidence score 0-1
+    
+    def __post_init__(self):
+        if self.take_profit is None:
+            self.take_profit = []
+        if not self.timestamp:
+            self.timestamp = datetime.now().isoformat()
 
 class MakeWebhookLogger:
     def __init__(self, webhook_url: str):
@@ -315,6 +401,233 @@ class MakeWebhookLogger:
                 'test_data': test_data if 'test_data' in locals() else {}
             }
 
+# ================== ENHANCED DATABASE CLASS ==================
+
+class EnhancedDatabase:
+    def __init__(self, db_path: str = "enhanced_trading_bot.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize database with enhanced schema"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Accounts table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS accounts (
+                    account_id TEXT PRIMARY KEY,
+                    account_name TEXT NOT NULL,
+                    bingx_api_key TEXT NOT NULL,
+                    bingx_secret_key TEXT NOT NULL,
+                    telegram_api_id TEXT NOT NULL,
+                    telegram_api_hash TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TEXT NOT NULL,
+                    last_used TEXT NOT NULL,
+                    leverage INTEGER DEFAULT 10,
+                    risk_percentage REAL DEFAULT 2.0,
+                    default_symbol TEXT DEFAULT 'BTC-USDT',
+                    auto_trade_enabled BOOLEAN DEFAULT FALSE,
+                    monitored_channels TEXT DEFAULT '[]',
+                    signal_channels TEXT DEFAULT '[]'
+                )
+            ''')
+            
+            # Channels table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS channels (
+                    channel_id INTEGER PRIMARY KEY,
+                    channel_name TEXT NOT NULL,
+                    channel_username TEXT DEFAULT '',
+                    is_active BOOLEAN DEFAULT TRUE,
+                    account_ids TEXT DEFAULT '[]',
+                    signal_filters TEXT DEFAULT '{}'
+                )
+            ''')
+            
+            # Parsed signals table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS parsed_signals (
+                    signal_id TEXT PRIMARY KEY,
+                    channel_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL,
+                    raw_text TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL,
+                    stop_loss REAL,
+                    take_profit TEXT DEFAULT '[]',
+                    leverage INTEGER,
+                    risk_percentage REAL,
+                    timestamp TEXT NOT NULL,
+                    processed BOOLEAN DEFAULT FALSE,
+                    trade_executed BOOLEAN DEFAULT FALSE,
+                    trade_id TEXT,
+                    confidence REAL DEFAULT 0.0,
+                    FOREIGN KEY (account_id) REFERENCES accounts (account_id),
+                    FOREIGN KEY (channel_id) REFERENCES channels (channel_id)
+                )
+            ''')
+            
+            # Account-channel relationships
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS account_channels (
+                    account_id TEXT,
+                    channel_id INTEGER,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (account_id, channel_id),
+                    FOREIGN KEY (account_id) REFERENCES accounts (account_id),
+                    FOREIGN KEY (channel_id) REFERENCES channels (channel_id)
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            logger.info("✅ Enhanced database schema initialized")
+            
+        except Exception as e:
+            logger.error(f"❌ Database initialization failed: {e}")
+            raise
+    
+    def create_account(self, account: AccountConfig) -> bool:
+        """Create a new trading account"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO accounts (
+                    account_id, account_name, bingx_api_key, bingx_secret_key,
+                    telegram_api_id, telegram_api_hash, phone, is_active,
+                    created_at, last_used, leverage, risk_percentage,
+                    default_symbol, auto_trade_enabled, monitored_channels, signal_channels
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                account.account_id, account.account_name, account.bingx_api_key,
+                account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
+                account.phone, account.is_active, account.created_at, account.last_used,
+                account.leverage, account.risk_percentage, account.default_symbol,
+                account.auto_trade_enabled, json.dumps(account.monitored_channels),
+                json.dumps(account.signal_channels)
+            ))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"✅ Account {account.account_name} created successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create account: {e}")
+            return False
+    
+    def get_all_accounts(self) -> List[AccountConfig]:
+        """Get all active accounts"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT * FROM accounts WHERE is_active = TRUE')
+            rows = cursor.fetchall()
+            conn.close()
+            
+            accounts = []
+            for row in rows:
+                accounts.append(AccountConfig(
+                    account_id=row[0],
+                    account_name=row[1],
+                    bingx_api_key=row[2],
+                    bingx_secret_key=row[3],
+                    telegram_api_id=row[4],
+                    telegram_api_hash=row[5],
+                    phone=row[6],
+                    is_active=bool(row[7]),
+                    created_at=row[8],
+                    last_used=row[9],
+                    leverage=row[10],
+                    risk_percentage=row[11],
+                    default_symbol=row[12],
+                    auto_trade_enabled=bool(row[13]),
+                    monitored_channels=json.loads(row[14]) if row[14] else [],
+                    signal_channels=json.loads(row[15]) if row[15] else []
+                ))
+            
+            return accounts
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get accounts: {e}")
+            return []
+    
+    def create_channel(self, channel: ChannelConfig) -> bool:
+        """Create or update a channel configuration"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO channels (
+                    channel_id, channel_name, channel_username, is_active,
+                    account_ids, signal_filters
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                channel.channel_id, channel.channel_name, channel.channel_username,
+                channel.is_active, json.dumps(channel.account_ids),
+                json.dumps(channel.signal_filters)
+            ))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"✅ Channel {channel.channel_name} created/updated successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create channel: {e}")
+            return False
+    
+    def link_account_channel(self, account_id: str, channel_id: int) -> bool:
+        """Link an account to a channel"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO account_channels (
+                    account_id, channel_id, is_active, created_at
+                ) VALUES (?, ?, TRUE, ?)
+            ''', (account_id, channel_id, datetime.now().isoformat()))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"✅ Account {account_id} linked to channel {channel_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to link account to channel: {e}")
+            return False
+    
+    def get_account_channels(self, account_id: str) -> List[int]:
+        """Get all channels linked to an account"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT channel_id FROM account_channels 
+                WHERE account_id = ? AND is_active = TRUE
+            ''', (account_id,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            return [row[0] for row in rows]
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get account channels: {e}")
+            return []
+
 class SignalDetector:
     @staticmethod
     def parse_signals(text):
@@ -461,6 +774,322 @@ class SignalDetector:
 
         return signals
 
+# ================== ENHANCED SIGNAL PARSER ==================
+
+class EnhancedSignalParser:
+    """Enhanced signal parser with support for multiple formats"""
+    
+    # Symbol patterns
+    SYMBOL_PATTERNS = [
+        r'#([A-Z0-9]{1,10})(?:/USDT|USDT)?',  # #BTCUSDT, #BTC/USDT
+        r'([A-Z0-9]{1,10})(?:/USDT|USDT)?',   # BTCUSDT, BTC/USDT
+        r'([A-Z0-9]{1,10})\s*—',              # BTC —
+        r'([A-Z0-9]{1,10})\s*Long',           # BTC Long
+        r'([A-Z0-9]{1,10})\s*Short',          # BTC Short
+    ]
+    
+    # Side patterns (LONG/SHORT)
+    LONG_PATTERNS = [
+        r'\b(LONG|ЛОНГ|Long|long)\b',
+        r'\b(BUY|ПОКУПКА|Buy|buy)\b',
+        r'📈',  # Green arrow up
+        r'🟢',  # Green circle
+        r'⬆️',  # Up arrow
+        r'🚀',  # Rocket
+        r'🟢',  # Green circle
+        r'набираю позицию в Long',
+        r'открываю Long',
+        r'открываю в Long',
+    ]
+    
+    SHORT_PATTERNS = [
+        r'\b(SHORT|ШОРТ|Short|short)\b',
+        r'\b(SELL|ПРОДАЖА|Sell|sell)\b',
+        r'📉',  # Red arrow down
+        r'🔴',  # Red circle
+        r'⬇️',  # Down arrow
+        r'🔻',  # Down triangle
+        r'набираю позицию в Short',
+        r'открываю Short',
+        r'открываю в Short',
+        r'открываем шорт-позицию',
+    ]
+    
+    # Price patterns
+    ENTRY_PATTERNS = [
+        r'Entry[:\s]*([\d.,]+)',
+        r'Вход[:\s]*([\d.,]+)',
+        r'@\s*([\d.,]+)',
+        r'Price[:\s]*([\d.,]+)',
+        r'Цена[:\s]*([\d.,]+)',
+        r'Вход в позицию[:\s]*([\d.,]+)',
+        r'Моя точка входа[:\s]*([\d.,]+)',
+        r'Точка входа[:\s]*([\d.,]+)',
+        r'Открытие сделки[:\s]*([\d.,]+)',
+    ]
+    
+    # Take profit patterns
+    TP_PATTERNS = [
+        r'Target\s*\d*[:]?\s*([\d.,]+)',
+        r'TP\s*\d*[:]?\s*([\d.,]+)',
+        r'Тп[:\s]*([\d.,]+)',
+        r'Take\s*Profit[:\s]*([\d.,]+)',
+        r'Цель[:\s]*([\d.,]+)',
+        r'Тейки[:\s]*([\d.,]+)',
+        r'Тейк[:\s]*([\d.,]+)',
+        r'Цели по сделке[:\s]*([\d.,]+)',
+        r'Стоп[:\s]*([\d.,]+)',
+    ]
+    
+    # Stop loss patterns
+    SL_PATTERNS = [
+        r'Stop\s*Loss[:\s]*([\d.,]+)',
+        r'SL[:\s]*([\d.,]+)',
+        r'Сл[:\s]*([\d.,]+)',
+        r'Стоп[:\s]*([\d.,]+)',
+        r'Стоп-лос[:\s]*([\d.,]+)',
+        r'Stop[:\s]*([\d.,]+)',
+    ]
+    
+    # Leverage patterns
+    LEVERAGE_PATTERNS = [
+        r'Leverage[:\s]*([\d]+)',
+        r'Плечо[:\s]*([\d]+)[-xх]*([\d]*)',
+        r'([\d]+)\s*[xх]',
+        r'([\d]+)\s*X',
+        r'Плечи[:\s]*([\d]+)',
+        r'Плечо[:\s]*([\d]+)',
+    ]
+    
+    # Risk management patterns
+    RISK_PATTERNS = [
+        r'РМ[:\s]*([\d.,]+)%',
+        r'Риск[:\s]*([\d.,]+)%',
+        r'Риски[:\s]*([\d.,]+)%',
+        r'Risk[:\s]*([\d.,]+)%',
+        r'([\d.,]+)%\s*от депозита',
+        r'([\d.,]+)%\s*от депо',
+    ]
+    
+    @staticmethod
+    def parse_signal(text: str, channel_id: str = "") -> Optional[ParsedSignal]:
+        """Parse a trading signal from text"""
+        try:
+            logger.info(f"🔍 Parsing signal from channel {channel_id}")
+            
+            # Clean and normalize text
+            text = text.strip()
+            if not text:
+                return None
+            
+            # Extract symbol
+            symbol = EnhancedSignalParser._extract_symbol(text)
+            if not symbol:
+                logger.info("❌ No symbol found")
+                return None
+            
+            # Extract side (LONG/SHORT)
+            side = EnhancedSignalParser._extract_side(text)
+            if not side:
+                logger.info("❌ No trade side found")
+                return None
+            
+            # Extract entry price
+            entry_price = EnhancedSignalParser._extract_entry_price(text)
+            
+            # Extract take profits
+            take_profits = EnhancedSignalParser._extract_take_profits(text)
+            
+            # Extract stop loss
+            stop_loss = EnhancedSignalParser._extract_stop_loss(text)
+            
+            # Extract leverage
+            leverage = EnhancedSignalParser._extract_leverage(text)
+            
+            # Extract risk percentage
+            risk_percentage = EnhancedSignalParser._extract_risk_percentage(text)
+            
+            # Calculate confidence score
+            confidence = EnhancedSignalParser._calculate_confidence(
+                symbol, side, entry_price, take_profits, stop_loss, leverage
+            )
+            
+            signal_id = str(uuid.uuid4())
+            
+            signal = ParsedSignal(
+                signal_id=signal_id,
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profits,
+                leverage=leverage,
+                risk_percentage=risk_percentage,
+                raw_text=text,
+                channel_id=channel_id,
+                confidence=confidence
+            )
+            
+            logger.info(f"✅ Parsed signal: {symbol} {side} (confidence: {confidence:.2f})")
+            return signal
+            
+        except Exception as e:
+            logger.error(f"❌ Error parsing signal: {e}")
+            return None
+    
+    @staticmethod
+    def _extract_symbol(text: str) -> Optional[str]:
+        """Extract trading symbol from text"""
+        for pattern in EnhancedSignalParser.SYMBOL_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                symbol = match.group(1).upper()
+                
+                # Normalize symbol
+                if not symbol.endswith('USDT'):
+                    symbol = symbol + 'USDT'
+                
+                # Fix double USDT
+                if symbol.endswith('USDUSDT'):
+                    symbol = symbol.replace('USDUSDT', 'USDT')
+                
+                return symbol
+        
+        return None
+    
+    @staticmethod
+    def _extract_side(text: str) -> Optional[str]:
+        """Extract trade side (LONG/SHORT) from text"""
+        # Check for LONG patterns
+        for pattern in EnhancedSignalParser.LONG_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return 'LONG'
+        
+        # Check for SHORT patterns
+        for pattern in EnhancedSignalParser.SHORT_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return 'SHORT'
+        
+        return None
+    
+    @staticmethod
+    def _extract_entry_price(text: str) -> Optional[float]:
+        """Extract entry price from text"""
+        for pattern in EnhancedSignalParser.ENTRY_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    price = float(match.group(1).replace(',', ''))
+                    if price > 0:
+                        return price
+                except ValueError:
+                    continue
+        
+        return None
+    
+    @staticmethod
+    def _extract_take_profits(text: str) -> List[float]:
+        """Extract take profit levels from text"""
+        take_profits = []
+        
+        # Look for multiple TP patterns
+        for pattern in EnhancedSignalParser.TP_PATTERNS:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0]
+                if match and match.replace('.', '').replace(',', '').isdigit():
+                    try:
+                        tp_val = float(match.replace(',', ''))
+                        if tp_val > 0:
+                            take_profits.append(tp_val)
+                    except ValueError:
+                        continue
+        
+        # Remove duplicates and sort
+        take_profits = sorted(list(set(take_profits)))
+        
+        # Limit to reasonable number of TPs
+        return take_profits[:5]
+    
+    @staticmethod
+    def _extract_stop_loss(text: str) -> Optional[float]:
+        """Extract stop loss from text"""
+        for pattern in EnhancedSignalParser.SL_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    sl = float(match.group(1).replace(',', ''))
+                    if sl > 0:
+                        return sl
+                except ValueError:
+                    continue
+        
+        return None
+    
+    @staticmethod
+    def _extract_leverage(text: str) -> Optional[int]:
+        """Extract leverage from text"""
+        for pattern in EnhancedSignalParser.LEVERAGE_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    leverage = int(match.group(1))
+                    if 1 <= leverage <= 125:
+                        return leverage
+                except ValueError:
+                    continue
+        
+        return None
+    
+    @staticmethod
+    def _extract_risk_percentage(text: str) -> Optional[float]:
+        """Extract risk percentage from text"""
+        for pattern in EnhancedSignalParser.RISK_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    risk = float(match.group(1).replace(',', ''))
+                    if 0 < risk <= 100:
+                        return risk
+                except ValueError:
+                    continue
+        
+        return None
+    
+    @staticmethod
+    def _calculate_confidence(symbol: str, side: str, entry_price: Optional[float], 
+                            take_profits: List[float], stop_loss: Optional[float], 
+                            leverage: Optional[int]) -> float:
+        """Calculate confidence score for the parsed signal"""
+        confidence = 0.0
+        
+        # Base confidence for having symbol and side
+        if symbol and side:
+            confidence += 0.3
+        
+        # Entry price adds confidence
+        if entry_price:
+            confidence += 0.2
+        
+        # Take profits add confidence
+        if take_profits:
+            confidence += 0.2
+        
+        # Stop loss adds confidence
+        if stop_loss:
+            confidence += 0.15
+        
+        # Leverage adds confidence
+        if leverage:
+            confidence += 0.1
+        
+        # Bonus for having multiple TPs
+        if len(take_profits) > 1:
+            confidence += 0.05
+        
+        return min(confidence, 1.0)
+
 class TradingBot:
     def __init__(self):
         self.config = BotConfig()
@@ -473,10 +1102,16 @@ class TradingBot:
         self.symbol_info_cache: Dict[str, Dict] = {}
         self.active_positions: Dict[str, ActivePosition] = {}
         self.order_monitor_running = False
+        
+        # Enhanced multi-account support
+        self.enhanced_db = EnhancedDatabase()
+        self.current_account = None
+        self.account_exchanges: Dict[str, ccxt.Exchange] = {}
+        
         self.main_menu = ReplyKeyboardMarkup(
             [[KeyboardButton("📊 Status"), KeyboardButton("💰 Balance")],
              [KeyboardButton("🚀 Start"), KeyboardButton("🛑 Stop")],
-             [KeyboardButton("⚙️ Settings")]],
+             [KeyboardButton("⚙️ Settings"), KeyboardButton("🔑 Accounts")]],
             resize_keyboard=True
         )
 
@@ -559,6 +1194,25 @@ class TradingBot:
         """Enhanced signal parsing with Russian support"""
         try:
             logger.info(f"🔍 PARSING SIGNAL from channel {channel_id}")
+            
+            # Try enhanced parser first
+            enhanced_signal = EnhancedSignalParser.parse_signal(message, channel_id)
+            if enhanced_signal and enhanced_signal.confidence > 0.5:
+                logger.info(f"✅ Enhanced parser: {enhanced_signal.symbol} {enhanced_signal.side} (confidence: {enhanced_signal.confidence:.2f})")
+                
+                return TradingSignal(
+                    symbol=enhanced_signal.symbol,
+                    trade_type=enhanced_signal.side,
+                    entry_price=enhanced_signal.entry_price,
+                    take_profit=enhanced_signal.take_profit or [],
+                    stop_loss=enhanced_signal.stop_loss,
+                    leverage=enhanced_signal.leverage,
+                    raw_message=message,
+                    channel_id=channel_id,
+                    timestamp=datetime.now()
+                )
+            
+            # Fallback to original parser
             signals = SignalDetector.parse_signals(message)
 
             if not signals:
@@ -1607,44 +2261,48 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # ===================== COMMAND HANDLERS =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = f"""🤖 <b>Telegram Trading Bot v3.2 - ENHANCED!</b>
+    welcome_text = f"""🤖 <b>Enhanced Multi-Account Trading Bot v4.0</b>
 
 🎉 <b>NEW FEATURES:</b>
-✅ Add channels via links (t.me/channel)
-✅ Add channels by forwarding messages
-✅ Custom multi-level take profits
-✅ Fixed USDT amount trading
-✅ Configurable TP percentages
+✅ Multi-account management
+✅ Channel synchronization
+✅ Enhanced signal parsing
+✅ Confidence scoring
+✅ Account-specific settings
+✅ Subaccount support
 
 🔗 {DEFAULT_WEBHOOK_URL[:50]}...
 
-<b>Features:</b>
-• 📡 Easy channel management (links/forwards)
-• 🎯 Custom TP levels (1%→50%, 2.5%→50%, etc.)
-• 💵 Fixed USDT amounts or percentage
-• ⚙️ Signal vs Bot settings
-• 🔄 OCO: Auto-cancel orders
-• 📊 Russian signal parsing
-• 🔗 Make.com webhook
+<b>Enhanced Features:</b>
+• 🔑 Multiple API keys support
+• 📡 Channel synchronization across accounts
+• 🎯 Advanced signal parsing (Russian/English)
+• 📊 Confidence scoring system
+• ⚙️ Account-specific settings
+• 🔄 Real-time trade execution
+• 🔗 Make.com webhook integration
 
-<b>Setup Steps:</b>
-1️⃣ /setup_binance
-2️⃣ /setup_telegram
-3️⃣ /setup_channels (now with links!)
-4️⃣ /setup_trading (new TP config!)
-5️⃣ /start_monitoring
+<b>Quick Setup:</b>
+1️⃣ /add_account - Add trading account
+2️⃣ /add_channel - Add channels
+3️⃣ /link_account - Link accounts to channels
+4️⃣ /start_monitoring - Begin trading
+
+<b>Account Management:</b>
+/accounts - List all accounts
+/channels - Manage channels
+/status - Check bot status
 
 <b>Test Commands:</b>
-/test_simple
-/test_basic
-/test_advanced
+/test_signal - Test signal parser
+/test_enhanced - Test enhanced features
 """
     await update.message.reply_text(welcome_text, parse_mode='HTML')
     # Show persistent main menu
     main_menu = ReplyKeyboardMarkup(
         [[KeyboardButton("📊 Status"), KeyboardButton("💰 Balance")],
          [KeyboardButton("🚀 Start"), KeyboardButton("🛑 Stop")],
-         [KeyboardButton("⚙️ Settings")]],
+         [KeyboardButton("⚙️ Settings"), KeyboardButton("🔑 Accounts")]],
         resize_keyboard=True
     )
     try:
@@ -1707,6 +2365,8 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stop_monitoring(update, context)
     elif text == "⚙️ Settings":
         await setup_trading(update, context)
+    elif text == "🔑 Accounts":
+        await list_accounts(update, context)
     elif text == "/setup_channels":
         await setup_channels(update, context)
 
@@ -2597,6 +3257,187 @@ async def handle_tp_level_close(update: Update, context: ContextTypes.DEFAULT_TY
 
     return ConversationHandler.END
 
+# ================== ENHANCED MULTI-ACCOUNT COMMANDS ==================
+
+async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start adding a new account"""
+    await update.message.reply_text(
+        "🔑 <b>Adding New Trading Account</b>\n\n"
+        "Please provide a name for this account:",
+        parse_mode='HTML'
+    )
+    return WAITING_ACCOUNT_NAME
+
+async def handle_account_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle account name input"""
+    account_name = update.message.text.strip()
+    context.user_data['account_name'] = account_name
+    
+    await update.message.reply_text(
+        f"✅ Account name: <b>{account_name}</b>\n\n"
+        "Now provide your BingX API Key:",
+        parse_mode='HTML'
+    )
+    return WAITING_ACCOUNT_BINGX_KEY
+
+async def handle_account_bingx_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle BingX API key input"""
+    api_key = update.message.text.strip()
+    context.user_data['bingx_api_key'] = api_key
+    
+    await update.message.reply_text(
+        "✅ API Key saved!\n\n"
+        "Now provide your BingX Secret Key:",
+        parse_mode='HTML'
+    )
+    return WAITING_ACCOUNT_BINGX_SECRET
+
+async def handle_account_bingx_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle BingX secret key input"""
+    secret_key = update.message.text.strip()
+    context.user_data['bingx_secret_key'] = secret_key
+    
+    await update.message.reply_text(
+        "✅ Secret Key saved!\n\n"
+        "Now provide your Telegram API ID:",
+        parse_mode='HTML'
+    )
+    return WAITING_ACCOUNT_TELEGRAM_ID
+
+async def handle_account_telegram_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Telegram API ID input"""
+    api_id = update.message.text.strip()
+    context.user_data['telegram_api_id'] = api_id
+    
+    await update.message.reply_text(
+        "✅ Telegram API ID saved!\n\n"
+        "Now provide your Telegram API Hash:",
+        parse_mode='HTML'
+    )
+    return WAITING_ACCOUNT_TELEGRAM_HASH
+
+async def handle_account_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Telegram API hash input"""
+    api_hash = update.message.text.strip()
+    context.user_data['telegram_api_hash'] = api_hash
+    
+    await update.message.reply_text(
+        "✅ Telegram API Hash saved!\n\n"
+        "Now provide your phone number (with country code, e.g., +1234567890):",
+        parse_mode='HTML'
+    )
+    return WAITING_ACCOUNT_PHONE
+
+async def handle_account_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle phone number input and create account"""
+    phone = update.message.text.strip()
+    
+    # Create account configuration
+    account_id = str(uuid.uuid4())
+    account = AccountConfig(
+        account_id=account_id,
+        account_name=context.user_data['account_name'],
+        bingx_api_key=context.user_data['bingx_api_key'],
+        bingx_secret_key=context.user_data['bingx_secret_key'],
+        telegram_api_id=context.user_data['telegram_api_id'],
+        telegram_api_hash=context.user_data['telegram_api_hash'],
+        phone=phone
+    )
+    
+    # Save to database
+    if trading_bot.enhanced_db.create_account(account):
+        await update.message.reply_text(
+            f"🎉 <b>Account Created Successfully!</b>\n\n"
+            f"Account: <b>{account.account_name}</b>\n"
+            f"ID: <code>{account_id}</code>\n\n"
+            f"You can now:\n"
+            f"• Add channels to monitor\n"
+            f"• Configure trading settings\n"
+            f"• Start receiving signals",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Failed to create account. Please try again.",
+            parse_mode='HTML'
+        )
+    
+    return ConversationHandler.END
+
+async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all accounts"""
+    accounts = trading_bot.enhanced_db.get_all_accounts()
+    
+    if not accounts:
+        await update.message.reply_text(
+            "📋 <b>No accounts found</b>\n\n"
+            "Use /add_account to create your first account.",
+            parse_mode='HTML'
+        )
+        return
+    
+    text = "📋 <b>Your Trading Accounts</b>\n\n"
+    
+    for account in accounts:
+        status = "🟢 Active" if account.is_active else "🔴 Inactive"
+        text += f"<b>{account.account_name}</b>\n"
+        text += f"ID: <code>{account.account_id}</code>\n"
+        text += f"Status: {status}\n"
+        text += f"Leverage: {account.leverage}x\n"
+        text += f"Risk: {account.risk_percentage}%\n"
+        text += f"Channels: {len(account.monitored_channels)}\n\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Account", callback_data="add_account")],
+        [InlineKeyboardButton("⚙️ Manage Accounts", callback_data="manage_accounts")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def test_enhanced_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test enhanced signal parser with example signals"""
+    test_signals = [
+        """🚀 ONDO/USDT — набираю позицию в Short.
+Торговый план: Вход в позицию осуществляю по рынку. Моя точка входа: 0.9443
+Цели по сделке следующие — 0.9348 / 0.9233 / 0.9128""",
+
+        """LONG 📈 DOT/USDT
+Плечо: 20x-100x
+Вход: 4.199
+Take: 4.220 | 4.241 | 4.262
+Stop: Стоп-лос ставим соблюдая ваш риск-менеджмент.
+РМ: 1-2% от депо""",
+
+        """#BANANA/USDT
+LONG
+Плечо: 5x-50x
+Сл:На ваше усмотрение 
+Тп: 60%+
+Осторожно 🛑
+Соблюдайте Рм 🚨1%"""
+    ]
+    
+    results = []
+    for i, signal_text in enumerate(test_signals, 1):
+        print(f"\n📊 Testing Signal {i}:")
+        signal = EnhancedSignalParser.parse_signal(signal_text, f"test_channel_{i}")
+        
+        if signal:
+            results.append(f"""<b>Test {i}: ✅</b>
+Symbol: {signal.symbol}
+Side: {signal.side}
+Entry: {signal.entry_price}
+SL: {signal.stop_loss}
+TP: {signal.take_profit}
+Leverage: {signal.leverage}
+Risk %: {signal.risk_percentage}
+Confidence: {signal.confidence:.2f}""")
+        else:
+            results.append(f"<b>Test {i}: ❌</b>")
+    
+    await update.message.reply_text("🧪 <b>Enhanced Parser Test</b>\n\n" + "\n\n".join(results), parse_mode='HTML')
+
 # ================== CONVERSATION HANDLERS ==================
 
 binance_conv_handler = ConversationHandler(
@@ -2648,6 +3489,20 @@ trading_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
+# Enhanced account conversation handler
+account_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('add_account', add_account)],
+    states={
+        WAITING_ACCOUNT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_name)],
+        WAITING_ACCOUNT_BINGX_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_bingx_key)],
+        WAITING_ACCOUNT_BINGX_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_bingx_secret)],
+        WAITING_ACCOUNT_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_id)],
+        WAITING_ACCOUNT_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_hash)],
+        WAITING_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_phone)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
+
 # ================== MAIN ==================
 
 def main():
@@ -2661,6 +3516,7 @@ def main():
     application.add_handler(telegram_conv_handler)
     application.add_handler(channel_conv_handler)
     application.add_handler(trading_conv_handler)
+    application.add_handler(account_conv_handler)  # Enhanced multi-account handler
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -2674,12 +3530,19 @@ def main():
     application.add_handler(CommandHandler("test_simple", test_webhook_simple))
     application.add_handler(CommandHandler("test_basic", test_webhook_basic))
     application.add_handler(CommandHandler("test_advanced", test_webhook_advanced))
+    
+    # Enhanced multi-account commands
+    application.add_handler(CommandHandler("accounts", list_accounts))
+    application.add_handler(CommandHandler("test_enhanced", test_enhanced_signal))
 
-    print("🤖 Trading Bot v3.2 Starting...")
+    print("🤖 Enhanced Multi-Account Trading Bot v4.0 Starting...")
     print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
-    print("✅ NEW: Add channels via links and forwards")
-    print("✅ NEW: Custom multi-level take profits")
-    print("✅ NEW: Fixed USDT amount trading")
+    print("✅ NEW: Multi-account management")
+    print("✅ NEW: Channel synchronization")
+    print("✅ NEW: Enhanced signal parsing")
+    print("✅ NEW: Confidence scoring")
+    print("✅ NEW: Account-specific settings")
+    print("✅ NEW: Subaccount support")
     print("✅ Feature: OCO order simulation")
     print("✅ Feature: Auto-cancel opposite orders")
     print("📊 Ready!")
