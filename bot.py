@@ -1539,6 +1539,7 @@ class TradingBot:
         self.symbol_info_cache: Dict[str, Dict] = {}
         self.active_positions: Dict[str, ActivePosition] = {}
         self.order_monitor_running = False
+        self.bot_instances: Dict[int, Any] = {}  # Store bot instance per user for notifications
         
         # Enhanced multi-account support
         self.enhanced_db = EnhancedDatabase()
@@ -2626,6 +2627,9 @@ class TradingBot:
             if not config.monitored_channels:
                 return False
 
+            # Store bot instance for notifications
+            self.bot_instances[user_id] = bot_instance
+
             telethon_client = self.user_monitoring_clients.get(user_id)
             if not telethon_client:
                 success = await self.setup_telethon_client(config)
@@ -2638,11 +2642,14 @@ class TradingBot:
             if not self.order_monitor_running:
                 asyncio.create_task(self.monitor_orders(bot_instance))
 
+            # Note: We're now using manual polling instead of event handlers
+            # The old event handler approach is commented out below
             # Remove existing handlers to avoid duplicates
-            telethon_client.remove_event_handler(message_handler) if 'message_handler' in locals() else None
+            # telethon_client.remove_event_handler(message_handler) if 'message_handler' in locals() else None
             
-            @telethon_client.on(events.NewMessage(incoming=True))
-            async def message_handler(event):
+            # Old event handler approach (not reliable with python-telegram-bot integration)
+            # @telethon_client.on(events.NewMessage(incoming=True))
+            async def message_handler_legacy(event):
                 try:
                     logger.info(f"📨 [DEBUG] Received message event from Telethon")
                     channel_ids = set()
@@ -2760,40 +2767,208 @@ class TradingBot:
             return False
     
     async def _run_telethon_client(self, user_id: int):
-        """Keep Telethon client running to process events"""
+        """Actively poll Telethon for new messages.
+        
+        This function manually checks for new messages in monitored channels.
+        This is more reliable than relying on Telethon's automatic event handlers
+        when integrating with other async frameworks like python-telegram-bot.
+        """
         try:
             telethon_client = self.user_monitoring_clients.get(user_id)
             if not telethon_client:
                 logger.error(f"No Telethon client found for user {user_id}")
                 return
             
-            logger.info(f"🔄 Telethon event loop running for user {user_id}")
+            logger.info(f"🔄 Starting message polling for user {user_id}")
             
-            # Keep the client running while monitoring is active
+            # Ensure connection is established
+            if not telethon_client.is_connected():
+                await telethon_client.connect()
+            
+            logger.info(f"✅ Telethon client connected, actively polling for new messages")
+            
+            # Track last message ID for each channel to detect new messages
+            last_message_ids = {}
+            
+            # Get bot instance (passed in via start_monitoring)
+            from telegram.ext import ContextTypes
+            
+            # Keep polling while monitoring is active
             while self.active_monitoring.get(user_id, False):
                 try:
+                    # Check if client is still connected
                     if not telethon_client.is_connected():
+                        logger.warning(f"Telethon client disconnected for user {user_id}, reconnecting...")
                         await telethon_client.connect()
                     
-                    # Check for updates by waiting for a short period
-                    # This allows Telethon to process incoming updates
-                    try:
-                        # Wait for updates with a timeout to allow checking active_monitoring
-                        await asyncio.wait_for(
-                            asyncio.create_task(asyncio.sleep(10)),
-                            timeout=10
-                        )
-                    except asyncio.TimeoutError:
-                        pass
+                    # Get current config to check monitored channels
+                    config = self.get_user_config(user_id)
+                    if not config.monitored_channels:
+                        logger.debug(f"No channels configured for user {user_id}, waiting...")
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    # Check each monitored channel for new messages
+                    for channel_id_str in config.monitored_channels:
+                        try:
+                            # Convert string channel ID to entity
+                            channel_id = int(channel_id_str)
+                            
+                            # Get the latest message from this channel
+                            messages = await telethon_client.get_messages(channel_id, limit=1)
+                            
+                            if not messages:
+                                continue
+                            
+                            latest_msg = messages[0]
+                            msg_id = latest_msg.id
+                            
+                            # Initialize last_message_ids for this channel if needed
+                            if channel_id_str not in last_message_ids:
+                                last_message_ids[channel_id_str] = msg_id
+                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, last ID: {msg_id}")
+                                continue
+                            
+                            # Check if this is a new message
+                            if msg_id > last_message_ids[channel_id_str]:
+                                logger.info(f"📨 New message detected in channel {channel_id_str}! ID: {msg_id}")
+                                
+                                # Get all new messages since last check
+                                new_messages = await telethon_client.get_messages(
+                                    channel_id,
+                                    min_id=last_message_ids[channel_id_str],
+                                    limit=10
+                                )
+                                
+                                # Process each new message (in chronological order)
+                                for msg in reversed(new_messages):
+                                    if msg.id > last_message_ids[channel_id_str] and msg.message:
+                                        logger.info(f"📨 Processing new message: {msg.message[:100]}")
+                                        await self._handle_new_message(msg, channel_id_str, user_id)
+                                
+                                # Update last seen message ID
+                                last_message_ids[channel_id_str] = msg_id
+                                
+                        except ValueError as e:
+                            logger.error(f"Invalid channel ID format: {channel_id_str}: {e}")
+                        except Exception as e:
+                            logger.error(f"Error checking channel {channel_id_str}: {e}")
+                    
+                    # Poll every 5 seconds to catch new messages quickly
+                    await asyncio.sleep(5)
                     
                 except Exception as e:
-                    logger.error(f"Error in Telethon event loop for user {user_id}: {e}")
-                    await asyncio.sleep(5)
+                    logger.error(f"Error in message polling loop for user {user_id}: {e}")
+                    logger.error(traceback.format_exc())
+                    await asyncio.sleep(10)
             
-            logger.info(f"🛑 Telethon event loop stopped for user {user_id}")
+            logger.info(f"🛑 Message polling stopped for user {user_id}")
             
         except Exception as e:
-            logger.error(f"Fatal error in Telethon event loop: {e}")
+            logger.error(f"Fatal error in message polling: {e}")
+            logger.error(traceback.format_exc())
+    
+    async def _handle_new_message(self, message, channel_id: str, user_id: int):
+        """Handle a new message from a monitored channel"""
+        try:
+            config = self.get_user_config(user_id)
+            bot_instance = self.bot_instances.get(user_id)
+            message_text = message.message
+            
+            if not message_text:
+                return
+            
+            logger.info(f"📨 [DEBUG] Processing message from channel {channel_id}")
+            logger.info(f"📨 [DEBUG] Message text: {message_text[:200]}")
+            
+            # Send notification about received message
+            if bot_instance:
+                try:
+                    await bot_instance.send_message(
+                        chat_id=user_id,
+                        text=f"📨 <b>New Message Received</b>\n\n<pre>{message_text[:300]}</pre>\n\n🔍 Processing...",
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending message notification: {e}")
+            
+            # Parse the signal
+            signal = self.parse_trading_signal(message_text, channel_id)
+            
+            if signal:
+                logger.info(f"🎯 SIGNAL DETECTED! {signal.symbol} {signal.trade_type}")
+                
+                settings_source = "Signal" if config.use_signal_settings else "Bot"
+                if bot_instance:
+                    try:
+                        await bot_instance.send_message(
+                            chat_id=user_id,
+                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n⚙️ Using: {settings_source} settings\n🚀 Executing...",
+                            parse_mode='HTML'
+                        )
+                    except Exception as e:
+                        logger.error(f"Error sending signal notification: {e}")
+                
+                # Execute the trade
+                result = await self.execute_trade(signal, config)
+                
+                logger.info(f"Trade execution result: {result}")
+                
+                # Send result notification
+                if bot_instance:
+                    try:
+                        if result.get('success'):
+                            notification = f"""✅ <b>TRADE EXECUTED!</b>
+
+💰 Symbol: {result['symbol']}
+📈 Direction: {signal.trade_type}
+🆔 Order ID: {result['order_id']}
+📦 Quantity: {result['quantity']}
+💲 Entry: {result['price']}
+⚡ Leverage: {result['leverage']}x
+💵 Order Value: ${result['order_value']:.2f}"""
+
+                            if 'sl_price' in result and result['sl_price']:
+                                notification += f"\n🛑 Stop Loss: {result['sl_price']:.6f}"
+                                if result.get('stop_loss_id'):
+                                    notification += f" (ID: {result['stop_loss_id']})"
+
+                            if 'tp_prices' in result and result['tp_prices']:
+                                notification += f"\n🎯 Take Profits:"
+                                for i, tp in enumerate(result.get('take_profit_ids', [])):
+                                    notification += f"\n  TP{i+1}: {tp['price']:.6f} (ID: {tp['order_id']})"
+
+                            notification += "\n🔗 Sent to Make.com"
+                            notification += "\n🔄 OCO: Auto-cancel enabled"
+                            notification += f"\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+                            notification += f"\n\n🎉 Position is LIVE!"
+
+                        else:
+                            notification = f"""❌ <b>TRADE EXECUTION FAILED</b>
+
+💰 Symbol: {signal.symbol}
+📈 Direction: {signal.trade_type}
+🚨 Error: {result.get('error', 'Unknown error')}
+⏰ Time: {datetime.now().strftime('%H:%M:%S')}"""
+
+                        await bot_instance.send_message(chat_id=user_id, text=notification, parse_mode='HTML')
+                    except Exception as e:
+                        logger.error(f"Error sending trade result notification: {e}")
+                
+            else:
+                logger.info(f"📨 No valid signal detected in message")
+                if bot_instance:
+                    try:
+                        await bot_instance.send_message(
+                            chat_id=user_id,
+                            text="📨 Message received but no valid signal detected",
+                            parse_mode='HTML'
+                        )
+                    except Exception as e:
+                        logger.error(f"Error sending no-signal notification: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error handling new message: {e}")
             logger.error(traceback.format_exc())
 
 # Initialize bot
