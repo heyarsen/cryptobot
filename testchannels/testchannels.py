@@ -16,7 +16,7 @@ import json
 import logging
 import sqlite3
 import uuid
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
@@ -556,6 +556,14 @@ class EnhancedDatabase:
                 )
             ''')
             
+            # Application-wide settings table (for editable defaults)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
+
             # Account-channel relationships
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS account_channels (
@@ -682,6 +690,150 @@ class EnhancedDatabase:
         except Exception as e:
             logger.error(f"❌ Failed to get accounts: {e}")
             return []
+
+    # =============== Settings and Accounts Update Helpers ===============
+
+    def set_app_setting(self, key: str, value: Any) -> bool:
+        """Upsert a key/value setting in app_settings table."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)', (key, json.dumps(value)))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to save app setting {key}: {e}")
+            return False
+
+    def get_app_setting(self, key: str, default: Any = None) -> Any:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT value FROM app_settings WHERE key = ?', (key,))
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0] is not None:
+                try:
+                    return json.loads(row[0])
+                except Exception:
+                    return row[0]
+            return default
+        except Exception as e:
+            logger.error(f"❌ Failed to read app setting {key}: {e}")
+            return default
+
+    def get_default_settings(self) -> Dict[str, Any]:
+        """Return editable default settings (with DB overrides if present)."""
+        try:
+            # Start with hard-coded defaults
+            defaults = {
+                'leverage': DEFAULT_SETTINGS.get('leverage', 10),
+                'risk_percentage': DEFAULT_SETTINGS.get('risk_percentage', 2.0),
+                'sl_level': DEFAULT_SETTINGS.get('sl_level', -10.0),
+                'tp_levels': DEFAULT_SETTINGS.get('tp_levels', [50.0, 100.0, 150.0]),
+            }
+            # Overlay DB values when present
+            for k in list(defaults.keys()):
+                stored = self.get_app_setting(f'default_{k}', None)
+                if stored is not None:
+                    defaults[k] = stored
+            return defaults
+        except Exception as e:
+            logger.error(f"❌ Failed to build default settings: {e}")
+            return DEFAULT_SETTINGS
+
+    def update_account_name(self, account_id: str, new_name: str) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE accounts SET account_name = ? WHERE account_id = ?', (new_name, account_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to rename account {account_id}: {e}")
+            return False
+
+    def soft_delete_account(self, account_id: str) -> bool:
+        """Soft delete by setting is_active = FALSE."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE accounts SET is_active = FALSE WHERE account_id = ?', (account_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to delete account {account_id}: {e}")
+            return False
+
+    def update_account_settings(self, account_id: str, **kwargs) -> bool:
+        """Update basic scalar settings on an account row.
+        Allowed keys: leverage, risk_percentage, use_percentage_balance, balance_percentage, fixed_usdt_amount
+        """
+        allowed = {
+            'leverage', 'risk_percentage', 'use_percentage_balance', 'balance_percentage', 'fixed_usdt_amount'
+        }
+        set_clauses = []
+        values: List[Any] = []
+        for key, val in kwargs.items():
+            if key in allowed:
+                set_clauses.append(f"{key} = ?")
+                values.append(val)
+        if not set_clauses:
+            return True
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            sql = f"UPDATE accounts SET {', '.join(set_clauses)} WHERE account_id = ?"
+            values.append(account_id)
+            cursor.execute(sql, tuple(values))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update account settings for {account_id}: {e}")
+            return False
+
+    def update_account_take_profit_levels(self, account_id: str, tp_levels: List[TakeProfitLevel]) -> bool:
+        try:
+            payload = json.dumps([{'percentage': tp.percentage, 'close_percentage': tp.close_percentage} for tp in tp_levels])
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE accounts SET take_profit_levels = ? WHERE account_id = ?', (payload, account_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update TP levels for {account_id}: {e}")
+            return False
+
+    def update_account_stop_loss_levels(self, account_id: str, sl_levels: List[StopLossLevel]) -> bool:
+        try:
+            payload = json.dumps([{'percentage': sl.percentage, 'close_percentage': sl.close_percentage} for sl in sl_levels])
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE accounts SET stop_loss_levels = ? WHERE account_id = ?', (payload, account_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update SL levels for {account_id}: {e}")
+            return False
+
+    def update_monitored_channels(self, account_id: str, channels: List[Union[str, int]]) -> bool:
+        try:
+            payload = json.dumps([int(str(c)) for c in channels if str(c).lstrip('-').isdigit()])
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE accounts SET monitored_channels = ? WHERE account_id = ?', (payload, account_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update monitored channels for {account_id}: {e}")
+            return False
 
 
     def create_channel(self, channel: ChannelConfig) -> bool:
@@ -1557,7 +1709,37 @@ class TradingBot:
                 telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
                 user_id=user_id
             )
-        return self.user_data[user_id]
+        # Always layer current account settings onto session config so trades use account config
+        config = self.user_data[user_id]
+        try:
+            current_account = self.get_current_account(user_id)
+            if current_account:
+                config.leverage = int(current_account.leverage)
+                # Stop loss percent: prefer first stop loss level if any
+                if current_account.stop_loss_levels:
+                    try:
+                        # If stored as positive percent, treat as absolute percent
+                        config.stop_loss_percent = float(current_account.stop_loss_levels[0].percentage)
+                    except Exception:
+                        pass
+                # Balance mode
+                if bool(current_account.use_percentage_balance):
+                    config.use_fixed_usdt_amount = False
+                    config.balance_percent = float(current_account.balance_percentage)
+                else:
+                    config.use_fixed_usdt_amount = True
+                    config.fixed_usdt_amount = float(current_account.fixed_usdt_amount)
+                # Custom TP levels from account
+                if current_account.take_profit_levels:
+                    config.custom_take_profits = [
+                        TakeProfitLevel(tp.percentage, tp.close_percentage)
+                        for tp in current_account.take_profit_levels
+                    ]
+                # Channels
+                config.monitored_channels = [str(cid) for cid in (current_account.monitored_channels or [])]
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to overlay account config: {e}")
+        return config
 
     def setup_make_webhook(self, user_id: int) -> bool:
         """Setup Make.com webhook logger for user"""
@@ -2538,6 +2720,7 @@ def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarku
 
 def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
 
     # Format trade amount display
     if config.use_fixed_usdt_amount:
@@ -2560,6 +2743,7 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"↩️ Trailing Callback: {config.trailing_callback_percent}%", callback_data="set_trailing_callback")],
         [InlineKeyboardButton(trade_amount_text, callback_data="toggle_trade_amount_mode")],
         [InlineKeyboardButton("📡 Manage Channels", callback_data="manage_channels"), InlineKeyboardButton("🔄 Enable OCO Monitor", callback_data="enable_oco")],
+        [InlineKeyboardButton("✏️ Rename Account", callback_data="rename_account"), InlineKeyboardButton("🗑️ Delete Account", callback_data="delete_account")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
 
@@ -2569,6 +2753,29 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 # ==================== ENHANCED UI SYSTEM ====================
+
+def render_trading_config_text(user_id: int) -> str:
+    """Build a clear, comprehensive configuration summary for the settings screen."""
+    config = trading_bot.get_user_config(user_id)
+    settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
+    sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
+    trailing_status = "🟢 ON" if config.trailing_enabled else "🔴 OFF"
+    trade_amount = f"${int(config.fixed_usdt_amount)} USDT" if config.use_fixed_usdt_amount else f"{config.balance_percent}%"
+    tp_lines = [f"TP{i}: {lvl.percentage}% → Close {lvl.close_percentage}%" for i, lvl in enumerate(config.custom_take_profits, 1)]
+    if not tp_lines:
+        tp_lines = ["None configured"]
+    text = (
+        "⚙️ <b>Trading Configuration</b>\n\n"
+        f"🎯 Settings: <b>{settings_source}</b>\n"
+        f"📊 SL/TP Orders: <b>{sl_tp_status}</b>\n"
+        f"⚡ Leverage: <b>{config.leverage}x</b>\n"
+        f"🛑 Stop Loss: <b>{config.stop_loss_percent}%</b>\n"
+        f"🧵 Trailing: <b>{trailing_status}</b> (Act: {config.trailing_activation_percent}%, Cb: {config.trailing_callback_percent}%)\n"
+        f"💰 Trade Amount: <b>{trade_amount}</b>\n"
+        f"🎯 Take Profits: <b>{len(config.custom_take_profits)} levels</b>\n"
+        + ("\n" + "\n".join(tp_lines) if tp_lines else "")
+    )
+    return text
 
 # Default settings for new accounts
 DEFAULT_SETTINGS = {
@@ -2702,13 +2909,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔑 Saved!\n\nBingX Secret:", parse_mode='HTML')
         return
     elif context.user_data.get('state') == 'WAIT_ACC_SEC':
+        defaults = trading_bot.enhanced_db.get_default_settings()
         acc = AccountConfig(
             account_id=str(uuid.uuid4()), account_name=context.user_data.get('acc_name'),
             bingx_api_key=context.user_data.get('acc_key'), bingx_secret_key=text,
             telegram_api_id=DEFAULT_TELEGRAM_API_ID, telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
             phone="", is_active=True, created_at=datetime.now().isoformat(),
-            last_used=datetime.now().isoformat(), leverage=DEFAULT_SETTINGS['leverage'],
-            risk_percentage=DEFAULT_SETTINGS['risk_percentage'], use_percentage_balance=True,
+            last_used=datetime.now().isoformat(), leverage=int(defaults.get('leverage', DEFAULT_SETTINGS['leverage'])),
+            risk_percentage=float(defaults.get('risk_percentage', DEFAULT_SETTINGS['risk_percentage'])), use_percentage_balance=True,
             monitored_channels=[], signal_channels=[]
         )
         try:
@@ -2717,6 +2925,36 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Error: {str(e)[:100]}", parse_mode='HTML')
         context.user_data.clear()
+        return
+
+    # Parse quick commands to update default settings
+    lower = text.lower()
+    if lower.startswith('default '):
+        try:
+            _, key, *rest = lower.split(' ')
+            value_str = ' '.join(rest).strip()
+            if key == 'leverage':
+                lev = int(value_str)
+                trading_bot.enhanced_db.set_app_setting('default_leverage', lev)
+                await update.message.reply_text(f"✅ Default leverage set to {lev}x")
+            elif key == 'risk':
+                risk = float(value_str)
+                trading_bot.enhanced_db.set_app_setting('default_risk_percentage', risk)
+                await update.message.reply_text(f"✅ Default risk set to {risk}%")
+            elif key == 'sl':
+                sl = float(value_str)
+                trading_bot.enhanced_db.set_app_setting('default_sl_level', sl)
+                await update.message.reply_text(f"✅ Default SL set to {sl}%")
+            elif key == 'tp':
+                # Parse CSV of floats
+                parts = [p.strip() for p in value_str.split(',') if p.strip()]
+                tps = [float(p) for p in parts][:8]
+                trading_bot.enhanced_db.set_app_setting('default_tp_levels', tps)
+                await update.message.reply_text(f"✅ Default TP levels set to {tps}")
+            else:
+                await update.message.reply_text("❌ Unknown default key. Use leverage|risk|sl|tp")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not update defaults: {str(e)[:80]}")
         return
 
     # Settings states
@@ -2760,11 +2998,20 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📈 Active trades across all accounts", parse_mode='HTML')
 
     elif text == "⚙️ Default Settings":
-        msg = f"⚙️ <b>Default Settings</b>\n\n"
-        msg += f"📊 Leverage: {DEFAULT_SETTINGS['leverage']}x\n"
-        msg += f"💰 Risk: {DEFAULT_SETTINGS['risk_percentage']}%\n"
-        msg += f"🎯 TP Levels: {DEFAULT_SETTINGS['tp_levels']}\n"
-        msg += f"🛡️ SL: {DEFAULT_SETTINGS['sl_level']}%\n"
+        # Show editable defaults and instructions
+        current = trading_bot.enhanced_db.get_default_settings()
+        msg = (
+            "⚙️ <b>Default Settings</b>\n\n"
+            f"📊 Leverage: {current['leverage']}x\n"
+            f"💰 Risk: {current['risk_percentage']}%\n"
+            f"🎯 TP Levels: {current['tp_levels']} (as % of entry deltas)\n"
+            f"🛡️ SL: {current['sl_level']}%\n\n"
+            "To update, send commands:\n"
+            "• default leverage 10\n"
+            "• default risk 2.0\n"
+            "• default sl -10\n"
+            "• default tp 2.0,3.5,5.0\n"
+        )
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     # Accounts menu buttons
@@ -2779,6 +3026,10 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if acc:
             context.user_data['current_account_id'] = acc.account_id
             context.user_data['current_account_name'] = acc.account_name
+            try:
+                trading_bot.set_current_account(user_id, acc.account_id)
+            except Exception:
+                pass
             msg = f"📋 <b>{acc.account_name}</b>\n\n"
             msg += f"📊 Leverage: {acc.leverage}x\n"
             msg += f"💰 Risk: {acc.risk_percentage}%\n"
@@ -3482,10 +3733,23 @@ Monitoring: <b>{len(config.monitored_channels)}</b> channels
 Next: /setup_trading""",
             parse_mode='HTML'
         )
+        # Persist monitored channels to the current account if available
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
         return ConversationHandler.END
 
     elif query.data == "clear_all_channels":
         config.monitored_channels.clear()
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
         channels = context.user_data.get('available_channels', [])
         keyboard_markup = create_channel_keyboard(user_id, channels)
         await query.edit_message_text(
@@ -3534,6 +3798,13 @@ The bot will automatically extract the channel ID.""",
         else:
             config.monitored_channels.append(channel_id)
 
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+
         channels = context.user_data.get('available_channels', [])
         keyboard_markup = create_channel_keyboard(user_id, channels)
 
@@ -3559,6 +3830,12 @@ async def handle_manual_channel(update: Update, context: ContextTypes.DEFAULT_TY
 
     if channel_id not in config.monitored_channels:
         config.monitored_channels.append(channel_id)
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
 
     await update.message.reply_text(
         f"""✅ <b>Channel added!</b>
@@ -3596,6 +3873,14 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         except:
             channel_name = 'Channel'
 
+        # Persist if possible
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+
         await update.message.reply_text(
             f"""✅ <b>Channel Added!</b>
 
@@ -3628,7 +3913,7 @@ async def setup_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard_markup = create_settings_keyboard(user_id)
 
     await update.message.reply_text(
-        "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+        render_trading_config_text(user_id),
         reply_markup=keyboard_markup,
         parse_mode='HTML'
     )
@@ -3659,7 +3944,7 @@ Next: /start_monitoring""",
         config.use_signal_settings = not config.use_signal_settings
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+            render_trading_config_text(user_id),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -3668,7 +3953,7 @@ Next: /start_monitoring""",
         config.create_sl_tp = not config.create_sl_tp
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+            render_trading_config_text(user_id),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -3677,7 +3962,7 @@ Next: /start_monitoring""",
         config.make_webhook_enabled = not config.make_webhook_enabled
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+            render_trading_config_text(user_id),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -3697,11 +3982,22 @@ Next: /start_monitoring""",
         return WAITING_STOP_LOSS
 
     elif query.data == "set_take_profit":
-        await query.edit_message_text(
-            "🎯 <b>Set Take Profit</b>\n\nSend percentage (e.g., 10 for 10%) or 'default' to use 2.5/5/7.5% ladder:",
-            parse_mode='HTML'
-        )
-        return WAITING_TAKE_PROFIT
+        # Shortcut to TP configurator
+        total_close = 0.0
+        lines = []
+        for i, tp in enumerate(config.custom_take_profits, 1):
+            total_close += tp.close_percentage if i < len(config.custom_take_profits) else (100.0 - min(total_close, 100.0))
+            lines.append(f"TP{i}: {tp.percentage}% → Close {tp.close_percentage}%")
+        summary = f"Total planned close (pre-cap): {sum(l.close_percentage for l in config.custom_take_profits):.1f}%"
+        tp_text = "\n".join(["🎯 <b>Current Take Profit Levels:</b>", "", *lines, "", summary, "", "Add, clear, or reset below."])
+        tp_keyboard = [
+            [InlineKeyboardButton("➕ Add Level", callback_data="add_tp_level")],
+            [InlineKeyboardButton("🗑️ Clear All", callback_data="clear_tp_levels")],
+            [InlineKeyboardButton("🔄 Reset Default", callback_data="reset_tp_default")],
+            [InlineKeyboardButton("✅ Done", callback_data="tp_config_done")]
+        ]
+        await query.edit_message_text(tp_text, reply_markup=InlineKeyboardMarkup(tp_keyboard), parse_mode='HTML')
+        return WAITING_TP_CONFIG
 
     elif query.data == "set_balance_percent":
         await query.edit_message_text(
@@ -3738,6 +4034,24 @@ Next: /start_monitoring""",
         await query.edit_message_text("📡 <b>Opening channel manager...</b> Use /setup_channels", parse_mode='HTML')
         return ConversationHandler.END
 
+    elif query.data == "rename_account":
+        # Ask for new account name
+        await query.edit_message_text(
+            "✏️ <b>Rename Account</b>\n\nSend a new name for this account:",
+            parse_mode='HTML'
+        )
+        context.user_data['awaiting_rename'] = True
+        return WAITING_ACCOUNT_SETTINGS
+
+    elif query.data == "delete_account":
+        # Ask for confirmation
+        await query.edit_message_text(
+            "🗑️ <b>Delete Account</b>\n\nType 'DELETE' to confirm. This disables the account (soft delete).",
+            parse_mode='HTML'
+        )
+        context.user_data['awaiting_delete'] = True
+        return WAITING_ACCOUNT_SETTINGS
+
     elif query.data == "enable_oco":
         # Start the monitor if not running
         if not trading_bot.order_monitor_running:
@@ -3755,23 +4069,28 @@ Next: /start_monitoring""",
         else:
             keyboard_markup = create_settings_keyboard(user_id)
             await query.edit_message_text(
-                "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+                render_trading_config_text(user_id),
                 reply_markup=keyboard_markup,
                 parse_mode='HTML'
             )
 
     elif query.data == "configure_take_profits":
-        tp_text = "🎯 <b>Current Take Profit Levels:</b>\n\n"
+        # Render TP levels with totals for clarity
+        total_close = 0.0
+        lines = []
         for i, tp in enumerate(config.custom_take_profits, 1):
-            tp_text += f"TP{i}: {tp.percentage}% → Close {tp.close_percentage}%\n"
-        
+            total_close += tp.close_percentage if i < len(config.custom_take_profits) else (100.0 - min(total_close, 100.0))
+            lines.append(f"TP{i}: {tp.percentage}% → Close {tp.close_percentage}%")
+        summary = f"Total planned close (pre-cap): {sum(l.close_percentage for l in config.custom_take_profits):.1f}%"
+        tp_text = "\n".join(["🎯 <b>Current Take Profit Levels:</b>", "", *lines, "", summary, "", "Add, clear, or reset below."])
+
         tp_keyboard = [
             [InlineKeyboardButton("➕ Add Level", callback_data="add_tp_level")],
             [InlineKeyboardButton("🗑️ Clear All", callback_data="clear_tp_levels")],
             [InlineKeyboardButton("🔄 Reset Default", callback_data="reset_tp_default")],
             [InlineKeyboardButton("✅ Done", callback_data="tp_config_done")]
         ]
-        
+
         await query.edit_message_text(
             tp_text,
             reply_markup=InlineKeyboardMarkup(tp_keyboard),
@@ -3784,11 +4103,17 @@ Next: /start_monitoring""",
 async def handle_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
 
     try:
         leverage = int(update.message.text)
         if 1 <= leverage <= 125:
             config.leverage = leverage
+            try:
+                if current_account:
+                    trading_bot.enhanced_db.update_account_settings(current_account.account_id, leverage=leverage)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist leverage: {e}")
             await update.message.reply_text(f"✅ <b>Leverage: {leverage}x</b>", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Must be 1-125", parse_mode='HTML')
@@ -3797,14 +4122,57 @@ async def handle_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+async def handle_account_settings_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle rename/delete confirmations in settings flow."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    acc = trading_bot.get_current_account(user_id)
+    if not acc:
+        await update.message.reply_text("❌ No current account selected.")
+        return ConversationHandler.END
+
+    # Rename flow
+    if context.user_data.get('awaiting_rename'):
+        new_name = text[:50]
+        ok = trading_bot.enhanced_db.update_account_name(acc.account_id, new_name)
+        context.user_data.pop('awaiting_rename', None)
+        if ok:
+            await update.message.reply_text(f"✅ Account renamed to <b>{new_name}</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Failed to rename account")
+        return ConversationHandler.END
+
+    # Delete flow
+    if context.user_data.get('awaiting_delete'):
+        if text.upper() == 'DELETE':
+            ok = trading_bot.enhanced_db.soft_delete_account(acc.account_id)
+            context.user_data.pop('awaiting_delete', None)
+            if ok:
+                await update.message.reply_text("✅ Account disabled (soft-deleted).", parse_mode='HTML')
+            else:
+                await update.message.reply_text("❌ Failed to delete account", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Deletion cancelled.", parse_mode='HTML')
+            context.user_data.pop('awaiting_delete', None)
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
 async def handle_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
 
     try:
         sl_percent = float(update.message.text)
         if 0.1 <= sl_percent <= 50:
             config.stop_loss_percent = sl_percent
+            try:
+                if current_account:
+                    # Store as first/only stop loss level for account defaults
+                    trading_bot.enhanced_db.update_account_stop_loss_levels(current_account.account_id, [StopLossLevel(abs(sl_percent), 100.0)])
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist stop loss: {e}")
             await update.message.reply_text(f"✅ <b>Stop Loss: {sl_percent}%</b>", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Must be 0.1-50%", parse_mode='HTML')
@@ -3837,11 +4205,17 @@ async def handle_take_profit(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_balance_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
 
     try:
         value = float(update.message.text)
         if 1 <= value <= 100:
             config.balance_percent = value
+            try:
+                if current_account:
+                    trading_bot.enhanced_db.update_account_settings(current_account.account_id, balance_percentage=value, use_percentage_balance=True)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist balance %: {e}")
             await update.message.reply_text(f"✅ <b>Balance: {value}%</b>", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Must be 1-100", parse_mode='HTML')
@@ -3853,6 +4227,7 @@ async def handle_balance_percent(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_trailing_activation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
     try:
         value = float(update.message.text)
         if value <= 0 or value > 50:
@@ -3866,6 +4241,7 @@ async def handle_trailing_activation(update: Update, context: ContextTypes.DEFAU
 async def handle_trailing_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
     try:
         value = float(update.message.text)
         if value <= 0 or value > 50:
@@ -3958,11 +4334,17 @@ TP: {signal.take_profit}""")
 async def handle_usdt_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
 
     try:
         amount = float(update.message.text)
         if amount > 0:
             config.fixed_usdt_amount = amount
+            try:
+                if current_account:
+                    trading_bot.enhanced_db.update_account_settings(current_account.account_id, fixed_usdt_amount=amount, use_percentage_balance=False)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist usdt amount: {e}")
             await update.message.reply_text(f"✅ <b>Fixed USDT Amount: ${amount:.0f}</b>", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Amount must be positive", parse_mode='HTML')
@@ -3984,7 +4366,7 @@ async def handle_tp_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "tp_config_done":
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+            render_trading_config_text(user_id),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -3999,6 +4381,12 @@ async def handle_tp_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "clear_tp_levels":
         config.custom_take_profits.clear()
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_account_take_profit_levels(acc.account_id, config.custom_take_profits)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist TP clear: {e}")
         await query.edit_message_text(
             "🗑️ <b>All take profit levels cleared!</b>\n\nAdd new levels or reset to default.",
             parse_mode='HTML'
@@ -4011,6 +4399,12 @@ async def handle_tp_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
             TakeProfitLevel(2.5, 50.0),
             TakeProfitLevel(5.0, 100.0)
         ]
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_account_take_profit_levels(acc.account_id, config.custom_take_profits)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist TP reset: {e}")
         tp_text = "🔄 <b>Reset to Default:</b>\n\n"
         for i, tp in enumerate(config.custom_take_profits, 1):
             tp_text += f"TP{i}: {tp.percentage}% → Close {tp.close_percentage}%\n"
@@ -4052,6 +4446,7 @@ async def handle_tp_level_percent(update: Update, context: ContextTypes.DEFAULT_
 async def handle_tp_level_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = trading_bot.get_user_config(user_id)
+    current_account = trading_bot.get_current_account(user_id)
     
     try:
         close_percentage = float(update.message.text)
@@ -4064,6 +4459,12 @@ async def handle_tp_level_close(update: Update, context: ContextTypes.DEFAULT_TY
             
             # Sort by percentage
             config.custom_take_profits.sort(key=lambda x: x.percentage)
+            # Persist for current account if available
+            try:
+                if current_account:
+                    trading_bot.enhanced_db.update_account_take_profit_levels(current_account.account_id, config.custom_take_profits)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist TP levels: {e}")
             
             await update.message.reply_text(
                 f"✅ <b>Added TP Level!</b>\n\n🎯 {tp_percentage}% → Close {close_percentage}%\n\nTotal levels: {len(config.custom_take_profits)}",
@@ -4303,6 +4704,7 @@ trading_conv_handler = ConversationHandler(
         WAITING_TRAILING_ACTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trailing_activation)],
         WAITING_TRAILING_CALLBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trailing_callback)],
         WAITING_USDT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_usdt_amount)],
+        WAITING_ACCOUNT_SETTINGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_settings_text)],
         WAITING_TP_CONFIG: [CallbackQueryHandler(handle_tp_config)],
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
@@ -4357,11 +4759,15 @@ def main():
     try:
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Enhanced static button handlers (no commands needed)
+        # Enhanced static button handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
-        
-        # Keep only essential conversation handlers for account setup
-        application.add_handler(account_conv_handler)  # Enhanced multi-account handler
+
+        # Conversation handlers (enable full settings/channel flows)
+        application.add_handler(account_conv_handler)
+        application.add_handler(binance_conv_handler)
+        application.add_handler(telegram_conv_handler)
+        application.add_handler(channel_conv_handler)
+        application.add_handler(trading_conv_handler)
 
         print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
         print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
