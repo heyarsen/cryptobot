@@ -54,14 +54,6 @@ from telethon.tl.types import Channel, PeerChannel
 from telethon.errors import ApiIdInvalidError
 
 # Bot Configuration
-# Railway persistent storage
-DATABASE_PATH = os.getenv('DATABASE_PATH', 'enhancedtradingbot.db')
-if '/data/' in DATABASE_PATH:
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
-    print(f"💾 Using persistent volume: {DATABASE_PATH}")
-else:
-    print(f"⚠️ Ephemeral storage - data lost on redeploy!")
-
 BOT_PIN_CODE = "496745"  # PIN code for bot access
 DEFAULT_TELEGRAM_API_ID = '28270452'
 DEFAULT_TELEGRAM_API_HASH = '8bb0aa3065dd515fb6e105f1fc60fdb6'
@@ -617,40 +609,48 @@ class EnhancedDatabase:
             return False
     
     def get_all_accounts(self) -> List[AccountConfig]:
-        """Get all accounts with correct column mapping"""
+        """Get all accounts - FIXED column positions"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM accounts WHERE is_active = TRUE")
+            cursor.execute("SELECT * FROM accounts WHERE is_active = 1 OR is_active = TRUE")
             rows = cursor.fetchall()
             conn.close()
 
             accounts = []
             for row in rows:
                 try:
-                    # Correct positions: 19=monitored_channels, 20=signal_channels
-                    mon = json.loads(row[19]) if len(row) > 19 and isinstance(row[19], str) and row[19] else []
-                    sig = json.loads(row[20]) if len(row) > 20 and isinstance(row[20], str) and row[20] else []
+                    # Columns 19=monitored_channels, 20=signal_channels
+                    mon = row[19] if len(row) > 19 else "[]"
+                    sig = row[20] if len(row) > 20 else "[]"
+
+                    mon_ch = json.loads(mon) if isinstance(mon, str) and mon not in ["[]","0",""] else []
+                    sig_ch = json.loads(sig) if isinstance(sig, str) and sig not in ["[]","0",""] else []
 
                     accounts.append(AccountConfig(
                         account_id=row[0], account_name=row[1],
                         bingx_api_key=row[2], bingx_secret_key=row[3],
                         telegram_api_id=row[4], telegram_api_hash=row[5],
-                        phone=row[6], is_active=bool(row[7]),
-                        created_at=row[8], last_used=row[9],
-                        leverage=int(row[10]), risk_percentage=float(row[11]),
-                        default_symbol=row[12] if len(row) > 12 else "BTC-USDT",
-                        auto_trade_enabled=bool(row[13]) if len(row) > 13 else False,
-                        use_percentage_balance=bool(row[14]) if len(row) > 14 else True,
-                        monitored_channels=mon, signal_channels=sig
+                        phone=row[6] if len(row)>6 else "",
+                        is_active=bool(row[7]) if len(row)>7 else True,
+                        created_at=row[8] if len(row)>8 else datetime.now().isoformat(),
+                        last_used=row[9] if len(row)>9 else datetime.now().isoformat(),
+                        leverage=int(row[10]) if len(row)>10 else 10,
+                        risk_percentage=float(row[11]) if len(row)>11 else 2.0,
+                        default_symbol=row[12] if len(row)>12 else "BTC-USDT",
+                        auto_trade_enabled=bool(row[13]) if len(row)>13 else False,
+                        use_percentage_balance=bool(row[14]) if len(row)>14 else True,
+                        monitored_channels=mon_ch,
+                        signal_channels=sig_ch
                     ))
-                    logger.info(f"✅ Loaded: {row[1]}")
                 except Exception as e:
                     logger.error(f"Row error: {e}")
-            logger.info(f"Total: {len(accounts)} accounts")
+                    continue
+
+            logger.info(f"✅ Loaded {len(accounts)} accounts")
             return accounts
         except Exception as e:
-            logger.error(f"Get accounts failed: {e}")
+            logger.error(f"❌ Get accounts failed: {e}")
             return []
 
     def create_channel(self, channel: ChannelConfig) -> bool:
@@ -2542,34 +2542,41 @@ async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAUL
         )
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid, txt = update.effective_user.id, update.message.text.strip()
-    if not trading_bot.is_authenticated(uid):
-        if trading_bot.authenticate_user(uid,txt): await update.message.reply_text("✅ Authenticated!", parse_mode='HTML', reply_markup=build_main()); return
-        else: await update.message.reply_text("❌ Invalid PIN (496745):", parse_mode='HTML'); return
-    s = context.user_data.get('state')
-    if s=='W_AN': context.user_data.update({'an':txt,'state':'W_AK'}); await update.message.reply_text(f"📝 {txt}\n\nBingX API Key:", parse_mode='HTML'); return
-    elif s=='W_AK': context.user_data.update({'ak':txt,'state':'W_AS'}); await update.message.reply_text("🔑 Saved\n\nSecret:", parse_mode='HTML'); return
-    elif s=='W_AS':
-        a=AccountConfig(account_id=str(uuid.uuid4()),account_name=context.user_data.get('an'),bingx_api_key=context.user_data.get('ak'),bingx_secret_key=txt,telegram_api_id=DEFAULT_TELEGRAM_API_ID,telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,phone="",is_active=True,created_at=datetime.now().isoformat(),last_used=datetime.now().isoformat(),leverage=DEFAULT_SETTINGS['leverage'],risk_percentage=DEFAULT_SETTINGS['risk_percentage'],use_percentage_balance=True,monitored_channels=[],signal_channels=[])
-        try: trading_bot.enhanced_db.create_account(a); acs=trading_bot.enhanced_db.get_all_accounts(); await update.message.reply_text(f"✅ Created! Total: {len(acs)}", parse_mode='HTML', reply_markup=build_accounts(acs))
-        except Exception as e: await update.message.reply_text(f"❌ {str(e)[:50]}", parse_mode='HTML')
-        context.user_data.clear(); return
-    if txt=="🔑 Accounts": acs=trading_bot.enhanced_db.get_all_accounts(); await update.message.reply_text("🔑 Accounts", parse_mode='HTML', reply_markup=build_accounts(acs))
-    elif txt=="📊 Stats": await update.message.reply_text(f"📊 Stats\n\nAccounts: {len(trading_bot.enhanced_db.get_all_accounts())}", parse_mode='HTML')
-    elif txt=="🚀 Start All": await update.message.reply_text("🚀 Starting all", parse_mode='HTML')
-    elif txt=="🛑 Stop All": await update.message.reply_text("🛑 Stopping all", parse_mode='HTML')
-    elif txt=="📋 All History": await update.message.reply_text("📋 All history", parse_mode='HTML')
-    elif txt=="📈 All Trades": await update.message.reply_text("📈 All trades", parse_mode='HTML')
-    elif txt=="⚙️ Default Settings": await update.message.reply_text(f"⚙️ Defaults\n\nLev: {DEFAULT_SETTINGS['leverage']}x\nRisk: {DEFAULT_SETTINGS['risk_percentage']}%", parse_mode='HTML')
-    elif txt=="➕ Add Account": await update.message.reply_text("➕ New Account\n\nName:", parse_mode='HTML'); context.user_data['state']='W_AN'
-    elif txt.startswith("📋 ") and txt!="📋 All History": an=txt[2:]; acs=trading_bot.enhanced_db.get_all_accounts(); a=next((x for x in acs if x.account_name==an),None); context.user_data.update({'caid':a.account_id,'can':a.account_name}) if a else None; await update.message.reply_text(f"📋 {a.account_name}\n\nLev: {a.leverage}x | Risk: {a.risk_percentage}%", parse_mode='HTML', reply_markup=build_account()) if a else None
-    elif txt=="🔙 Main Menu": context.user_data.clear(); await update.message.reply_text("🏠 Main", parse_mode='HTML', reply_markup=build_main())
-    elif txt=="🔙 Accounts": acs=trading_bot.enhanced_db.get_all_accounts(); await update.message.reply_text("🔑 Accounts", parse_mode='HTML', reply_markup=build_accounts(acs))
-    elif txt=="🚀 Start": await update.message.reply_text(f"🚀 Started {context.user_data.get('can','')}", parse_mode='HTML')
-    elif txt=="🛑 Stop": await update.message.reply_text(f"🛑 Stopped {context.user_data.get('can','')}", parse_mode='HTML')
-    elif txt=="⚙️ Settings" and 'caid' in context.user_data: await update.message.reply_text(f"⚙️ Settings\n\n{context.user_data.get('can','')}", parse_mode='HTML', reply_markup=build_settings())
-    elif txt=="📡 Channels": await update.message.reply_text("📡 Channels", parse_mode='HTML')
-    elif txt=="🔙 Account": await update.message.reply_text(f"📋 {context.user_data.get('can','Account')}", parse_mode='HTML', reply_markup=build_account())
+    """Handle main menu button presses"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    # Check authentication first
+    if not trading_bot.is_authenticated(user_id):
+        await update.message.reply_text(
+            "🔐 <b>Authentication Required</b>\n\n"
+            "Please enter the PIN code to access the bot:",
+            parse_mode='HTML'
+        )
+        return
+    
+    if text == "🔑 Accounts":
+        await handle_accounts_menu(update, context)
+    elif text == "📊 Status":
+        await handle_status(update, context)
+    elif text == "💰 Balance":
+        await handle_balance(update, context)
+    elif text == "📈 Active Trades":
+        await handle_active_trades(update, context)
+    elif text == "📋 Trade History":
+        await handle_trade_history(update, context)
+    elif text == "⚙️ Settings":
+        await handle_settings_menu(update, context)
+    elif text == "🚀 Start Trading":
+        await handle_start_trading(update, context)
+    elif text == "🛑 Stop Trading":
+        await handle_stop_trading(update, context)
+    elif text == "🔙 Back to Main":
+        await update.message.reply_text(
+            "🏠 <b>Main Menu</b>\n\nChoose an action:",
+            parse_mode='HTML',
+            reply_markup=trading_bot.main_menu
+        )
 
 async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle accounts menu"""
@@ -4077,6 +4084,19 @@ def kill_existing_bot_instances():
 # ================== MAIN ==================
 
 def main():
+    """Start bot with persistent database"""
+    # Database path for Railway persistence
+    DATABASE_PATH = os.getenv('DATABASE_PATH', '/data/enhancedtradingbot.db')
+    if not os.path.exists(os.path.dirname(DATABASE_PATH)) and DATABASE_PATH.startswith('/data'):
+        DATABASE_PATH = 'enhancedtradingbot.db'
+        print("⚠️ Local DB (no volume mounted)")
+    else:
+        print(f"💾 Database: {DATABASE_PATH}")
+
+    # Initialize with persistent path
+    global trading_bot
+    trading_bot.enhanced_db = EnhancedDatabase(DATABASE_PATH)
+
     """Start the enhanced bot with static button interface"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
