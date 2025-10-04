@@ -2638,9 +2638,13 @@ class TradingBot:
             if not self.order_monitor_running:
                 asyncio.create_task(self.monitor_orders(bot_instance))
 
-            @telethon_client.on(events.NewMessage)
+            # Remove existing handlers to avoid duplicates
+            telethon_client.remove_event_handler(message_handler) if 'message_handler' in locals() else None
+            
+            @telethon_client.on(events.NewMessage(incoming=True))
             async def message_handler(event):
                 try:
+                    logger.info(f"📨 [DEBUG] Received message event from Telethon")
                     channel_ids = set()
 
                     if hasattr(event, 'chat_id') and event.chat_id:
@@ -2656,11 +2660,18 @@ class TradingBot:
                             channel_ids.add(str(event.message.peer_id.channel_id))
                             channel_ids.add(str(-abs(event.message.peer_id.channel_id)))
 
+                    logger.info(f"📨 [DEBUG] Message from channel IDs: {channel_ids}")
+                    
                     user_config = self.get_user_config(user_id)
+                    logger.info(f"📨 [DEBUG] Monitored channels: {user_config.monitored_channels}")
+                    
                     matching_channels = channel_ids.intersection(set(user_config.monitored_channels))
 
                     if not matching_channels:
+                        logger.info(f"📨 [DEBUG] No matching channels, ignoring message")
                         return
+                    
+                    logger.info(f"📨 [DEBUG] Found matching channel: {matching_channels}")
 
                     message_text = getattr(event.message, 'message', '') if event.message else ''
                     if not message_text:
@@ -2734,12 +2745,56 @@ class TradingBot:
             if not telethon_client.is_connected():
                 await telethon_client.connect()
 
+            # Start background task to process Telethon events if not already running
+            if user_id not in self.monitoring_tasks or self.monitoring_tasks[user_id].done():
+                self.monitoring_tasks[user_id] = asyncio.create_task(self._run_telethon_client(user_id))
+                logger.info(f"✅ Started Telethon event loop for user {user_id}")
+
             self.active_monitoring[user_id] = True
+            logger.info(f"📡 Monitoring now active for user {user_id}. Monitored channels: {config.monitored_channels}")
+            logger.info(f"🔔 Event handler registered. Client connected: {telethon_client.is_connected()}")
             return True
 
         except Exception as e:
             logger.error(f"Start monitoring error: {e}")
             return False
+    
+    async def _run_telethon_client(self, user_id: int):
+        """Keep Telethon client running to process events"""
+        try:
+            telethon_client = self.user_monitoring_clients.get(user_id)
+            if not telethon_client:
+                logger.error(f"No Telethon client found for user {user_id}")
+                return
+            
+            logger.info(f"🔄 Telethon event loop running for user {user_id}")
+            
+            # Keep the client running while monitoring is active
+            while self.active_monitoring.get(user_id, False):
+                try:
+                    if not telethon_client.is_connected():
+                        await telethon_client.connect()
+                    
+                    # Check for updates by waiting for a short period
+                    # This allows Telethon to process incoming updates
+                    try:
+                        # Wait for updates with a timeout to allow checking active_monitoring
+                        await asyncio.wait_for(
+                            asyncio.create_task(asyncio.sleep(10)),
+                            timeout=10
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    
+                except Exception as e:
+                    logger.error(f"Error in Telethon event loop for user {user_id}: {e}")
+                    await asyncio.sleep(5)
+            
+            logger.info(f"🛑 Telethon event loop stopped for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Fatal error in Telethon event loop: {e}")
+            logger.error(traceback.format_exc())
 
 # Initialize bot
 trading_bot = TradingBot()
