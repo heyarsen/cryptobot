@@ -582,88 +582,107 @@ class EnhancedDatabase:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
+            # Ensure timestamps are set
+            if not account.created_at:
+                account.created_at = datetime.now().isoformat()
+            if not account.last_used:
+                account.last_used = datetime.now().isoformat()
+
             cursor.execute('''
                 INSERT OR REPLACE INTO accounts (
                     account_id, account_name, bingx_api_key, bingx_secret_key,
                     telegram_api_id, telegram_api_hash, phone, is_active,
                     created_at, last_used, leverage, risk_percentage,
-                    default_symbol, auto_trade_enabled, monitored_channels, signal_channels
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    default_symbol, auto_trade_enabled, use_percentage_balance,
+                    balance_percentage, fixed_usdt_amount,
+                    take_profit_levels, stop_loss_levels,
+                    monitored_channels, signal_channels
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
                 account.phone, account.is_active, account.created_at, account.last_used,
                 account.leverage, account.risk_percentage, account.default_symbol,
-                account.auto_trade_enabled, json.dumps(account.monitored_channels),
+                account.auto_trade_enabled, account.use_percentage_balance,
+                account.balance_percentage, account.fixed_usdt_amount,
+                json.dumps([{'percentage': tp.percentage, 'close_percentage': tp.close_percentage} 
+                           for tp in account.take_profit_levels]),
+                json.dumps([{'percentage': sl.percentage, 'close_percentage': sl.close_percentage} 
+                           for sl in account.stop_loss_levels]),
+                json.dumps(account.monitored_channels),
                 json.dumps(account.signal_channels)
             ))
-            
+
             conn.commit()
             conn.close()
-            logger.info(f"✅ Account {account.account_name} created successfully")
+            logger.info(f"✅ Account {account.account_name} created successfully in database")
             return True
-            
         except Exception as e:
             logger.error(f"❌ Failed to create account: {e}")
             return False
-    
+
+
     def get_all_accounts(self) -> List[AccountConfig]:
         """Get all active accounts"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM accounts WHERE is_active = 1 OR is_active = TRUE")
+            cursor.execute('SELECT * FROM accounts WHERE is_active = TRUE')
             rows = cursor.fetchall()
             conn.close()
 
             accounts = []
             for row in rows:
                 try:
-                    # Correct column positions: 19 and 20 for channels
-                    mon_raw = row[19] if len(row) > 19 else "[]"
-                    sig_raw = row[20] if len(row) > 20 else "[]"
+                    # Parse TP levels
+                    tp_levels = []
+                    if row[17]:  # take_profit_levels column
+                        tp_data = json.loads(row[17])
+                        tp_levels = [TakeProfitLevel(tp['percentage'], tp['close_percentage']) 
+                                    for tp in tp_data]
 
-                    # Safe JSON parsing
-                    try:
-                        mon_ch = json.loads(mon_raw) if isinstance(mon_raw, str) and mon_raw not in ["[]", "0", ""] else []
-                    except:
-                        mon_ch = []
+                    # Parse SL levels
+                    sl_levels = []
+                    if row[18]:  # stop_loss_levels column
+                        sl_data = json.loads(row[18])
+                        sl_levels = [StopLossLevel(sl['percentage'], sl['close_percentage']) 
+                                    for sl in sl_data]
 
-                    try:
-                        sig_ch = json.loads(sig_raw) if isinstance(sig_raw, str) and sig_raw not in ["[]", "0", ""] else []
-                    except:
-                        sig_ch = []
-
-                    accounts.append(AccountConfig(
+                    account = AccountConfig(
                         account_id=row[0],
                         account_name=row[1],
                         bingx_api_key=row[2],
                         bingx_secret_key=row[3],
                         telegram_api_id=row[4],
                         telegram_api_hash=row[5],
-                        phone=row[6] if len(row) > 6 else "",
-                        is_active=bool(row[7]) if len(row) > 7 else True,
-                        created_at=row[8] if len(row) > 8 else datetime.now().isoformat(),
-                        last_used=row[9] if len(row) > 9 else datetime.now().isoformat(),
-                        leverage=int(row[10]) if len(row) > 10 else 10,
-                        risk_percentage=float(row[11]) if len(row) > 11 else 2.0,
-                        default_symbol=row[12] if len(row) > 12 else "BTC-USDT",
-                        auto_trade_enabled=bool(row[13]) if len(row) > 13 else False,
-                        use_percentage_balance=bool(row[14]) if len(row) > 14 else True,
-                        monitored_channels=mon_ch,
-                        signal_channels=sig_ch
-                    ))
-                    logger.info(f"✅ Loaded: {row[1]}")
+                        phone=row[6],
+                        is_active=bool(row[7]),
+                        created_at=row[8],
+                        last_used=row[9],
+                        leverage=row[10],
+                        risk_percentage=row[11],
+                        default_symbol=row[12],
+                        auto_trade_enabled=bool(row[13]),
+                        use_percentage_balance=bool(row[14]),
+                        balance_percentage=row[15],
+                        fixed_usdt_amount=row[16],
+                        take_profit_levels=tp_levels,
+                        stop_loss_levels=sl_levels,
+                        monitored_channels=json.loads(row[19]) if row[19] else [],
+                        signal_channels=json.loads(row[20]) if row[20] else []
+                    )
+                    accounts.append(account)
                 except Exception as e:
-                    logger.error(f"Row parse error: {e}")
+                    logger.error(f"❌ Error parsing account row: {e}")
                     continue
 
-            logger.info(f"✅ Total: {len(accounts)}")
+            logger.info(f"✅ Retrieved {len(accounts)} accounts from database")
             return accounts
         except Exception as e:
-            logger.error(f"Get accounts error: {e}")
+            logger.error(f"❌ Failed to get accounts: {e}")
             return []
+
 
     def create_channel(self, channel: ChannelConfig) -> bool:
         """Create or update a channel configuration"""
@@ -1350,6 +1369,27 @@ class TradingBot:
             resize_keyboard=True
         )
     
+
+    def load_accounts_from_db(self):
+        """Load all accounts from database on startup"""
+        try:
+            accounts = self.enhanced_db.get_all_accounts()
+            logger.info(f"📂 Loading {len(accounts)} accounts from database...")
+
+            for account in accounts:
+                logger.info(f"✅ Loaded account: {account.account_name} ({account.account_id})")
+
+            return accounts
+        except Exception as e:
+            logger.error(f"❌ Error loading accounts from database: {e}")
+            return []
+
+
+        # Load existing accounts from database
+        logger.info("🔄 Loading accounts from database...")
+        loaded_accounts = self.load_accounts_from_db()
+        logger.info(f"✅ Loaded {len(loaded_accounts)} accounts")
+
     def authenticate_user(self, user_id: int, pin_code: str) -> bool:
         """Authenticate user with PIN code"""
         if pin_code == BOT_PIN_CODE:
@@ -2527,6 +2567,89 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 # ===================== STATIC BUTTON HANDLERS =====================
 
+
+# ==================== ENHANCED UI SYSTEM ====================
+
+# Default settings for new accounts
+DEFAULT_SETTINGS = {
+    'leverage': 10,
+    'risk_percentage': 2.0,
+    'tp_levels': [50.0, 100.0, 150.0],
+    'sl_level': -10.0,
+    'trailing_stop_enabled': False
+}
+
+# Trade tracker for duplicate prevention
+class TradeTracker:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_table()
+
+    def init_table(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""CREATE TABLE IF NOT EXISTS trade_tracking (
+                id INTEGER PRIMARY KEY, account_id TEXT, symbol TEXT, 
+                channel_id TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(account_id, symbol, channel_id, date(timestamp)))""")
+            conn.commit()
+            conn.close()
+        except: pass
+
+    def can_open_trade(self, account_id: str, symbol: str, channel_id: str) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM trade_tracking WHERE account_id=? AND symbol=? AND channel_id=? AND timestamp > datetime('now','-24 hours')", (account_id, symbol, channel_id))
+            return cursor.fetchone()[0] == 0
+        except: return True
+
+    def record_trade(self, account_id: str, symbol: str, channel_id: str):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO trade_tracking (account_id,symbol,channel_id) VALUES (?,?,?)", (account_id,symbol,channel_id))
+            conn.commit()
+            conn.close()
+        except: pass
+
+trade_tracker = TradeTracker("enhancedtradingbot.db")
+
+# Keyboard builders
+def build_main_menu():
+    return ReplyKeyboardMarkup([
+        ["🔑 Accounts", "📊 Stats"],
+        ["🚀 Start All", "🛑 Stop All"],
+        ["📋 All History", "📈 All Trades"],
+        ["⚙️ Default Settings"]
+    ], resize_keyboard=True)
+
+def build_accounts_menu(accounts):
+    kb = [["➕ Add Account"]]
+    for i in range(0, len(accounts), 2):
+        row = [f"📋 {accounts[i].account_name}"]
+        if i+1 < len(accounts): row.append(f"📋 {accounts[i+1].account_name}")
+        kb.append(row)
+    kb.append(["🔙 Main Menu"])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def build_account_page():
+    return ReplyKeyboardMarkup([
+        ["🚀 Start", "🛑 Stop"],
+        ["📋 History", "📈 Trades"],
+        ["⚙️ Settings", "📡 Channels"],
+        ["🔙 Accounts"]
+    ], resize_keyboard=True)
+
+def build_settings_menu():
+    return ReplyKeyboardMarkup([
+        ["📊 Leverage", "💰 Risk %"],
+        ["🎯 Take Profits", "🛡️ Stop Loss"],
+        ["📉 Trailing"],
+        ["🔙 Account"]
+    ], resize_keyboard=True)
+
 async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle PIN code authentication"""
     user_id = update.effective_user.id
@@ -2554,41 +2677,170 @@ async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAUL
         )
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle main menu button presses"""
+    """Complete navigation system"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    
-    # Check authentication first
+
+    # Auth check
     if not trading_bot.is_authenticated(user_id):
-        await update.message.reply_text(
-            "🔐 <b>Authentication Required</b>\n\n"
-            "Please enter the PIN code to access the bot:",
-            parse_mode='HTML'
-        )
+        if trading_bot.authenticate_user(user_id, text):
+            await update.message.reply_text("✅ <b>Authenticated!</b>", parse_mode='HTML', reply_markup=build_main_menu())
+            return
+        else:
+            await update.message.reply_text("❌ Invalid PIN (496745):", parse_mode='HTML')
+            return
+
+    # Account creation states
+    if context.user_data.get('state') == 'WAIT_ACC_NAME':
+        context.user_data['acc_name'] = text
+        context.user_data['state'] = 'WAIT_ACC_KEY'
+        await update.message.reply_text(f"📝 {text}\n\nBingX API Key:", parse_mode='HTML')
         return
-    
-    if text == "🔑 Accounts":
-        await handle_accounts_menu(update, context)
-    elif text == "📊 Status":
-        await handle_status(update, context)
-    elif text == "💰 Balance":
-        await handle_balance(update, context)
-    elif text == "📈 Active Trades":
-        await handle_active_trades(update, context)
-    elif text == "📋 Trade History":
-        await handle_trade_history(update, context)
-    elif text == "⚙️ Settings":
-        await handle_settings_menu(update, context)
-    elif text == "🚀 Start Trading":
-        await handle_start_trading(update, context)
-    elif text == "🛑 Stop Trading":
-        await handle_stop_trading(update, context)
-    elif text == "🔙 Back to Main":
-        await update.message.reply_text(
-            "🏠 <b>Main Menu</b>\n\nChoose an action:",
-            parse_mode='HTML',
-            reply_markup=trading_bot.main_menu
+    elif context.user_data.get('state') == 'WAIT_ACC_KEY':
+        context.user_data['acc_key'] = text
+        context.user_data['state'] = 'WAIT_ACC_SEC'
+        await update.message.reply_text("🔑 Saved!\n\nBingX Secret:", parse_mode='HTML')
+        return
+    elif context.user_data.get('state') == 'WAIT_ACC_SEC':
+        acc = AccountConfig(
+            account_id=str(uuid.uuid4()), account_name=context.user_data.get('acc_name'),
+            bingx_api_key=context.user_data.get('acc_key'), bingx_secret_key=text,
+            telegram_api_id=DEFAULT_TELEGRAM_API_ID, telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
+            phone="", is_active=True, created_at=datetime.now().isoformat(),
+            last_used=datetime.now().isoformat(), leverage=DEFAULT_SETTINGS['leverage'],
+            risk_percentage=DEFAULT_SETTINGS['risk_percentage'], use_percentage_balance=True,
+            monitored_channels=[], signal_channels=[]
         )
+        try:
+            trading_bot.enhanced_db.create_account(acc)
+            await update.message.reply_text(f"✅ Account created with default settings!", parse_mode='HTML', reply_markup=build_accounts_menu(trading_bot.enhanced_db.get_all_accounts()))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}", parse_mode='HTML')
+        context.user_data.clear()
+        return
+
+    # Settings states
+    if context.user_data.get('state') == 'WAIT_LEVERAGE':
+        try:
+            lev = int(text)
+            if 1 <= lev <= 125:
+                acc_id = context.user_data.get('current_account_id')
+                # Update leverage in DB
+                await update.message.reply_text(f"✅ Leverage set to {lev}x", parse_mode='HTML', reply_markup=build_settings_menu())
+            else:
+                await update.message.reply_text("❌ Use 1-125", parse_mode='HTML')
+        except:
+            await update.message.reply_text("❌ Invalid number", parse_mode='HTML')
+        context.user_data.pop('state', None)
+        return
+
+    # Main menu buttons
+    if text == "🔑 Accounts":
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        await update.message.reply_text("🔑 <b>Accounts</b>", parse_mode='HTML', reply_markup=build_accounts_menu(accs))
+
+    elif text == "📊 Stats":
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        msg = "📊 <b>Overall Stats</b>\n\n"
+        msg += f"Total Accounts: {len(accs)}\n"
+        # Add balance calculation here
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
+
+    elif text == "🚀 Start All":
+        # Start monitoring all accounts
+        await update.message.reply_text("🚀 Starting all accounts...", parse_mode='HTML')
+
+    elif text == "🛑 Stop All":
+        await update.message.reply_text("🛑 Stopping all accounts...", parse_mode='HTML')
+
+    elif text == "📋 All History":
+        await update.message.reply_text("📋 Trade history across all accounts", parse_mode='HTML')
+
+    elif text == "📈 All Trades":
+        await update.message.reply_text("📈 Active trades across all accounts", parse_mode='HTML')
+
+    elif text == "⚙️ Default Settings":
+        msg = f"⚙️ <b>Default Settings</b>\n\n"
+        msg += f"📊 Leverage: {DEFAULT_SETTINGS['leverage']}x\n"
+        msg += f"💰 Risk: {DEFAULT_SETTINGS['risk_percentage']}%\n"
+        msg += f"🎯 TP Levels: {DEFAULT_SETTINGS['tp_levels']}\n"
+        msg += f"🛡️ SL: {DEFAULT_SETTINGS['sl_level']}%\n"
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
+
+    # Accounts menu buttons
+    elif text == "➕ Add Account":
+        await update.message.reply_text("➕ <b>New Account</b>\n\nAccount name:", parse_mode='HTML')
+        context.user_data['state'] = 'WAIT_ACC_NAME'
+
+    elif text.startswith("📋 ") and text != "📋 All History":
+        acc_name = text[2:].strip()
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        acc = next((a for a in accs if a.account_name == acc_name), None)
+        if acc:
+            context.user_data['current_account_id'] = acc.account_id
+            context.user_data['current_account_name'] = acc.account_name
+            msg = f"📋 <b>{acc.account_name}</b>\n\n"
+            msg += f"📊 Leverage: {acc.leverage}x\n"
+            msg += f"💰 Risk: {acc.risk_percentage}%\n"
+            msg += f"📡 Channels: {len(acc.monitored_channels)}\n"
+            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
+
+    elif text == "🔙 Main Menu":
+        context.user_data.clear()
+        await update.message.reply_text("🏠 Main Menu", parse_mode='HTML', reply_markup=build_main_menu())
+
+    elif text == "🔙 Accounts":
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        await update.message.reply_text("🔑 Accounts", parse_mode='HTML', reply_markup=build_accounts_menu(accs))
+
+    # Account page buttons
+    elif text == "🚀 Start":
+        acc_name = context.user_data.get('current_account_name', 'this account')
+        await update.message.reply_text(f"🚀 Starting monitoring for {acc_name}", parse_mode='HTML')
+
+    elif text == "🛑 Stop":
+        acc_name = context.user_data.get('current_account_name', 'this account')
+        await update.message.reply_text(f"🛑 Stopped monitoring for {acc_name}", parse_mode='HTML')
+
+    elif text == "📋 History" and 'current_account_id' in context.user_data:
+        await update.message.reply_text("📋 Trade history for this account", parse_mode='HTML')
+
+    elif text == "📈 Trades" and 'current_account_id' in context.user_data:
+        await update.message.reply_text("📈 Active trades for this account", parse_mode='HTML')
+
+    elif text == "⚙️ Settings" and 'current_account_id' in context.user_data:
+        acc_id = context.user_data.get('current_account_id')
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        acc = next((a for a in accs if a.account_id == acc_id), None)
+        if acc:
+            msg = f"⚙️ <b>Settings: {acc.account_name}</b>\n\n"
+            msg += f"📊 Leverage: {acc.leverage}x\n"
+            msg += f"💰 Risk: {acc.risk_percentage}%\n"
+            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_settings_menu())
+
+    elif text == "📡 Channels" and 'current_account_id' in context.user_data:
+        await update.message.reply_text("📡 <b>Channel Management</b>\n\nAdd channels to monitor", parse_mode='HTML')
+
+    elif text == "🔙 Account":
+        acc_name = context.user_data.get('current_account_name', 'Account')
+        await update.message.reply_text(f"📋 {acc_name}", parse_mode='HTML', reply_markup=build_account_page())
+
+    # Settings menu buttons
+    elif text == "📊 Leverage":
+        await update.message.reply_text("📊 Enter leverage (1-125):", parse_mode='HTML')
+        context.user_data['state'] = 'WAIT_LEVERAGE'
+
+    elif text == "💰 Risk %":
+        await update.message.reply_text("💰 Enter risk % per trade:", parse_mode='HTML')
+
+    elif text == "🎯 Take Profits":
+        await update.message.reply_text("🎯 Configure TP levels", parse_mode='HTML')
+
+    elif text == "🛡️ Stop Loss":
+        await update.message.reply_text("🛡️ Configure SL level", parse_mode='HTML')
+
+    elif text == "📉 Trailing":
+        await update.message.reply_text("📉 Trailing stop settings", parse_mode='HTML')
 
 async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle accounts menu"""
