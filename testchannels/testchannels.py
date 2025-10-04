@@ -609,7 +609,7 @@ class EnhancedDatabase:
             return False
     
     def get_all_accounts(self) -> List[AccountConfig]:
-        """Get all accounts - FIXED column positions"""
+        """Get all active accounts"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -620,37 +620,49 @@ class EnhancedDatabase:
             accounts = []
             for row in rows:
                 try:
-                    # Columns 19=monitored_channels, 20=signal_channels
-                    mon = row[19] if len(row) > 19 else "[]"
-                    sig = row[20] if len(row) > 20 else "[]"
+                    # Correct column positions: 19 and 20 for channels
+                    mon_raw = row[19] if len(row) > 19 else "[]"
+                    sig_raw = row[20] if len(row) > 20 else "[]"
 
-                    mon_ch = json.loads(mon) if isinstance(mon, str) and mon not in ["[]","0",""] else []
-                    sig_ch = json.loads(sig) if isinstance(sig, str) and sig not in ["[]","0",""] else []
+                    # Safe JSON parsing
+                    try:
+                        mon_ch = json.loads(mon_raw) if isinstance(mon_raw, str) and mon_raw not in ["[]", "0", ""] else []
+                    except:
+                        mon_ch = []
+
+                    try:
+                        sig_ch = json.loads(sig_raw) if isinstance(sig_raw, str) and sig_raw not in ["[]", "0", ""] else []
+                    except:
+                        sig_ch = []
 
                     accounts.append(AccountConfig(
-                        account_id=row[0], account_name=row[1],
-                        bingx_api_key=row[2], bingx_secret_key=row[3],
-                        telegram_api_id=row[4], telegram_api_hash=row[5],
-                        phone=row[6] if len(row)>6 else "",
-                        is_active=bool(row[7]) if len(row)>7 else True,
-                        created_at=row[8] if len(row)>8 else datetime.now().isoformat(),
-                        last_used=row[9] if len(row)>9 else datetime.now().isoformat(),
-                        leverage=int(row[10]) if len(row)>10 else 10,
-                        risk_percentage=float(row[11]) if len(row)>11 else 2.0,
-                        default_symbol=row[12] if len(row)>12 else "BTC-USDT",
-                        auto_trade_enabled=bool(row[13]) if len(row)>13 else False,
-                        use_percentage_balance=bool(row[14]) if len(row)>14 else True,
+                        account_id=row[0],
+                        account_name=row[1],
+                        bingx_api_key=row[2],
+                        bingx_secret_key=row[3],
+                        telegram_api_id=row[4],
+                        telegram_api_hash=row[5],
+                        phone=row[6] if len(row) > 6 else "",
+                        is_active=bool(row[7]) if len(row) > 7 else True,
+                        created_at=row[8] if len(row) > 8 else datetime.now().isoformat(),
+                        last_used=row[9] if len(row) > 9 else datetime.now().isoformat(),
+                        leverage=int(row[10]) if len(row) > 10 else 10,
+                        risk_percentage=float(row[11]) if len(row) > 11 else 2.0,
+                        default_symbol=row[12] if len(row) > 12 else "BTC-USDT",
+                        auto_trade_enabled=bool(row[13]) if len(row) > 13 else False,
+                        use_percentage_balance=bool(row[14]) if len(row) > 14 else True,
                         monitored_channels=mon_ch,
                         signal_channels=sig_ch
                     ))
+                    logger.info(f"✅ Loaded: {row[1]}")
                 except Exception as e:
-                    logger.error(f"Row error: {e}")
+                    logger.error(f"Row parse error: {e}")
                     continue
 
-            logger.info(f"✅ Loaded {len(accounts)} accounts")
+            logger.info(f"✅ Total: {len(accounts)}")
             return accounts
         except Exception as e:
-            logger.error(f"❌ Get accounts failed: {e}")
+            logger.error(f"Get accounts error: {e}")
             return []
 
     def create_channel(self, channel: ChannelConfig) -> bool:
@@ -4084,19 +4096,6 @@ def kill_existing_bot_instances():
 # ================== MAIN ==================
 
 def main():
-    """Start bot with persistent database"""
-    # Database path for Railway persistence
-    DATABASE_PATH = os.getenv('DATABASE_PATH', '/data/enhancedtradingbot.db')
-    if not os.path.exists(os.path.dirname(DATABASE_PATH)) and DATABASE_PATH.startswith('/data'):
-        DATABASE_PATH = 'enhancedtradingbot.db'
-        print("⚠️ Local DB (no volume mounted)")
-    else:
-        print(f"💾 Database: {DATABASE_PATH}")
-
-    # Initialize with persistent path
-    global trading_bot
-    trading_bot.enhanced_db = EnhancedDatabase(DATABASE_PATH)
-
     """Start the enhanced bot with static button interface"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
