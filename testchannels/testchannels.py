@@ -4056,22 +4056,62 @@ account_conv_handler = ConversationHandler(
 
 def kill_existing_bot_instances():
     """Kill any existing bot instances to prevent conflicts"""
+    import time
+
+    print("🔍 Checking for existing bot instances...")
+
     try:
-        # Find processes running testchannels.py
+        # Method 1: Try pgrep (Linux)
         result = subprocess.run(['pgrep', '-f', 'testchannels.py'], capture_output=True, text=True)
         if result.returncode == 0:
             pids = result.stdout.strip().split('\n')
             for pid in pids:
-                if pid and pid != str(os.getpid()):  # Don't kill ourselves
+                if pid and pid != str(os.getpid()):
                     try:
-                        os.kill(int(pid), signal.SIGTERM)
+                        os.kill(int(pid), signal.SIGKILL)  # Force kill
                         print(f"🔄 Killed existing bot instance (PID: {pid})")
-                    except ProcessLookupError:
-                        pass  # Process already dead
+                        time.sleep(1)
+                    except (ProcessLookupError, ValueError):
+                        pass
                     except Exception as e:
                         print(f"⚠️ Could not kill process {pid}: {e}")
+
+        # Method 2: Search through all python processes
+        try:
+            ps_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+            for line in ps_result.stdout.split('\n'):
+                if 'testchannels.py' in line and 'python' in line:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        pid = parts[1]
+                        if pid.isdigit() and int(pid) != os.getpid():
+                            try:
+                                os.kill(int(pid), signal.SIGKILL)
+                                print(f"🔄 Killed bot process (PID: {pid})")
+                                time.sleep(1)
+                            except:
+                                pass
+        except Exception as e:
+            print(f"⚠️ ps method failed: {e}")
+
     except Exception as e:
         print(f"⚠️ Could not check for existing instances: {e}")
+
+    # Clear any webhook conflicts
+    try:
+        BOT_TOKEN_STR = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
+        import requests
+        webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN_STR}/deleteWebhook?drop_pending_updates=true"
+        response = requests.get(webhook_url, timeout=5)
+        if response.status_code == 200:
+            print("✅ Cleared existing webhooks")
+        time.sleep(1)
+    except Exception as e:
+        print(f"⚠️ Could not delete webhook: {e}")
+
+    # Wait before starting
+    time.sleep(3)
+    print("✅ Ready to start new instance")
 
 # ================== MAIN ==================
 
