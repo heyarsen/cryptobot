@@ -2537,16 +2537,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user_id = update.effective_user.id
     if trading_bot.is_authenticated(user_id):
-        await update.message.reply_text(
-            "👋 <b>Welcome Back!</b>\n\nChoose an action:",
-            parse_mode='HTML',
-            reply_markup=trading_bot.main_menu
-        )
+        await update.message.reply_text("👋 <b>Welcome Back!</b>\n\nChoose an action:", parse_mode='HTML', reply_markup=trading_bot.main_menu)
     else:
-        await update.message.reply_text(
-            "🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nEnter PIN code:",
-            parse_mode='HTML'
-        )
+        await update.message.reply_text("🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nWelcome! Enter your PIN code:\n\n🔑 PIN:", parse_mode='HTML')
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle main menu button presses"""
@@ -2556,17 +2549,10 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check authentication first
     if not trading_bot.is_authenticated(user_id):
         if trading_bot.authenticate_user(user_id, text):
-            await update.message.reply_text(
-                "✅ <b>Authenticated!</b>\n\nWelcome!",
-                parse_mode='HTML',
-                reply_markup=trading_bot.main_menu
-            )
+            await update.message.reply_text("✅ <b>Authentication Successful!</b>\n\nWelcome to Enhanced Multi-Account Trading Bot v5.0!", parse_mode='HTML', reply_markup=trading_bot.main_menu)
             return
         else:
-            await update.message.reply_text(
-                "❌ Invalid PIN. Try again:",
-                parse_mode='HTML'
-            )
+            await update.message.reply_text("❌ <b>Invalid PIN!</b> Try again (496745):", parse_mode='HTML')
             return
     
     if text == "🔑 Accounts":
@@ -4098,16 +4084,14 @@ def kill_existing_bot_instances():
 # ================== MAIN ==================
 
 def main():
-    """Start the enhanced bot with static button interface"""
+    """Start the enhanced bot"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
-
-    # Kill any existing bot instances to prevent conflicts
     kill_existing_bot_instances()
 
     try:
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Add handlers
+        # Handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
         application.add_handler(account_conv_handler)
@@ -4115,35 +4099,23 @@ def main():
         print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
         print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
         print("🔐 PIN Protection: ENABLED (496745)")
-        print("✅ NEW: Individual account settings")
-        print("✅ NEW: Advanced TP/SL management")
-        print("✅ NEW: Trade history tracking")
-        print("✅ NEW: PIN code protection")
-        print("✅ NEW: Static button interface")
-        print("✅ NEW: Balance configuration options")
-        print("✅ NEW: Multiple stop loss levels")
-        print("✅ NEW: Enhanced user experience")
-        print("✅ FIXED: Duplicate monitoring prevention")
-        print("✅ FIXED: Proper stop monitoring")
-        print("✅ FIXED: Bot instance conflicts")
+        print("✅ Multi-account trading system")
+        print("✅ Advanced TP/SL management")
+        print("✅ Trade history tracking")
+        print("✅ Channel monitoring")
         print("📊 Ready! Use PIN code 496745 to access")
 
-        # Add error handler for conflicts
         async def error_handler(update, context):
             logger.error(f"Update {update} caused error {context.error}")
             if "Conflict" in str(context.error):
-                print("⚠️ Bot instance conflict detected. Please stop other instances.")
+                print("⚠️ Bot instance conflict detected")
             return True
 
         application.add_error_handler(error_handler)
-
         application.run_polling()
 
     except Exception as e:
-        print(f"❌ Error starting bot: {e}")
-        if "Conflict" in str(e):
-            print("⚠️ Another bot instance is running. Please stop it first.")
-        print("🔄 Retrying in 5 seconds...")
+        print(f"❌ Error: {e}")
         import time
         time.sleep(5)
         main()
