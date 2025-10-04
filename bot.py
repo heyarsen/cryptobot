@@ -735,7 +735,7 @@ class EnhancedDatabase:
                     logger.error(f"❌ Error parsing account row: {e}")
                     continue
 
-            logger.info(f"✅ Retrieved {len(accounts)} accounts from database")
+            # Reduce log spam - only log on initial load
             return accounts
         except Exception as e:
             logger.error(f"❌ Failed to get accounts: {e}")
@@ -2656,15 +2656,28 @@ class TradingBot:
                             channel_ids.add(str(event.message.peer_id.channel_id))
                             channel_ids.add(str(-abs(event.message.peer_id.channel_id)))
 
+                    # Enhanced logging for debugging
+                    logger.info(f"📨 Message received from channel IDs: {channel_ids}")
+                    
                     user_config = self.get_user_config(user_id)
-                    matching_channels = channel_ids.intersection(set(user_config.monitored_channels))
+                    # Convert monitored channels to strings for comparison
+                    monitored_channels_str = set(str(ch) for ch in user_config.monitored_channels)
+                    logger.info(f"📡 Monitored channels (as strings): {monitored_channels_str}")
+                    
+                    matching_channels = channel_ids.intersection(monitored_channels_str)
 
                     if not matching_channels:
+                        logger.info(f"❌ No matching channels. Received: {channel_ids}, Monitoring: {set(user_config.monitored_channels)}")
                         return
+                    
+                    logger.info(f"✅ Matched channel: {matching_channels}")
 
                     message_text = getattr(event.message, 'message', '') if event.message else ''
                     if not message_text:
+                        logger.info("❌ No message text found")
                         return
+                    
+                    logger.info(f"📝 Message text: {message_text[:100]}...")
 
                     await bot_instance.send_message(
                         chat_id=user_id,
@@ -2735,10 +2748,14 @@ class TradingBot:
                 await telethon_client.connect()
 
             self.active_monitoring[user_id] = True
+            logger.info(f"✅ Monitoring started for user {user_id}")
+            logger.info(f"📡 Monitoring {len(config.monitored_channels)} channels: {config.monitored_channels}")
+            logger.info(f"🎯 Waiting for messages from these channels...")
             return True
 
         except Exception as e:
             logger.error(f"Start monitoring error: {e}")
+            logger.error(traceback.format_exc())
             return False
 
 # Initialize bot
@@ -3220,10 +3237,18 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_trades = trading_bot.enhanced_db.get_active_trades(current_account.account_id)
     active_trades_count = len(active_trades)
     
+    # Debug: Show channel IDs for verification
+    channels_debug = ""
+    if current_account.monitored_channels:
+        channel_ids = current_account.monitored_channels[:3]  # Show first 3
+        channels_debug = f"\n🔍 Channel IDs: {', '.join(str(c) for c in channel_ids)}"
+        if len(current_account.monitored_channels) > 3:
+            channels_debug += f" (+{len(current_account.monitored_channels) - 3} more)"
+    
     status_text = f"""📊 <b>Bot Status Dashboard v5.0</b>
 
 🔧 <b>Current Account:</b> {current_account.account_name}
-📡 Channels: <b>{len(current_account.monitored_channels)}</b>
+📡 Channels: <b>{len(current_account.monitored_channels)}</b>{channels_debug}
 🔄 Monitoring: <b>{monitoring_status}</b>
 
 ⚙️ <b>Trading Settings:</b>
