@@ -3112,9 +3112,30 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🚀 Start All":
         # Start monitoring all accounts
         await update.message.reply_text("🚀 Starting all accounts...", parse_mode='HTML')
+        # TODO: Implement actual start all functionality
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        for acc in accs:
+            if acc.is_active:
+                try:
+                    # Set current account and start monitoring
+                    trading_bot.set_current_account(user_id, acc.account_id)
+                    success = await trading_bot.start_monitoring(user_id, context.bot)
+                    if success:
+                        await update.message.reply_text(f"✅ Started: {acc.account_name}", parse_mode='HTML')
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Failed: {acc.account_name} - {str(e)[:50]}", parse_mode='HTML')
 
     elif text == "🛑 Stop All":
         await update.message.reply_text("🛑 Stopping all accounts...", parse_mode='HTML')
+        # TODO: Implement actual stop all functionality
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        for acc in accs:
+            try:
+                trading_bot.active_monitoring[user_id] = False
+                trading_bot.monitoring_status[user_id] = False
+            except Exception:
+                pass
+        await update.message.reply_text("🛑 All monitoring stopped", parse_mode='HTML')
 
     elif text == "📋 All History":
         await update.message.reply_text("📋 Trade history across all accounts", parse_mode='HTML')
@@ -3183,11 +3204,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Account page buttons
     elif text == "🚀 Start":
         acc_name = context.user_data.get('current_account_name', 'this account')
-        await update.message.reply_text(f"🚀 Starting monitoring for {acc_name}", parse_mode='HTML')
+        await update.message.reply_text(f"🚀 Starting monitoring for {acc_name}...", parse_mode='HTML')
+        # Actually start monitoring
+        await start_monitoring(update, context)
 
     elif text == "🛑 Stop":
         acc_name = context.user_data.get('current_account_name', 'this account')
-        await update.message.reply_text(f"🛑 Stopped monitoring for {acc_name}", parse_mode='HTML')
+        await update.message.reply_text(f"🛑 Stopping monitoring for {acc_name}...", parse_mode='HTML')
+        # Actually stop monitoring
+        await stop_monitoring(update, context)
 
     elif text == "📋 History" and 'current_account_id' in context.user_data:
         await update.message.reply_text("📋 Trade history for this account", parse_mode='HTML')
