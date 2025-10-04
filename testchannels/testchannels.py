@@ -2533,6 +2533,27 @@ async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAUL
             parse_mode='HTML'
         )
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command - entry point for the bot"""
+    user_id = update.effective_user.id
+
+    # Check if user is already authenticated
+    if trading_bot.is_authenticated(user_id):
+        await update.message.reply_text(
+            "👋 <b>Welcome Back!</b>\n\n"
+            "You're already authenticated.\n"
+            "Choose an action from the menu:",
+            parse_mode='HTML',
+            reply_markup=trading_bot.main_menu
+        )
+    else:
+        await update.message.reply_text(
+            "🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\n"
+            "Welcome! To access the bot, please enter your PIN code:\n\n"
+            "🔑 Enter the 6-digit PIN code:",
+            parse_mode='HTML'
+        )
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle main menu button presses"""
     user_id = update.effective_user.id
@@ -4056,62 +4077,22 @@ account_conv_handler = ConversationHandler(
 
 def kill_existing_bot_instances():
     """Kill any existing bot instances to prevent conflicts"""
-    import time
-
-    print("🔍 Checking for existing bot instances...")
-
     try:
-        # Method 1: Try pgrep (Linux)
+        # Find processes running testchannels.py
         result = subprocess.run(['pgrep', '-f', 'testchannels.py'], capture_output=True, text=True)
         if result.returncode == 0:
             pids = result.stdout.strip().split('\n')
             for pid in pids:
-                if pid and pid != str(os.getpid()):
+                if pid and pid != str(os.getpid()):  # Don't kill ourselves
                     try:
-                        os.kill(int(pid), signal.SIGKILL)  # Force kill
+                        os.kill(int(pid), signal.SIGTERM)
                         print(f"🔄 Killed existing bot instance (PID: {pid})")
-                        time.sleep(1)
-                    except (ProcessLookupError, ValueError):
-                        pass
+                    except ProcessLookupError:
+                        pass  # Process already dead
                     except Exception as e:
                         print(f"⚠️ Could not kill process {pid}: {e}")
-
-        # Method 2: Search through all python processes
-        try:
-            ps_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
-            for line in ps_result.stdout.split('\n'):
-                if 'testchannels.py' in line and 'python' in line:
-                    parts = line.split()
-                    if len(parts) > 1:
-                        pid = parts[1]
-                        if pid.isdigit() and int(pid) != os.getpid():
-                            try:
-                                os.kill(int(pid), signal.SIGKILL)
-                                print(f"🔄 Killed bot process (PID: {pid})")
-                                time.sleep(1)
-                            except:
-                                pass
-        except Exception as e:
-            print(f"⚠️ ps method failed: {e}")
-
     except Exception as e:
         print(f"⚠️ Could not check for existing instances: {e}")
-
-    # Clear any webhook conflicts
-    try:
-        BOT_TOKEN_STR = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
-        import requests
-        webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN_STR}/deleteWebhook?drop_pending_updates=true"
-        response = requests.get(webhook_url, timeout=5)
-        if response.status_code == 200:
-            print("✅ Cleared existing webhooks")
-        time.sleep(1)
-    except Exception as e:
-        print(f"⚠️ Could not delete webhook: {e}")
-
-    # Wait before starting
-    time.sleep(3)
-    print("✅ Ready to start new instance")
 
 # ================== MAIN ==================
 
@@ -4126,7 +4107,10 @@ def main():
         application = Application.builder().token(BOT_TOKEN).build()
 
         # Enhanced static button handlers (no commands needed)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
+                # Add /start command handler
+        application.add_handler(CommandHandler("start", start))
+
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
         
         # Keep only essential conversation handlers for account setup
         application.add_handler(account_conv_handler)  # Enhanced multi-account handler
