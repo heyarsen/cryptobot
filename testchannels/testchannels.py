@@ -2539,17 +2539,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if trading_bot.is_authenticated(user_id):
         await update.message.reply_text("👋 <b>Welcome Back!</b>\n\nChoose an action:", parse_mode='HTML', reply_markup=trading_bot.main_menu)
     else:
-        await update.message.reply_text("🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nWelcome! Enter your PIN code:\n\n🔑 PIN:", parse_mode='HTML')
+        await update.message.reply_text("🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nWelcome! Enter PIN:", parse_mode='HTML')
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all buttons and PIN"""
+    """Handle buttons and PIN"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Authentication
+    # Auth
     if not trading_bot.is_authenticated(user_id):
         if trading_bot.authenticate_user(user_id, text):
-            await update.message.reply_text("✅ <b>Authenticated!</b>\n\nWelcome!", parse_mode='HTML', reply_markup=trading_bot.main_menu)
+            await update.message.reply_text("✅ Authenticated!", parse_mode='HTML', reply_markup=trading_bot.main_menu)
             return
         else:
             await update.message.reply_text("❌ Invalid PIN (496745):", parse_mode='HTML')
@@ -2564,16 +2564,17 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.user_data.get('state') == 'WAITING_BINGX_KEY':
         context.user_data['bingx_key'] = text
         context.user_data['state'] = 'WAITING_BINGX_SECRET'
-        await update.message.reply_text("🔑 API Key saved!\n\nSend BingX Secret Key:", parse_mode='HTML')
+        await update.message.reply_text("🔑 Saved! Send BingX Secret:", parse_mode='HTML')
         return
     elif context.user_data.get('state') == 'WAITING_BINGX_SECRET':
         account_name = context.user_data.get('account_name')
         api_key = context.user_data.get('bingx_key')
         secret = text
+        account_id = str(uuid.uuid4())
 
-        # Use AccountConfig (not TradingAccount)
+        # Create AccountConfig
         account = AccountConfig(
-            account_id=str(uuid.uuid4()),
+            account_id=account_id,
             account_name=account_name,
             bingx_api_key=api_key,
             bingx_secret_key=secret,
@@ -2590,19 +2591,32 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             signal_channels=[]
         )
 
-        if trading_bot.enhanced_db.create_account(account):
-            await update.message.reply_text(
-                f"✅ <b>Account Created!</b>\n\n📝 Name: {account_name}\n🆔 ID: {account.account_id[:8]}...",
-                parse_mode='HTML',
-                reply_markup=trading_bot.account_menu
-            )
-        else:
-            await update.message.reply_text("❌ Failed to create account.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
+        try:
+            # Save to database
+            result = trading_bot.enhanced_db.create_account(account)
+            if result:
+                # Verify it was saved
+                all_accounts = trading_bot.enhanced_db.get_all_accounts()
+                logger.info(f"Accounts in DB: {len(all_accounts)}")
+
+                await update.message.reply_text(
+                    f"✅ <b>Account Created!</b>\n\n"
+                    f"📝 Name: {account_name}\n"
+                    f"🆔 ID: {account_id[:8]}...\n\n"
+                    f"Total accounts: {len(all_accounts)}",
+                    parse_mode='HTML',
+                    reply_markup=trading_bot.account_menu
+                )
+            else:
+                await update.message.reply_text("❌ Database error. Check logs.", parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Failed to create account: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}", parse_mode='HTML')
 
         context.user_data.clear()
         return
 
-    # Main menu buttons
+    # Buttons
     if text == "🔑 Accounts":
         await handle_accounts_menu(update, context)
     elif text == "📊 Status":
@@ -2620,26 +2634,37 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🛑 Stop Trading":
         await handle_stop_trading(update, context)
     elif text == "🔙 Back to Main":
-        await update.message.reply_text("🏠 <b>Main Menu</b>", parse_mode='HTML', reply_markup=trading_bot.main_menu)
-
-    # Account menu buttons
+        await update.message.reply_text("🏠 Main Menu", parse_mode='HTML', reply_markup=trading_bot.main_menu)
     elif text == "➕ Add Account":
         await update.message.reply_text("➕ <b>Add Account</b>\n\nSend account name:", parse_mode='HTML')
         context.user_data['state'] = 'WAITING_ACCOUNT_NAME'
     elif text == "📋 List Accounts":
-        accounts = trading_bot.enhanced_db.get_all_accounts()
-        if not accounts:
-            await update.message.reply_text("📋 <b>No Accounts</b>\n\nUse ➕ Add Account.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
-        else:
-            msg = "📋 <b>Your Accounts</b>\n\n"
-            for acc in accounts:
-                status = "🟢" if acc.is_active else "🔴"
-                msg += f"{status} <b>{acc.account_name}</b>\n   🆔 {acc.account_id[:8]}...\n   📊 {acc.leverage}x | 💰 {acc.risk_percentage}%\n\n"
-            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=trading_bot.account_menu)
+        try:
+            accounts = trading_bot.enhanced_db.get_all_accounts()
+            logger.info(f"Retrieved {len(accounts)} accounts")
+
+            if not accounts:
+                await update.message.reply_text(
+                    "📋 <b>No Accounts</b>\n\nUse ➕ Add Account.",
+                    parse_mode='HTML',
+                    reply_markup=trading_bot.account_menu
+                )
+            else:
+                msg = f"📋 <b>Your Accounts ({len(accounts)})</b>\n\n"
+                for acc in accounts:
+                    status = "🟢" if acc.is_active else "🔴"
+                    msg += f"{status} <b>{acc.account_name}</b>\n"
+                    msg += f"   🆔 {acc.account_id[:8]}...\n"
+                    msg += f"   📊 {acc.leverage}x | 💰 {acc.risk_percentage}%\n\n"
+
+                await update.message.reply_text(msg, parse_mode='HTML', reply_markup=trading_bot.account_menu)
+        except Exception as e:
+            logger.error(f"Error listing accounts: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}", parse_mode='HTML')
     elif text == "⚙️ Account Settings":
-        await update.message.reply_text("⚙️ <b>Account Settings</b>\n\nConfigure leverage, TP/SL per account.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
+        await update.message.reply_text("⚙️ Settings per account", parse_mode='HTML', reply_markup=trading_bot.account_menu)
     elif text == "📡 Channels":
-        await update.message.reply_text("📡 <b>Channels</b>\n\nManage monitored channels.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
+        await update.message.reply_text("📡 Manage channels", parse_mode='HTML', reply_markup=trading_bot.account_menu)
 
 async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle accounts menu"""
@@ -4159,12 +4184,18 @@ def main():
 
         print("🤖 Enhanced Multi-Account Trading Bot v5.0")
         print("🔐 PIN: 496745")
-        print("💾 Database: enhancedtradingbot.db (persists across deploys)")
+        print("💾 Database: enhancedtradingbot.db")
         print("✅ All buttons working")
+        print("✅ Data persistence enabled")
         print("📊 Ready!")
 
         async def error_handler(update, context):
             logger.error(f"Error: {context.error}")
+            if update and update.message:
+                try:
+                    await update.message.reply_text(f"❌ Error: {str(context.error)[:100]}")
+                except:
+                    pass
             return True
 
         application.add_error_handler(error_handler)
