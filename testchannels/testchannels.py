@@ -2507,6 +2507,27 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 # ===================== STATIC BUTTON HANDLERS =====================
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command - entry point for the bot"""
+    user_id = update.effective_user.id
+
+    # Check if user is already authenticated
+    if trading_bot.is_authenticated(user_id):
+        await update.message.reply_text(
+            "👋 <b>Welcome Back!</b>\n\n"
+            "You're already authenticated.\n"
+            "Choose an action from the menu:",
+            parse_mode='HTML',
+            reply_markup=trading_bot.main_menu
+        )
+    else:
+        await update.message.reply_text(
+            "🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\n"
+            "Welcome! To access the bot, please enter your PIN code:\n\n"
+            "🔑 Enter the 6-digit PIN code:",
+            parse_mode='HTML'
+        )
+
 async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle PIN code authentication"""
     user_id = update.effective_user.id
@@ -4086,7 +4107,10 @@ def main():
         application = Application.builder().token(BOT_TOKEN).build()
 
         # Enhanced static button handlers (no commands needed)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
+                # Add /start command handler
+        application.add_handler(CommandHandler("start", start))
+
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
         
         # Keep only essential conversation handlers for account setup
         application.add_handler(account_conv_handler)  # Enhanced multi-account handler
