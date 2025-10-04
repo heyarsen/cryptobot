@@ -217,6 +217,14 @@ class AccountConfig:
     monitored_channels: List[int] = None
     signal_channels: List[int] = None
     
+    # Additional trading settings
+    use_signal_settings: bool = False
+    create_sl_tp: bool = True
+    make_webhook_enabled: bool = False
+    trailing_enabled: bool = False
+    trailing_activation_percent: float = 2.0
+    trailing_callback_percent: float = 0.5
+    
     def __post_init__(self):
         if self.monitored_channels is None:
             self.monitored_channels = []
@@ -495,9 +503,41 @@ class EnhancedDatabase:
                     take_profit_levels TEXT DEFAULT '[]',
                     stop_loss_levels TEXT DEFAULT '[]',
                     monitored_channels TEXT DEFAULT '[]',
-                    signal_channels TEXT DEFAULT '[]'
+                    signal_channels TEXT DEFAULT '[]',
+                    use_signal_settings BOOLEAN DEFAULT FALSE,
+                    create_sl_tp BOOLEAN DEFAULT TRUE,
+                    make_webhook_enabled BOOLEAN DEFAULT FALSE,
+                    trailing_enabled BOOLEAN DEFAULT FALSE,
+                    trailing_activation_percent REAL DEFAULT 2.0,
+                    trailing_callback_percent REAL DEFAULT 0.5
                 )
             ''')
+            
+            # Add new columns if they don't exist (for existing databases)
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN use_signal_settings BOOLEAN DEFAULT FALSE")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN create_sl_tp BOOLEAN DEFAULT TRUE")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN make_webhook_enabled BOOLEAN DEFAULT FALSE")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN trailing_enabled BOOLEAN DEFAULT FALSE")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN trailing_activation_percent REAL DEFAULT 2.0")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN trailing_callback_percent REAL DEFAULT 0.5")
+            except:
+                pass
             
             # Trade history table
             cursor.execute('''
@@ -605,8 +645,10 @@ class EnhancedDatabase:
                     default_symbol, auto_trade_enabled, use_percentage_balance,
                     balance_percentage, fixed_usdt_amount,
                     take_profit_levels, stop_loss_levels,
-                    monitored_channels, signal_channels
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    monitored_channels, signal_channels,
+                    use_signal_settings, create_sl_tp, make_webhook_enabled,
+                    trailing_enabled, trailing_activation_percent, trailing_callback_percent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
@@ -619,7 +661,9 @@ class EnhancedDatabase:
                 json.dumps([{'percentage': sl.percentage, 'close_percentage': sl.close_percentage} 
                            for sl in account.stop_loss_levels]),
                 json.dumps(account.monitored_channels),
-                json.dumps(account.signal_channels)
+                json.dumps(account.signal_channels),
+                account.use_signal_settings, account.create_sl_tp, account.make_webhook_enabled,
+                account.trailing_enabled, account.trailing_activation_percent, account.trailing_callback_percent
             ))
 
             conn.commit()
@@ -678,7 +722,13 @@ class EnhancedDatabase:
                         take_profit_levels=tp_levels,
                         stop_loss_levels=sl_levels,
                         monitored_channels=json.loads(row[19]) if row[19] else [],
-                        signal_channels=json.loads(row[20]) if row[20] else []
+                        signal_channels=json.loads(row[20]) if row[20] else [],
+                        use_signal_settings=bool(row[21]) if len(row) > 21 else False,
+                        create_sl_tp=bool(row[22]) if len(row) > 22 else True,
+                        make_webhook_enabled=bool(row[23]) if len(row) > 23 else False,
+                        trailing_enabled=bool(row[24]) if len(row) > 24 else False,
+                        trailing_activation_percent=float(row[25]) if len(row) > 25 else 2.0,
+                        trailing_callback_percent=float(row[26]) if len(row) > 26 else 0.5
                     )
                     accounts.append(account)
                 except Exception as e:
@@ -770,10 +820,14 @@ class EnhancedDatabase:
 
     def update_account_settings(self, account_id: str, **kwargs) -> bool:
         """Update basic scalar settings on an account row.
-        Allowed keys: leverage, risk_percentage, use_percentage_balance, balance_percentage, fixed_usdt_amount
+        Allowed keys: leverage, risk_percentage, use_percentage_balance, balance_percentage, fixed_usdt_amount,
+        use_signal_settings, create_sl_tp, make_webhook_enabled, trailing_enabled, 
+        trailing_activation_percent, trailing_callback_percent
         """
         allowed = {
-            'leverage', 'risk_percentage', 'use_percentage_balance', 'balance_percentage', 'fixed_usdt_amount'
+            'leverage', 'risk_percentage', 'use_percentage_balance', 'balance_percentage', 'fixed_usdt_amount',
+            'use_signal_settings', 'create_sl_tp', 'make_webhook_enabled', 'trailing_enabled',
+            'trailing_activation_percent', 'trailing_callback_percent'
         }
         set_clauses = []
         values: List[Any] = []
@@ -1737,6 +1791,13 @@ class TradingBot:
                     ]
                 # Channels
                 config.monitored_channels = [str(cid) for cid in (current_account.monitored_channels or [])]
+                # Additional settings
+                config.use_signal_settings = bool(current_account.use_signal_settings)
+                config.create_sl_tp = bool(current_account.create_sl_tp)
+                config.make_webhook_enabled = bool(current_account.make_webhook_enabled)
+                config.trailing_enabled = bool(current_account.trailing_enabled)
+                config.trailing_activation_percent = float(current_account.trailing_activation_percent)
+                config.trailing_callback_percent = float(current_account.trailing_callback_percent)
         except Exception as e:
             logger.warning(f"⚠️ Failed to overlay account config: {e}")
         return config
@@ -3060,17 +3121,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📈 Active trades for this account", parse_mode='HTML')
 
     elif text == "⚙️ Settings" and 'current_account_id' in context.user_data:
-        acc_id = context.user_data.get('current_account_id')
-        accs = trading_bot.enhanced_db.get_all_accounts()
-        acc = next((a for a in accs if a.account_id == acc_id), None)
-        if acc:
-            msg = f"⚙️ <b>Settings: {acc.account_name}</b>\n\n"
-            msg += f"📊 Leverage: {acc.leverage}x\n"
-            msg += f"💰 Risk: {acc.risk_percentage}%\n"
-            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_settings_menu())
+        # This will be handled by the conversation handler
+        pass
 
     elif text == "📡 Channels" and 'current_account_id' in context.user_data:
-        await update.message.reply_text("📡 <b>Channel Management</b>\n\nAdd channels to monitor", parse_mode='HTML')
+        # This will be handled by the conversation handler
+        pass
 
     elif text == "🔙 Account":
         acc_name = context.user_data.get('current_account_name', 'Account')
@@ -3942,6 +3998,13 @@ Next: /start_monitoring""",
 
     elif query.data == "toggle_settings_source":
         config.use_signal_settings = not config.use_signal_settings
+        # Persist to database
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_signal_settings=config.use_signal_settings)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist settings source: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
             render_trading_config_text(user_id),
@@ -3951,6 +4014,13 @@ Next: /start_monitoring""",
 
     elif query.data == "toggle_sl_tp":
         config.create_sl_tp = not config.create_sl_tp
+        # Persist to database
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, create_sl_tp=config.create_sl_tp)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist SL/TP setting: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
             render_trading_config_text(user_id),
@@ -3960,6 +4030,13 @@ Next: /start_monitoring""",
 
     elif query.data == "toggle_webhook":
         config.make_webhook_enabled = not config.make_webhook_enabled
+        # Persist to database
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, make_webhook_enabled=config.make_webhook_enabled)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist webhook setting: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
             render_trading_config_text(user_id),
@@ -4008,9 +4085,16 @@ Next: /start_monitoring""",
 
     elif query.data == "toggle_trailing":
         config.trailing_enabled = not config.trailing_enabled
+        # Persist to database
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, trailing_enabled=config.trailing_enabled)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist trailing setting: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
         await query.edit_message_text(
-            "⚙️ <b>Trading Configuration</b>\n\nConfigure parameters:",
+            render_trading_config_text(user_id),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -4067,6 +4151,13 @@ Next: /start_monitoring""",
             )
             return WAITING_USDT_AMOUNT
         else:
+            # Persist the toggle to database
+            try:
+                current_account = trading_bot.get_current_account(user_id)
+                if current_account:
+                    trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_percentage_balance=not config.use_fixed_usdt_amount)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist trade amount mode: {e}")
             keyboard_markup = create_settings_keyboard(user_id)
             await query.edit_message_text(
                 render_trading_config_text(user_id),
@@ -4233,6 +4324,12 @@ async def handle_trailing_activation(update: Update, context: ContextTypes.DEFAU
         if value <= 0 or value > 50:
             raise ValueError("out of range")
         config.trailing_activation_percent = value
+        # Persist to database
+        try:
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, trailing_activation_percent=value)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist trailing activation: {e}")
         await update.message.reply_text(f"✅ <b>Trailing Activation:</b> {value}%", parse_mode='HTML')
     except Exception:
         await update.message.reply_text("❌ Invalid percentage!", parse_mode='HTML')
@@ -4247,6 +4344,12 @@ async def handle_trailing_callback(update: Update, context: ContextTypes.DEFAULT
         if value <= 0 or value > 50:
             raise ValueError("out of range")
         config.trailing_callback_percent = value
+        # Persist to database
+        try:
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, trailing_callback_percent=value)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist trailing callback: {e}")
         await update.message.reply_text(f"✅ <b>Trailing Callback:</b> {value}%", parse_mode='HTML')
     except Exception:
         await update.message.reply_text("❌ Invalid percentage!", parse_mode='HTML')
@@ -4680,8 +4783,17 @@ telegram_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
+async def channels_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for channels button press"""
+    if update.message and update.message.text == "📡 Channels" and 'current_account_id' in context.user_data:
+        return await setup_channels(update, context)
+    return ConversationHandler.END
+
 channel_conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('setup_channels', setup_channels)],
+    entry_points=[
+        CommandHandler('setup_channels', setup_channels),
+        MessageHandler(filters.Regex(r'^📡 Channels$'), channels_button_entry)
+    ],
     states={
         WAITING_CHANNEL_SELECTION: [
             CallbackQueryHandler(handle_channel_selection),
@@ -4693,8 +4805,24 @@ channel_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
+async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for settings button press"""
+    if update.message and update.message.text == "⚙️ Settings" and 'current_account_id' in context.user_data:
+        user_id = update.effective_user.id
+        keyboard_markup = create_settings_keyboard(user_id)
+        await update.message.reply_text(
+            render_trading_config_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+        return WAITING_SETTINGS_SOURCE
+    return ConversationHandler.END
+
 trading_conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('setup_trading', setup_trading)],
+    entry_points=[
+        CommandHandler('setup_trading', setup_trading),
+        MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)
+    ],
     states={
         WAITING_SETTINGS_SOURCE: [CallbackQueryHandler(handle_trading_settings)],
         WAITING_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_leverage)],
@@ -4759,15 +4887,15 @@ def main():
     try:
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Enhanced static button handler
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
-
-        # Conversation handlers (enable full settings/channel flows)
+        # Conversation handlers (enable full settings/channel flows) - must be before main menu handler
         application.add_handler(account_conv_handler)
         application.add_handler(binance_conv_handler)
         application.add_handler(telegram_conv_handler)
         application.add_handler(channel_conv_handler)
         application.add_handler(trading_conv_handler)
+
+        # Enhanced static button handler (catch-all for remaining messages)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
 
         print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
         print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
