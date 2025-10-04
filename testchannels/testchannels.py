@@ -24,6 +24,8 @@ import os
 import sys
 import traceback
 import requests
+import subprocess
+import signal
 
 # Import python-telegram-bot
 from telegram import (
@@ -181,7 +183,7 @@ class StopLossLevel:
     """Individual stop loss level configuration"""
     percentage: float  # Price percentage (e.g., 2.0 for 2%)
     close_percentage: float  # Percentage of position to close (e.g., 100.0 for 100%)
-    
+
 @dataclass
 class AccountConfig:
     """Enhanced configuration for a trading account"""
@@ -1301,6 +1303,7 @@ class TradingBot:
         # User session management
         self.authenticated_users: Dict[int, bool] = {}
         self.current_accounts: Dict[int, str] = {}  # user_id -> account_id
+        self.monitoring_status: Dict[int, bool] = {}  # Track monitoring status per user
         
         # Enhanced main menu
         self.main_menu = ReplyKeyboardMarkup(
@@ -2608,11 +2611,19 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # Get monitoring status
+    is_monitoring = trading_bot.monitoring_status.get(user_id, False)
+    monitoring_status = "🟢 Active" if is_monitoring else "🔴 Inactive"
+    
+    # Get active trades count
+    active_trades = trading_bot.enhanced_db.get_active_trades(current_account.account_id)
+    active_trades_count = len(active_trades)
+    
     status_text = f"""📊 <b>Bot Status Dashboard v5.0</b>
 
 🔧 <b>Current Account:</b> {current_account.account_name}
 📡 Channels: <b>{len(current_account.monitored_channels)}</b>
-🔄 Monitoring: {'🟢 Active' if trading_bot.active_monitoring.get(user_id) else '🔴 Inactive'}
+🔄 Monitoring: <b>{monitoring_status}</b>
 
 ⚙️ <b>Trading Settings:</b>
 ⚡ Leverage: <b>{current_account.leverage}x</b>
@@ -2620,7 +2631,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🎯 Take Profits: <b>{len(current_account.take_profit_levels)} levels</b>
 🛑 Stop Losses: <b>{len(current_account.stop_loss_levels)} levels</b>
 
-📍 <b>Active Positions:</b> {len(trading_bot.active_positions)}
+📍 <b>Active Positions:</b> {active_trades_count}
 
 ✅ <b>Features:</b>
 • Multi-account support
@@ -2730,7 +2741,7 @@ async def handle_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def handle_start_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle start trading"""
+    """Handle start trading with duplicate prevention"""
     user_id = update.effective_user.id
     current_account = trading_bot.get_current_account(user_id)
     
@@ -2742,22 +2753,111 @@ async def handle_start_trading(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
     
-    await update.message.reply_text(
-        "🚀 <b>Starting Trading...</b>\n\n"
-        "Monitoring channels and executing trades...",
-        parse_mode='HTML'
-    )
+    # Check if already monitoring
+    if trading_bot.monitoring_status.get(user_id, False):
+        await update.message.reply_text(
+            "⚠️ <b>Already Monitoring!</b>\n\n"
+            "Trading is already active for this account.\n"
+            "Use 'Stop Trading' to stop first.",
+            parse_mode='HTML'
+        )
+        return
+    
+    # Check if account has channels configured
+    if not current_account.monitored_channels:
+        await update.message.reply_text(
+            "❌ <b>No Channels Configured</b>\n\n"
+            "Please add channels to monitor first.\n"
+            "Go to Accounts → Account Settings → Channels",
+            parse_mode='HTML'
+        )
+        return
+    
+    try:
+        # Start monitoring
+        success = await trading_bot.start_monitoring(user_id, context.bot)
+        
+        if success:
+            trading_bot.monitoring_status[user_id] = True
+            await update.message.reply_text(
+                f"🚀 <b>Trading Started Successfully!</b>\n\n"
+                f"Account: <b>{current_account.account_name}</b>\n"
+                f"Channels: <b>{len(current_account.monitored_channels)}</b>\n"
+                f"Leverage: <b>{current_account.leverage}x</b>\n"
+                f"Balance: <b>{'Percentage' if current_account.use_percentage_balance else 'Fixed USDT'}</b>\n\n"
+                f"✅ Monitoring active\n"
+                f"🎯 Ready to execute trades",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ <b>Failed to Start Trading</b>\n\n"
+                "Please check your account configuration and try again.",
+                parse_mode='HTML'
+            )
+    except Exception as e:
+        logger.error(f"Error starting trading: {e}")
+        await update.message.reply_text(
+            "❌ <b>Error Starting Trading</b>\n\n"
+            f"Error: {str(e)[:100]}",
+            parse_mode='HTML'
+        )
 
 async def handle_stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle stop trading"""
+    """Handle stop trading with proper cleanup"""
     user_id = update.effective_user.id
-    trading_bot.active_monitoring[user_id] = False
+    current_account = trading_bot.get_current_account(user_id)
     
-    await update.message.reply_text(
-        "🛑 <b>Trading Stopped!</b>\n\n"
-        "All monitoring and trading activities have been stopped.",
-        parse_mode='HTML'
-    )
+    # Check if monitoring is active
+    if not trading_bot.monitoring_status.get(user_id, False):
+        await update.message.reply_text(
+            "⚠️ <b>Not Currently Monitoring</b>\n\n"
+            "Trading is not active for this account.",
+            parse_mode='HTML'
+        )
+        return
+    
+    try:
+        # Stop monitoring
+        trading_bot.active_monitoring[user_id] = False
+        trading_bot.monitoring_status[user_id] = False
+        
+        # Stop any running monitoring tasks
+        if user_id in trading_bot.monitoring_tasks:
+            task = trading_bot.monitoring_tasks[user_id]
+            if not task.done():
+                task.cancel()
+            del trading_bot.monitoring_tasks[user_id]
+        
+        # Close telethon client if exists
+        if user_id in trading_bot.user_monitoring_clients:
+            try:
+                client = trading_bot.user_monitoring_clients[user_id]
+                if client.is_connected():
+                    await client.disconnect()
+                del trading_bot.user_monitoring_clients[user_id]
+            except Exception as e:
+                logger.error(f"Error closing telethon client: {e}")
+        
+        account_name = current_account.account_name if current_account else "Unknown"
+        
+        await update.message.reply_text(
+            f"🛑 <b>Trading Stopped Successfully!</b>\n\n"
+            f"Account: <b>{account_name}</b>\n"
+            f"✅ Monitoring stopped\n"
+            f"✅ Channels disconnected\n"
+            f"✅ Tasks cancelled\n\n"
+            f"All trading activities have been stopped.",
+            parse_mode='HTML'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error stopping trading: {e}")
+        await update.message.reply_text(
+            "❌ <b>Error Stopping Trading</b>\n\n"
+            f"Error: {str(e)[:100]}",
+            parse_mode='HTML'
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = f"""<b>📖 All Commands</b>
@@ -3952,34 +4052,80 @@ account_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
+# ================== UTILITY FUNCTIONS ==================
+
+def kill_existing_bot_instances():
+    """Kill any existing bot instances to prevent conflicts"""
+    try:
+        # Find processes running testchannels.py
+        result = subprocess.run(['pgrep', '-f', 'testchannels.py'], capture_output=True, text=True)
+        if result.returncode == 0:
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                if pid and pid != str(os.getpid()):  # Don't kill ourselves
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                        print(f"🔄 Killed existing bot instance (PID: {pid})")
+                    except ProcessLookupError:
+                        pass  # Process already dead
+                    except Exception as e:
+                        print(f"⚠️ Could not kill process {pid}: {e}")
+    except Exception as e:
+        print(f"⚠️ Could not check for existing instances: {e}")
+
 # ================== MAIN ==================
 
 def main():
     """Start the enhanced bot with static button interface"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Enhanced static button handlers (no commands needed)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
+    # Kill any existing bot instances to prevent conflicts
+    kill_existing_bot_instances()
     
-    # Keep only essential conversation handlers for account setup
-    application.add_handler(account_conv_handler)  # Enhanced multi-account handler
+    try:
+        application = Application.builder().token(BOT_TOKEN).build()
 
-    print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
-    print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
-    print("🔐 PIN Protection: ENABLED (496745)")
-    print("✅ NEW: Individual account settings")
-    print("✅ NEW: Advanced TP/SL management")
-    print("✅ NEW: Trade history tracking")
-    print("✅ NEW: PIN code protection")
-    print("✅ NEW: Static button interface")
-    print("✅ NEW: Balance configuration options")
-    print("✅ NEW: Multiple stop loss levels")
-    print("✅ NEW: Enhanced user experience")
-    print("📊 Ready! Use PIN code 496745 to access")
-    
-    application.run_polling()
+        # Enhanced static button handlers (no commands needed)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
+        
+        # Keep only essential conversation handlers for account setup
+        application.add_handler(account_conv_handler)  # Enhanced multi-account handler
+
+        print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
+        print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
+        print("🔐 PIN Protection: ENABLED (496745)")
+        print("✅ NEW: Individual account settings")
+        print("✅ NEW: Advanced TP/SL management")
+        print("✅ NEW: Trade history tracking")
+        print("✅ NEW: PIN code protection")
+        print("✅ NEW: Static button interface")
+        print("✅ NEW: Balance configuration options")
+        print("✅ NEW: Multiple stop loss levels")
+        print("✅ NEW: Enhanced user experience")
+        print("✅ FIXED: Duplicate monitoring prevention")
+        print("✅ FIXED: Proper stop monitoring")
+        print("✅ FIXED: Bot instance conflicts")
+        print("📊 Ready! Use PIN code 496745 to access")
+        
+        # Add error handler for conflicts
+        async def error_handler(update, context):
+            logger.error(f"Update {update} caused error {context.error}")
+            if "Conflict" in str(context.error):
+                print("⚠️ Bot instance conflict detected. Please stop other instances.")
+            return True
+        
+        application.add_error_handler(error_handler)
+        
+        application.run_polling()
+        
+    except Exception as e:
+        print(f"❌ Error starting bot: {e}")
+        if "Conflict" in str(e):
+            print("⚠️ Another bot instance is running. Please stop it first.")
+        print("🔄 Retrying in 5 seconds...")
+        import time
+        time.sleep(5)
+        main()  # Retry
 
 if __name__ == '__main__':
     main()
