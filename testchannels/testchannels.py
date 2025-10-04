@@ -582,108 +582,69 @@ class EnhancedDatabase:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-
-            # Ensure timestamps are set
-            if not account.created_at:
-                account.created_at = datetime.now().isoformat()
-            if not account.last_used:
-                account.last_used = datetime.now().isoformat()
-
+            
             cursor.execute('''
                 INSERT OR REPLACE INTO accounts (
                     account_id, account_name, bingx_api_key, bingx_secret_key,
                     telegram_api_id, telegram_api_hash, phone, is_active,
                     created_at, last_used, leverage, risk_percentage,
-                    default_symbol, auto_trade_enabled, use_percentage_balance,
-                    balance_percentage, fixed_usdt_amount,
-                    take_profit_levels, stop_loss_levels,
-                    monitored_channels, signal_channels
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    default_symbol, auto_trade_enabled, monitored_channels, signal_channels
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
                 account.phone, account.is_active, account.created_at, account.last_used,
                 account.leverage, account.risk_percentage, account.default_symbol,
-                account.auto_trade_enabled, account.use_percentage_balance,
-                account.balance_percentage, account.fixed_usdt_amount,
-                json.dumps([{'percentage': tp.percentage, 'close_percentage': tp.close_percentage} 
-                           for tp in account.take_profit_levels]),
-                json.dumps([{'percentage': sl.percentage, 'close_percentage': sl.close_percentage} 
-                           for sl in account.stop_loss_levels]),
-                json.dumps(account.monitored_channels),
+                account.auto_trade_enabled, json.dumps(account.monitored_channels),
                 json.dumps(account.signal_channels)
             ))
-
+            
             conn.commit()
             conn.close()
-            logger.info(f"✅ Account {account.account_name} created successfully in database")
+            logger.info(f"✅ Account {account.account_name} created successfully")
             return True
+            
         except Exception as e:
             logger.error(f"❌ Failed to create account: {e}")
             return False
-
-
+    
     def get_all_accounts(self) -> List[AccountConfig]:
         """Get all active accounts"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            
             cursor.execute('SELECT * FROM accounts WHERE is_active = TRUE')
             rows = cursor.fetchall()
             conn.close()
-
+            
             accounts = []
             for row in rows:
-                try:
-                    # Parse TP levels
-                    tp_levels = []
-                    if row[17]:  # take_profit_levels column
-                        tp_data = json.loads(row[17])
-                        tp_levels = [TakeProfitLevel(tp['percentage'], tp['close_percentage']) 
-                                    for tp in tp_data]
-
-                    # Parse SL levels
-                    sl_levels = []
-                    if row[18]:  # stop_loss_levels column
-                        sl_data = json.loads(row[18])
-                        sl_levels = [StopLossLevel(sl['percentage'], sl['close_percentage']) 
-                                    for sl in sl_data]
-
-                    account = AccountConfig(
-                        account_id=row[0],
-                        account_name=row[1],
-                        bingx_api_key=row[2],
-                        bingx_secret_key=row[3],
-                        telegram_api_id=row[4],
-                        telegram_api_hash=row[5],
-                        phone=row[6],
-                        is_active=bool(row[7]),
-                        created_at=row[8],
-                        last_used=row[9],
-                        leverage=row[10],
-                        risk_percentage=row[11],
-                        default_symbol=row[12],
-                        auto_trade_enabled=bool(row[13]),
-                        use_percentage_balance=bool(row[14]),
-                        balance_percentage=row[15],
-                        fixed_usdt_amount=row[16],
-                        take_profit_levels=tp_levels,
-                        stop_loss_levels=sl_levels,
-                        monitored_channels=json.loads(row[19]) if row[19] else [],
-                        signal_channels=json.loads(row[20]) if row[20] else []
-                    )
-                    accounts.append(account)
-                except Exception as e:
-                    logger.error(f"❌ Error parsing account row: {e}")
-                    continue
-
-            logger.info(f"✅ Retrieved {len(accounts)} accounts from database")
+                accounts.append(AccountConfig(
+                    account_id=row[0],
+                    account_name=row[1],
+                    bingx_api_key=row[2],
+                    bingx_secret_key=row[3],
+                    telegram_api_id=row[4],
+                    telegram_api_hash=row[5],
+                    phone=row[6],
+                    is_active=bool(row[7]),
+                    created_at=row[8],
+                    last_used=row[9],
+                    leverage=row[10],
+                    risk_percentage=row[11],
+                    default_symbol=row[12],
+                    auto_trade_enabled=bool(row[13]),
+                    monitored_channels=json.loads(row[14]) if row[14] else [],
+                    signal_channels=json.loads(row[15]) if row[15] else []
+                ))
+            
             return accounts
+            
         except Exception as e:
             logger.error(f"❌ Failed to get accounts: {e}")
             return []
-
-
+    
     def create_channel(self, channel: ChannelConfig) -> bool:
         """Create or update a channel configuration"""
         try:
@@ -1369,27 +1330,6 @@ class TradingBot:
             resize_keyboard=True
         )
     
-
-    def load_accounts_from_db(self):
-        """Load all accounts from database on startup"""
-        try:
-            accounts = self.enhanced_db.get_all_accounts()
-            logger.info(f"📂 Loading {len(accounts)} accounts from database...")
-
-            for account in accounts:
-                logger.info(f"✅ Loaded account: {account.account_name} ({account.account_id})")
-
-            return accounts
-        except Exception as e:
-            logger.error(f"❌ Error loading accounts from database: {e}")
-            return []
-
-
-        # Load existing accounts from database
-        logger.info("🔄 Loading accounts from database...")
-        loaded_accounts = self.load_accounts_from_db()
-        logger.info(f"✅ Loaded {len(loaded_accounts)} accounts")
-
     def authenticate_user(self, user_id: int, pin_code: str) -> bool:
         """Authenticate user with PIN code"""
         if pin_code == BOT_PIN_CODE:
