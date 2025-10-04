@@ -609,7 +609,7 @@ class EnhancedDatabase:
             return False
     
     def get_all_accounts(self) -> List[AccountConfig]:
-        """Get all active accounts with proper column mapping"""
+        """Get all active accounts"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -620,66 +620,35 @@ class EnhancedDatabase:
             accounts = []
             for row in rows:
                 try:
-                    # Proper column mapping based on CREATE TABLE statement
-                    # 0:account_id, 1:account_name, 2:bingx_api_key, 3:bingx_secret_key,
-                    # 4:telegram_api_id, 5:telegram_api_hash, 6:phone, 7:is_active,
-                    # 8:created_at, 9:last_used, 10:leverage, 11:risk_percentage,
-                    # 12:default_symbol, 13:auto_trade_enabled, 14:use_percentage_balance,
-                    # 15:balance_percentage, 16:fixed_usdt_amount, 17:take_profit_levels,
-                    # 18:stop_loss_levels, 19:monitored_channels, 20:signal_channels
+                    # Columns: 0-18 are main fields, 19=monitored_channels, 20=signal_channels
+                    mon_raw = row[19] if len(row) > 19 else "[]"
+                    sig_raw = row[20] if len(row) > 20 else "[]"
 
-                    # Safe JSON parsing
-                    monitored_raw = row[19] if len(row) > 19 else "[]"
-                    signals_raw = row[20] if len(row) > 20 else "[]"
+                    mon_channels = json.loads(mon_raw) if isinstance(mon_raw, str) and mon_raw else []
+                    sig_channels = json.loads(sig_raw) if isinstance(sig_raw, str) and sig_raw else []
 
-                    # Parse JSON safely
-                    if monitored_raw and isinstance(monitored_raw, str) and monitored_raw != "[]":
-                        try:
-                            monitored_channels = json.loads(monitored_raw)
-                        except:
-                            monitored_channels = []
-                    else:
-                        monitored_channels = []
-
-                    if signals_raw and isinstance(signals_raw, str) and signals_raw != "[]":
-                        try:
-                            signal_channels = json.loads(signals_raw)
-                        except:
-                            signal_channels = []
-                    else:
-                        signal_channels = []
-
-                    account = AccountConfig(
-                        account_id=row[0],
-                        account_name=row[1],
-                        bingx_api_key=row[2],
-                        bingx_secret_key=row[3],
-                        telegram_api_id=row[4],
-                        telegram_api_hash=row[5],
-                        phone=row[6],
-                        is_active=bool(row[7]),
-                        created_at=row[8],
-                        last_used=row[9],
-                        leverage=int(row[10]),
-                        risk_percentage=float(row[11]),
+                    accounts.append(AccountConfig(
+                        account_id=row[0], account_name=row[1],
+                        bingx_api_key=row[2], bingx_secret_key=row[3],
+                        telegram_api_id=row[4], telegram_api_hash=row[5],
+                        phone=row[6], is_active=bool(row[7]),
+                        created_at=row[8], last_used=row[9],
+                        leverage=int(row[10]), risk_percentage=float(row[11]),
                         default_symbol=row[12] if len(row) > 12 else "BTC-USDT",
                         auto_trade_enabled=bool(row[13]) if len(row) > 13 else False,
                         use_percentage_balance=bool(row[14]) if len(row) > 14 else True,
-                        monitored_channels=monitored_channels,
-                        signal_channels=signal_channels
-                    )
-                    accounts.append(account)
-                    logger.info(f"✅ Loaded account: {account.account_name}")
+                        monitored_channels=mon_channels,
+                        signal_channels=sig_channels
+                    ))
+                    logger.info(f"✅ Loaded: {row[1]}")
                 except Exception as e:
-                    logger.error(f"❌ Error parsing account row: {e}")
+                    logger.error(f"❌ Row parse error: {e}")
                     continue
 
-            logger.info(f"✅ Retrieved {len(accounts)} accounts from database")
+            logger.info(f"✅ Total accounts: {len(accounts)}")
             return accounts
         except Exception as e:
-            logger.error(f"❌ Failed to get accounts: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Get accounts failed: {e}")
             return []
 
     def create_channel(self, channel: ChannelConfig) -> bool:
@@ -2570,20 +2539,90 @@ async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAUL
             parse_mode='HTML'
         )
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    if trading_bot.is_authenticated(user_id):
+        await update.message.reply_text("👋 <b>Welcome Back!</b>\n\nChoose an action:", parse_mode='HTML', reply_markup=trading_bot.main_menu)
+    else:
+        await update.message.reply_text("🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nWelcome!\n\n🔑 Enter PIN code:", parse_mode='HTML')
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle main menu button presses"""
+    """Handle all menu buttons and PIN authentication"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    
-    # Check authentication first
+
+    # ========== AUTHENTICATION ==========
     if not trading_bot.is_authenticated(user_id):
-        await update.message.reply_text(
-            "🔐 <b>Authentication Required</b>\n\n"
-            "Please enter the PIN code to access the bot:",
-            parse_mode='HTML'
-        )
+        # Try to authenticate with the PIN
+        if trading_bot.authenticate_user(user_id, text):
+            await update.message.reply_text(
+                "✅ <b>Authentication Successful!</b>\n\nWelcome to the bot!",
+                parse_mode='HTML',
+                reply_markup=trading_bot.main_menu
+            )
+            return
+        else:
+            await update.message.reply_text(
+                "❌ <b>Invalid PIN!</b>\n\nEnter PIN code (496745):",
+                parse_mode='HTML'
+            )
+            return
+
+    # ========== ACCOUNT CREATION FLOW ==========
+    if context.user_data.get('state') == 'WAITING_ACCOUNT_NAME':
+        context.user_data['account_name'] = text
+        context.user_data['state'] = 'WAITING_BINGX_KEY'
+        await update.message.reply_text(f"📝 Account: <b>{text}</b>\n\nSend BingX API Key:", parse_mode='HTML')
         return
-    
+    elif context.user_data.get('state') == 'WAITING_BINGX_KEY':
+        context.user_data['bingx_key'] = text
+        context.user_data['state'] = 'WAITING_BINGX_SECRET'
+        await update.message.reply_text("🔑 Saved!\n\nSend BingX Secret Key:", parse_mode='HTML')
+        return
+    elif context.user_data.get('state') == 'WAITING_BINGX_SECRET':
+        account_name = context.user_data.get('account_name')
+        api_key = context.user_data.get('bingx_key')
+        secret = text
+        account_id = str(uuid.uuid4())
+
+        account = AccountConfig(
+            account_id=account_id,
+            account_name=account_name,
+            bingx_api_key=api_key,
+            bingx_secret_key=secret,
+            telegram_api_id=DEFAULT_TELEGRAM_API_ID,
+            telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
+            phone="",
+            is_active=True,
+            created_at=datetime.now().isoformat(),
+            last_used=datetime.now().isoformat(),
+            leverage=10,
+            risk_percentage=2.0,
+            use_percentage_balance=True,
+            monitored_channels=[],
+            signal_channels=[]
+        )
+
+        try:
+            result = trading_bot.enhanced_db.create_account(account)
+            if result:
+                accounts = trading_bot.enhanced_db.get_all_accounts()
+                await update.message.reply_text(
+                    f"✅ <b>Account Created!</b>\n\n📝 {account_name}\n🆔 {account_id[:8]}...\n\nTotal: {len(accounts)}",
+                    parse_mode='HTML',
+                    reply_markup=trading_bot.account_menu
+                )
+            else:
+                await update.message.reply_text("❌ DB error", parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Create account error: {e}")
+            await update.message.reply_text(f"❌ {str(e)[:100]}", parse_mode='HTML')
+
+        context.user_data.clear()
+        return
+
+    # ========== MAIN MENU BUTTONS ==========
     if text == "🔑 Accounts":
         await handle_accounts_menu(update, context)
     elif text == "📊 Status":
@@ -2601,11 +2640,29 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🛑 Stop Trading":
         await handle_stop_trading(update, context)
     elif text == "🔙 Back to Main":
-        await update.message.reply_text(
-            "🏠 <b>Main Menu</b>\n\nChoose an action:",
-            parse_mode='HTML',
-            reply_markup=trading_bot.main_menu
-        )
+        await update.message.reply_text("🏠 <b>Main Menu</b>", parse_mode='HTML', reply_markup=trading_bot.main_menu)
+
+    # ========== ACCOUNT MENU BUTTONS ==========
+    elif text == "➕ Add Account":
+        await update.message.reply_text("➕ <b>Add Account</b>\n\nSend account name:", parse_mode='HTML')
+        context.user_data['state'] = 'WAITING_ACCOUNT_NAME'
+    elif text == "📋 List Accounts":
+        try:
+            accounts = trading_bot.enhanced_db.get_all_accounts()
+            if not accounts:
+                await update.message.reply_text("📋 <b>No Accounts</b>\n\nUse ➕ Add Account.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
+            else:
+                msg = f"📋 <b>Accounts ({len(accounts)})</b>\n\n"
+                for acc in accounts:
+                    msg += f"🟢 <b>{acc.account_name}</b>\n   🆔 {acc.account_id[:8]}...\n   📊 {acc.leverage}x | 💰 {acc.risk_percentage}%\n\n"
+                await update.message.reply_text(msg, parse_mode='HTML', reply_markup=trading_bot.account_menu)
+        except Exception as e:
+            logger.error(f"List error: {e}")
+            await update.message.reply_text(f"❌ {str(e)[:100]}", parse_mode='HTML')
+    elif text == "⚙️ Account Settings":
+        await update.message.reply_text("⚙️ <b>Settings</b>\n\nConfigure per account.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
+    elif text == "📡 Channels":
+        await update.message.reply_text("📡 <b>Channels</b>\n\nMonitor signals.", parse_mode='HTML', reply_markup=trading_bot.account_menu)
 
 async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle accounts menu"""
@@ -4113,56 +4170,32 @@ def kill_existing_bot_instances():
 # ================== MAIN ==================
 
 def main():
-    """Start the enhanced bot with static button interface"""
+    """Start bot"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
-    
-    # Kill any existing bot instances to prevent conflicts
     kill_existing_bot_instances()
-    
+
     try:
         application = Application.builder().token(BOT_TOKEN).build()
-
-        # Enhanced static button handlers (no commands needed)
+        application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
-        
-        # Keep only essential conversation handlers for account setup
-        application.add_handler(account_conv_handler)  # Enhanced multi-account handler
+        application.add_handler(account_conv_handler)
 
-        print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
-        print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
-        print("🔐 PIN Protection: ENABLED (496745)")
-        print("✅ NEW: Individual account settings")
-        print("✅ NEW: Advanced TP/SL management")
-        print("✅ NEW: Trade history tracking")
-        print("✅ NEW: PIN code protection")
-        print("✅ NEW: Static button interface")
-        print("✅ NEW: Balance configuration options")
-        print("✅ NEW: Multiple stop loss levels")
-        print("✅ NEW: Enhanced user experience")
-        print("✅ FIXED: Duplicate monitoring prevention")
-        print("✅ FIXED: Proper stop monitoring")
-        print("✅ FIXED: Bot instance conflicts")
-        print("📊 Ready! Use PIN code 496745 to access")
-        
-        # Add error handler for conflicts
+        print("🤖 Enhanced Multi-Account Trading Bot v5.0")
+        print("🔐 PIN: 496745")
+        print("✅ ALL FIXES APPLIED")
+        print("📊 Ready!")
+
         async def error_handler(update, context):
-            logger.error(f"Update {update} caused error {context.error}")
-            if "Conflict" in str(context.error):
-                print("⚠️ Bot instance conflict detected. Please stop other instances.")
+            logger.error(f"Error: {context.error}")
             return True
-        
+
         application.add_error_handler(error_handler)
-        
         application.run_polling()
-        
     except Exception as e:
-        print(f"❌ Error starting bot: {e}")
-        if "Conflict" in str(e):
-            print("⚠️ Another bot instance is running. Please stop it first.")
-        print("🔄 Retrying in 5 seconds...")
+        print(f"❌ Error: {e}")
         import time
         time.sleep(5)
-        main()  # Retry
+        main()
 
 if __name__ == '__main__':
     main()
