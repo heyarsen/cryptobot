@@ -1574,27 +1574,26 @@ class TradingBot:
              [KeyboardButton("📡 Channels"), KeyboardButton("🔙 Back to Main")]],
             resize_keyboard=True
         )
+        
+        # Load accounts from database on startup
+        logger.info("🔄 Loading accounts from database on startup...")
+        self.load_accounts_from_db()
+        logger.info("✅ Accounts loaded successfully")
     
 
     def load_accounts_from_db(self):
         """Load all accounts from database on startup"""
         try:
             accounts = self.enhanced_db.get_all_accounts()
-            logger.info(f"📂 Loading {len(accounts)} accounts from database...")
+            logger.info(f"📂 Loaded {len(accounts)} accounts from database")
 
             for account in accounts:
-                logger.info(f"✅ Loaded account: {account.account_name} ({account.account_id})")
+                logger.info(f"  ✅ {account.account_name} ({account.account_id[:8]}...)")
 
             return accounts
         except Exception as e:
             logger.error(f"❌ Error loading accounts from database: {e}")
             return []
-
-
-        # Load existing accounts from database
-        logger.info("🔄 Loading accounts from database...")
-        loaded_accounts = self.load_accounts_from_db()
-        logger.info(f"✅ Loaded {len(loaded_accounts)} accounts")
 
     def authenticate_user(self, user_id: int, pin_code: str) -> bool:
         """Authenticate user with PIN code"""
@@ -1608,11 +1607,12 @@ class TradingBot:
         return self.authenticated_users.get(user_id, False)
     
     def get_current_account(self, user_id: int) -> Optional[AccountConfig]:
-        """Get current account for user"""
+        """Get current account for user - always fresh from database"""
         account_id = self.current_accounts.get(user_id)
         if not account_id:
             return None
         
+        # Always reload from database to ensure we have latest settings
         accounts = self.enhanced_db.get_all_accounts()
         for account in accounts:
             if account.account_id == account_id:
@@ -2817,7 +2817,10 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 def render_trading_config_text(user_id: int) -> str:
     """Build a clear, comprehensive configuration summary for the settings screen."""
+    # Get fresh account data to ensure sync
+    current_account = trading_bot.get_current_account(user_id)
     config = trading_bot.get_user_config(user_id)
+    
     settings_source = "📊 Signal" if config.use_signal_settings else "🤖 Bot"
     sl_tp_status = "🟢 ON" if config.create_sl_tp else "🔴 OFF"
     trailing_status = "🟢 ON" if config.trailing_enabled else "🔴 OFF"
@@ -2825,8 +2828,14 @@ def render_trading_config_text(user_id: int) -> str:
     tp_lines = [f"TP{i}: {lvl.percentage}% → Close {lvl.close_percentage}%" for i, lvl in enumerate(config.custom_take_profits, 1)]
     if not tp_lines:
         tp_lines = ["None configured"]
+    
+    account_info = ""
+    if current_account:
+        account_info = f"📋 <b>Account:</b> {current_account.account_name}\n\n"
+    
     text = (
         "⚙️ <b>Trading Configuration</b>\n\n"
+        + account_info +
         f"🎯 Settings: <b>{settings_source}</b>\n"
         f"📊 SL/TP Orders: <b>{sl_tp_status}</b>\n"
         f"⚡ Leverage: <b>{config.leverage}x</b>\n"
@@ -3091,10 +3100,21 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trading_bot.set_current_account(user_id, acc.account_id)
             except Exception:
                 pass
+            
+            # Display complete account settings (synced with settings view)
+            balance_mode = "Percentage" if acc.use_percentage_balance else "Fixed USDT"
+            balance_value = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
+            
             msg = f"📋 <b>{acc.account_name}</b>\n\n"
-            msg += f"📊 Leverage: {acc.leverage}x\n"
-            msg += f"💰 Risk: {acc.risk_percentage}%\n"
-            msg += f"📡 Channels: {len(acc.monitored_channels)}\n"
+            msg += f"⚙️ <b>Trading Settings:</b>\n"
+            msg += f"⚡ Leverage: <b>{acc.leverage}x</b>\n"
+            msg += f"💰 Risk: <b>{acc.risk_percentage}%</b>\n"
+            msg += f"💵 Balance Mode: <b>{balance_mode}</b>\n"
+            msg += f"💵 Trade Amount: <b>{balance_value}</b>\n"
+            msg += f"🎯 Take Profits: <b>{len(acc.take_profit_levels)} levels</b>\n"
+            msg += f"🛑 Stop Losses: <b>{len(acc.stop_loss_levels)} levels</b>\n"
+            msg += f"📡 Channels: <b>{len(acc.monitored_channels)}</b>\n\n"
+            msg += "Use the buttons below to manage this account."
             await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "🔙 Main Menu":
@@ -3166,10 +3186,12 @@ async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         text = "📋 <b>Your Trading Accounts</b>\n\n"
         for i, account in enumerate(accounts, 1):
             status = "🟢 Active" if account.is_active else "🔴 Inactive"
+            balance_value = f"{account.balance_percentage}%" if account.use_percentage_balance else f"${account.fixed_usdt_amount}"
             text += f"<b>{i}. {account.account_name}</b>\n"
             text += f"Status: {status}\n"
-            text += f"Leverage: {account.leverage}x\n"
-            text += f"Balance: {'Percentage' if account.use_percentage_balance else 'Fixed USDT'}\n\n"
+            text += f"⚡ Leverage: {account.leverage}x\n"
+            text += f"💰 Trade Amount: {balance_value}\n"
+            text += f"📡 Channels: {len(account.monitored_channels)}\n\n"
         
         await update.message.reply_text(
             text,
@@ -3206,7 +3228,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⚙️ <b>Trading Settings:</b>
 ⚡ Leverage: <b>{current_account.leverage}x</b>
-💰 Balance: <b>{'Percentage' if current_account.use_percentage_balance else 'Fixed USDT'}</b>
+💰 Trade Amount: <b>{f"{current_account.balance_percentage}%" if current_account.use_percentage_balance else f"${current_account.fixed_usdt_amount}"}</b>
 🎯 Take Profits: <b>{len(current_account.take_profit_levels)} levels</b>
 🛑 Stop Losses: <b>{len(current_account.stop_loss_levels)} levels</b>
 
@@ -3362,8 +3384,8 @@ async def handle_start_trading(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"🚀 <b>Trading Started Successfully!</b>\n\n"
                 f"Account: <b>{current_account.account_name}</b>\n"
                 f"Channels: <b>{len(current_account.monitored_channels)}</b>\n"
-                f"Leverage: <b>{current_account.leverage}x</b>\n"
-                f"Balance: <b>{'Percentage' if current_account.use_percentage_balance else 'Fixed USDT'}</b>\n\n"
+                f"⚡ Leverage: <b>{current_account.leverage}x</b>\n"
+                f"💰 Trade Amount: <b>{f"{current_account.balance_percentage}%" if current_account.use_percentage_balance else f"${current_account.fixed_usdt_amount}"}</b>\n\n"
                 f"✅ Monitoring active\n"
                 f"🎯 Ready to execute trades",
                 parse_mode='HTML'
