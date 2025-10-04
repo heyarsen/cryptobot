@@ -2533,16 +2533,31 @@ async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAUL
             parse_mode='HTML'
         )
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command - entry point for the bot"""
+    user_id = update.effective_user.id
+
+    if trading_bot.is_authenticated(user_id):
+        await update.message.reply_text(
+            "👋 <b>Welcome Back!</b>\n\nYou're already authenticated.\nChoose an action from the menu:",
+            parse_mode='HTML',
+            reply_markup=trading_bot.main_menu
+        )
+    else:
+        await update.message.reply_text(
+            "🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nWelcome! To access the bot, please enter your PIN code:\n\n🔑 Enter the 6-digit PIN code:",
+            parse_mode='HTML'
+        )
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle main menu button presses and PIN authentication"""
+    """Handle main menu button presses"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
-
+    
     # Check authentication first
     if not trading_bot.is_authenticated(user_id):
-        # User is not authenticated - try to authenticate with the text they sent
+        # Try to authenticate with entered text
         if trading_bot.authenticate_user(user_id, text):
-            # PIN is correct - authenticate and show menu
             await update.message.reply_text(
                 "✅ <b>Authentication Successful!</b>\n\n"
                 "Welcome to Enhanced Multi-Account Trading Bot v5.0!\n\n"
@@ -2558,15 +2573,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         else:
-            # PIN is wrong - ask again
             await update.message.reply_text(
                 "❌ <b>Invalid PIN Code!</b>\n\n"
                 "Please enter the correct PIN code (496745):",
                 parse_mode='HTML'
             )
             return
-
-    # User is authenticated - handle menu buttons
+    
     if text == "🔑 Accounts":
         await handle_accounts_menu(update, context)
     elif text == "📊 Status":
@@ -4106,6 +4119,7 @@ def main():
         application = Application.builder().token(BOT_TOKEN).build()
 
         # Enhanced static button handlers (no commands needed)
+                application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
         
         # Keep only essential conversation handlers for account setup
