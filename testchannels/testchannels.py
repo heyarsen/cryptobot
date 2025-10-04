@@ -2537,20 +2537,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - entry point for the bot"""
     user_id = update.effective_user.id
 
-    # Check if user is already authenticated
     if trading_bot.is_authenticated(user_id):
         await update.message.reply_text(
-            "👋 <b>Welcome Back!</b>\n\n"
-            "You're already authenticated.\n"
-            "Choose an action from the menu:",
+            "👋 <b>Welcome Back!</b>\n\nYou're already authenticated.\nChoose an action from the menu:",
             parse_mode='HTML',
             reply_markup=trading_bot.main_menu
         )
     else:
         await update.message.reply_text(
-            "🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\n"
-            "Welcome! To access the bot, please enter your PIN code:\n\n"
-            "🔑 Enter the 6-digit PIN code:",
+            "🔐 <b>Enhanced Multi-Account Trading Bot v5.0</b>\n\nWelcome! To access the bot, please enter your PIN code:\n\n🔑 Enter the 6-digit PIN code:",
             parse_mode='HTML'
         )
 
@@ -4099,20 +4094,14 @@ def kill_existing_bot_instances():
 def main():
     """Start the enhanced bot with static button interface"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
-    
-    # Kill any existing bot instances to prevent conflicts
+
     kill_existing_bot_instances()
-    
+
     try:
         application = Application.builder().token(BOT_TOKEN).build()
-
-        # Enhanced static button handlers (no commands needed)
-                application.add_handler(CommandHandler("start", start))
-        
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
-        
-        # Keep only essential conversation handlers for account setup
-        application.add_handler(account_conv_handler)  # Enhanced multi-account handler
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
+        application.add_handler(account_conv_handler)
 
         print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
         print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
@@ -4129,18 +4118,16 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
         print("✅ FIXED: Proper stop monitoring")
         print("✅ FIXED: Bot instance conflicts")
         print("📊 Ready! Use PIN code 496745 to access")
-        
-        # Add error handler for conflicts
+
         async def error_handler(update, context):
             logger.error(f"Update {update} caused error {context.error}")
             if "Conflict" in str(context.error):
                 print("⚠️ Bot instance conflict detected. Please stop other instances.")
             return True
-        
+
         application.add_error_handler(error_handler)
-        
         application.run_polling()
-        
+
     except Exception as e:
         print(f"❌ Error starting bot: {e}")
         if "Conflict" in str(e):
@@ -4148,7 +4135,7 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
         print("🔄 Retrying in 5 seconds...")
         import time
         time.sleep(5)
-        main()  # Retry
+        main()
 
 if __name__ == '__main__':
     main()
