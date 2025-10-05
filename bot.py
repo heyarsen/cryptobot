@@ -1708,37 +1708,49 @@ class TradingBot:
         """Enhanced signal parsing with Russian support"""
         try:
             logger.info(f"🔍 PARSING SIGNAL from channel {channel_id}")
+            logger.info(f"📝 Message preview: {message[:300]}")
             
             # Try enhanced parser first
             enhanced_signal = EnhancedSignalParser.parse_signal(message, channel_id)
-            if enhanced_signal and enhanced_signal.confidence > 0.5:
-                logger.info(f"✅ Enhanced parser: {enhanced_signal.symbol} {enhanced_signal.side} (confidence: {enhanced_signal.confidence:.2f})")
-                
-                return TradingSignal(
-                    symbol=enhanced_signal.symbol,
-                    trade_type=enhanced_signal.side,
-                    entry_price=enhanced_signal.entry_price,
-                    take_profit=enhanced_signal.take_profit or [],
-                    stop_loss=enhanced_signal.stop_loss,
-                    leverage=enhanced_signal.leverage,
-                    raw_message=message,
-                    channel_id=channel_id,
-                    timestamp=datetime.now()
-                )
+            if enhanced_signal:
+                logger.info(f"🔎 Enhanced parser result - Symbol: {enhanced_signal.symbol}, Side: {enhanced_signal.side}, Confidence: {enhanced_signal.confidence:.2f}")
+                if enhanced_signal.confidence > 0.5:
+                    logger.info(f"✅ Enhanced parser SUCCESS: {enhanced_signal.symbol} {enhanced_signal.side} (confidence: {enhanced_signal.confidence:.2f})")
+                    
+                    return TradingSignal(
+                        symbol=enhanced_signal.symbol,
+                        trade_type=enhanced_signal.side,
+                        entry_price=enhanced_signal.entry_price,
+                        take_profit=enhanced_signal.take_profit or [],
+                        stop_loss=enhanced_signal.stop_loss,
+                        leverage=enhanced_signal.leverage,
+                        raw_message=message,
+                        channel_id=channel_id,
+                        timestamp=datetime.now()
+                    )
+                else:
+                    logger.info(f"⚠️ Enhanced parser confidence too low: {enhanced_signal.confidence:.2f} < 0.5")
+            else:
+                logger.info("⚠️ Enhanced parser returned None")
             
             # Fallback to original parser
+            logger.info("🔄 Trying fallback SignalDetector parser...")
             signals = SignalDetector.parse_signals(message)
 
             if not signals:
-                logger.info("❌ No signals found")
+                logger.info("❌ SignalDetector: No signals found in message")
+                logger.info("💡 TIP: Check if message contains required keywords (BUY/SELL/LONG/SHORT and symbol)")
                 return None
 
+            logger.info(f"✅ SignalDetector found {len(signals)} signal(s)")
             s = signals[0]
+            logger.info(f"📊 First signal - Symbol: {s.get('symbol')}, Side: {s.get('trade_side')}, Entry: {s.get('entry')}")
+            
             if not all([s['symbol'], s['trade_side']]):
-                logger.info("❌ Incomplete signal data")
+                logger.info(f"❌ Incomplete signal data - Symbol: {s.get('symbol')}, Side: {s.get('trade_side')}")
                 return None
 
-            logger.info(f"✅ Parsed signal: {s['symbol']} {s['trade_side']}")
+            logger.info(f"✅ SIGNAL PARSED SUCCESSFULLY: {s['symbol']} {s['trade_side']}")
 
             return TradingSignal(
                 symbol=s['symbol'],
@@ -1753,6 +1765,7 @@ class TradingBot:
             )
         except Exception as e:
             logger.error(f"❌ Error parsing signal: {e}")
+            logger.error(traceback.format_exc())
             return None
 
     def get_user_config(self, user_id: int) -> BotConfig:
@@ -2751,15 +2764,23 @@ class TradingBot:
 
             if not telethon_client.is_connected():
                 await telethon_client.connect()
+                logger.info(f"✅ Connected Telethon client for user {user_id}")
+
+            # Set active monitoring BEFORE starting the task
+            self.active_monitoring[user_id] = True
+            logger.info(f"🔛 Set active_monitoring[{user_id}] = True")
 
             # Start background task to process Telethon events if not already running
             if user_id not in self.monitoring_tasks or self.monitoring_tasks[user_id].done():
                 self.monitoring_tasks[user_id] = asyncio.create_task(self._run_telethon_client(user_id))
-                logger.info(f"✅ Started Telethon event loop for user {user_id}")
+                logger.info(f"✅ Started Telethon event loop task for user {user_id}")
+            else:
+                logger.info(f"ℹ️ Telethon event loop task already running for user {user_id}")
 
-            self.active_monitoring[user_id] = True
-            logger.info(f"📡 Monitoring now active for user {user_id}. Monitored channels: {config.monitored_channels}")
-            logger.info(f"🔔 Event handler registered. Client connected: {telethon_client.is_connected()}")
+            logger.info(f"📡 Monitoring now ACTIVE for user {user_id}")
+            logger.info(f"📡 Monitored channels: {config.monitored_channels}")
+            logger.info(f"🔔 Client connected: {telethon_client.is_connected()}")
+            logger.info(f"🔔 Active monitoring status: {self.active_monitoring.get(user_id, False)}")
             return True
 
         except Exception as e:
@@ -2776,16 +2797,19 @@ class TradingBot:
         try:
             telethon_client = self.user_monitoring_clients.get(user_id)
             if not telethon_client:
-                logger.error(f"No Telethon client found for user {user_id}")
+                logger.error(f"❌ No Telethon client found for user {user_id}")
                 return
             
-            logger.info(f"🔄 Starting message polling for user {user_id}")
+            logger.info(f"🔄 [_run_telethon_client] Starting message polling for user {user_id}")
+            logger.info(f"🔄 [_run_telethon_client] Active monitoring status: {self.active_monitoring.get(user_id, False)}")
             
             # Ensure connection is established
             if not telethon_client.is_connected():
+                logger.info(f"🔌 [_run_telethon_client] Connecting Telethon client...")
                 await telethon_client.connect()
             
-            logger.info(f"✅ Telethon client connected, actively polling for new messages")
+            logger.info(f"✅ [_run_telethon_client] Telethon client connected, actively polling for new messages")
+            logger.info(f"✅ [_run_telethon_client] Entering polling loop...")
             
             # Track last message ID for each channel to detect new messages
             last_message_ids = {}
@@ -2798,15 +2822,17 @@ class TradingBot:
                 try:
                     # Check if client is still connected
                     if not telethon_client.is_connected():
-                        logger.warning(f"Telethon client disconnected for user {user_id}, reconnecting...")
+                        logger.warning(f"⚠️ Telethon client disconnected for user {user_id}, reconnecting...")
                         await telethon_client.connect()
                     
                     # Get current config to check monitored channels
                     config = self.get_user_config(user_id)
                     if not config.monitored_channels:
-                        logger.debug(f"No channels configured for user {user_id}, waiting...")
+                        logger.debug(f"⏸️ No channels configured for user {user_id}, waiting...")
                         await asyncio.sleep(10)
                         continue
+                    
+                    logger.debug(f"🔍 Polling {len(config.monitored_channels)} channels for user {user_id}: {config.monitored_channels}")
                     
                     # Check each monitored channel for new messages
                     for channel_id_str in config.monitored_channels:
@@ -2814,24 +2840,30 @@ class TradingBot:
                             # Convert string channel ID to entity
                             channel_id = int(channel_id_str)
                             
+                            logger.debug(f"🔎 Checking channel {channel_id_str} for new messages...")
+                            
                             # Get the latest message from this channel
                             messages = await telethon_client.get_messages(channel_id, limit=1)
                             
                             if not messages:
+                                logger.debug(f"📭 No messages found in channel {channel_id_str}")
                                 continue
                             
                             latest_msg = messages[0]
                             msg_id = latest_msg.id
                             
+                            logger.debug(f"📬 Latest message in channel {channel_id_str}: ID={msg_id}")
+                            
                             # Initialize last_message_ids for this channel if needed
                             if channel_id_str not in last_message_ids:
                                 last_message_ids[channel_id_str] = msg_id
                                 logger.info(f"📝 Initialized tracking for channel {channel_id_str}, last ID: {msg_id}")
+                                logger.info(f"📝 Latest message preview: {latest_msg.message[:100] if latest_msg.message else '(no text)'}")
                                 continue
                             
                             # Check if this is a new message
                             if msg_id > last_message_ids[channel_id_str]:
-                                logger.info(f"📨 New message detected in channel {channel_id_str}! ID: {msg_id}")
+                                logger.info(f"🆕 New message detected in channel {channel_id_str}! ID: {msg_id} (previous: {last_message_ids[channel_id_str]})")
                                 
                                 # Get all new messages since last check
                                 new_messages = await telethon_client.get_messages(
@@ -2840,19 +2872,27 @@ class TradingBot:
                                     limit=10
                                 )
                                 
+                                logger.info(f"📥 Retrieved {len(new_messages)} new messages from channel {channel_id_str}")
+                                
                                 # Process each new message (in chronological order)
                                 for msg in reversed(new_messages):
                                     if msg.id > last_message_ids[channel_id_str] and msg.message:
-                                        logger.info(f"📨 Processing new message: {msg.message[:100]}")
+                                        logger.info(f"📨 Processing new message ID {msg.id}: {msg.message[:100]}...")
                                         await self._handle_new_message(msg, channel_id_str, user_id)
+                                    elif msg.id > last_message_ids[channel_id_str]:
+                                        logger.debug(f"⏭️ Skipping message ID {msg.id} (no text content)")
                                 
                                 # Update last seen message ID
                                 last_message_ids[channel_id_str] = msg_id
+                                logger.info(f"✅ Updated last message ID for channel {channel_id_str} to {msg_id}")
+                            else:
+                                logger.debug(f"✓ No new messages in channel {channel_id_str} (current: {msg_id}, last: {last_message_ids[channel_id_str]})")
                                 
                         except ValueError as e:
-                            logger.error(f"Invalid channel ID format: {channel_id_str}: {e}")
+                            logger.error(f"❌ Invalid channel ID format: {channel_id_str}: {e}")
                         except Exception as e:
-                            logger.error(f"Error checking channel {channel_id_str}: {e}")
+                            logger.error(f"❌ Error checking channel {channel_id_str}: {e}")
+                            logger.error(traceback.format_exc())
                     
                     # Poll every 5 seconds to catch new messages quickly
                     await asyncio.sleep(5)
@@ -2871,15 +2911,22 @@ class TradingBot:
     async def _handle_new_message(self, message, channel_id: str, user_id: int):
         """Handle a new message from a monitored channel"""
         try:
+            logger.info(f"🔔 [_handle_new_message] Called for user {user_id}, channel {channel_id}")
+            
             config = self.get_user_config(user_id)
+            logger.info(f"🔧 [_handle_new_message] Config loaded - monitored channels: {config.monitored_channels}")
+            
             bot_instance = self.bot_instances.get(user_id)
+            logger.info(f"🤖 [_handle_new_message] Bot instance {'found' if bot_instance else 'NOT FOUND'}")
+            
             message_text = message.message
             
             if not message_text:
+                logger.warning(f"⚠️ [_handle_new_message] Message has no text content, skipping")
                 return
             
-            logger.info(f"📨 [DEBUG] Processing message from channel {channel_id}")
-            logger.info(f"📨 [DEBUG] Message text: {message_text[:200]}")
+            logger.info(f"📨 [_handle_new_message] Processing message from channel {channel_id}")
+            logger.info(f"📨 [_handle_new_message] Message text: {message_text[:200]}")
             
             # Send notification about received message
             if bot_instance:
@@ -2889,11 +2936,16 @@ class TradingBot:
                         text=f"📨 <b>New Message Received</b>\n\n<pre>{message_text[:300]}</pre>\n\n🔍 Processing...",
                         parse_mode='HTML'
                     )
+                    logger.info(f"✅ [_handle_new_message] Sent notification to user {user_id}")
                 except Exception as e:
-                    logger.error(f"Error sending message notification: {e}")
+                    logger.error(f"❌ [_handle_new_message] Error sending message notification: {e}")
+            else:
+                logger.warning(f"⚠️ [_handle_new_message] No bot instance to send notification")
             
             # Parse the signal
+            logger.info(f"🔍 [_handle_new_message] Starting signal parsing...")
             signal = self.parse_trading_signal(message_text, channel_id)
+            logger.info(f"📊 [_handle_new_message] Signal parsing result: {'Signal detected' if signal else 'No signal detected'}")
             
             if signal:
                 logger.info(f"🎯 SIGNAL DETECTED! {signal.symbol} {signal.trade_type}")
@@ -5129,6 +5181,66 @@ def kill_existing_bot_instances():
 
 # ================== MAIN ==================
 
+async def auto_start_monitoring():
+    """Automatically start monitoring for all accounts with configured channels on bot startup"""
+    try:
+        logger.info("🔄 Auto-start monitoring: Checking for accounts with monitored channels...")
+        accounts = trading_bot.enhanced_db.get_all_accounts()
+        
+        if not accounts:
+            logger.info("ℹ️ No accounts found in database")
+            return
+        
+        logger.info(f"✅ Retrieved {len(accounts)} accounts from database")
+        
+        for account in accounts:
+            try:
+                if account.monitored_channels and len(account.monitored_channels) > 0:
+                    logger.info(f"🚀 Auto-starting monitoring for user {account.user_id} with {len(account.monitored_channels)} channels")
+                    logger.info(f"   Channels: {account.monitored_channels}")
+                    
+                    # Set the current account
+                    trading_bot.set_app_setting(f'current_account_{account.user_id}', account.account_id)
+                    
+                    # Get the bot application
+                    bot_app = trading_bot.bot_instances.get(account.user_id)
+                    if not bot_app:
+                        # Create a bot instance for this user
+                        from telegram import Bot
+                        bot_app = Bot(token="8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4")
+                        trading_bot.bot_instances[account.user_id] = bot_app
+                    
+                    # Start monitoring
+                    success = await trading_bot.start_monitoring(account.user_id, bot_app)
+                    
+                    if success:
+                        trading_bot.monitoring_status[account.user_id] = True
+                        logger.info(f"✅ Auto-started monitoring for user {account.user_id}")
+                        
+                        # Send notification to user
+                        try:
+                            await bot_app.send_message(
+                                chat_id=account.user_id,
+                                text=f"🤖 <b>Bot Started</b>\n\n✅ Auto-started monitoring for account <b>{account.account_name}</b>\n📡 Monitoring {len(account.monitored_channels)} channel(s)\n\n🔍 Ready to detect signals!",
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not send start notification to user {account.user_id}: {e}")
+                    else:
+                        logger.error(f"❌ Failed to auto-start monitoring for user {account.user_id}")
+                else:
+                    logger.info(f"⏭️ Skipping user {account.user_id} (no monitored channels configured)")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error auto-starting monitoring for account {account.account_id}: {e}")
+                logger.error(traceback.format_exc())
+        
+        logger.info("✅ Auto-start monitoring completed")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in auto_start_monitoring: {e}")
+        logger.error(traceback.format_exc())
+
 def main():
     """Start the enhanced bot with static button interface"""
     BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
@@ -5163,6 +5275,8 @@ def main():
         print("✅ FIXED: Duplicate monitoring prevention")
         print("✅ FIXED: Proper stop monitoring")
         print("✅ FIXED: Bot instance conflicts")
+        print("✅ FIXED: Auto-start monitoring on startup")
+        print("✅ FIXED: Enhanced message detection logging")
         print("📊 Ready! Use PIN code 496745 to access")
         
         # Add error handler for conflicts
@@ -5173,6 +5287,14 @@ def main():
             return True
         
         application.add_error_handler(error_handler)
+        
+        # Auto-start monitoring after bot initialization
+        async def post_init(app):
+            """Called after the bot starts"""
+            logger.info("🚀 Bot initialized, starting auto-monitoring...")
+            await auto_start_monitoring()
+        
+        application.post_init = post_init
         
         application.run_polling()
         
