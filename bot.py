@@ -194,6 +194,7 @@ class AccountConfig:
     telegram_api_id: str
     telegram_api_hash: str
     phone: str
+    user_id: int = 0  # Telegram user ID who owns this account
     is_active: bool = True
     created_at: str = ""
     last_used: str = ""
@@ -490,6 +491,7 @@ class EnhancedDatabase:
                     telegram_api_id TEXT NOT NULL,
                     telegram_api_hash TEXT NOT NULL,
                     phone TEXT NOT NULL,
+                    user_id INTEGER DEFAULT 0,
                     is_active BOOLEAN DEFAULT TRUE,
                     created_at TEXT NOT NULL,
                     last_used TEXT NOT NULL,
@@ -514,6 +516,10 @@ class EnhancedDatabase:
             ''')
             
             # Add new columns if they don't exist (for existing databases)
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN user_id INTEGER DEFAULT 0")
+            except:
+                pass
             try:
                 cursor.execute("ALTER TABLE accounts ADD COLUMN use_signal_settings BOOLEAN DEFAULT FALSE")
             except:
@@ -640,7 +646,7 @@ class EnhancedDatabase:
             cursor.execute('''
                 INSERT OR REPLACE INTO accounts (
                     account_id, account_name, bingx_api_key, bingx_secret_key,
-                    telegram_api_id, telegram_api_hash, phone, is_active,
+                    telegram_api_id, telegram_api_hash, phone, user_id, is_active,
                     created_at, last_used, leverage, risk_percentage,
                     default_symbol, auto_trade_enabled, use_percentage_balance,
                     balance_percentage, fixed_usdt_amount,
@@ -648,11 +654,11 @@ class EnhancedDatabase:
                     monitored_channels, signal_channels,
                     use_signal_settings, create_sl_tp, make_webhook_enabled,
                     trailing_enabled, trailing_activation_percent, trailing_callback_percent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
-                account.phone, account.is_active, account.created_at, account.last_used,
+                account.phone, account.user_id, account.is_active, account.created_at, account.last_used,
                 account.leverage, account.risk_percentage, account.default_symbol,
                 account.auto_trade_enabled, account.use_percentage_balance,
                 account.balance_percentage, account.fixed_usdt_amount,
@@ -689,15 +695,15 @@ class EnhancedDatabase:
                 try:
                     # Parse TP levels
                     tp_levels = []
-                    if row[17]:  # take_profit_levels column
-                        tp_data = json.loads(row[17])
+                    if row[18]:  # take_profit_levels column (shifted by 1)
+                        tp_data = json.loads(row[18])
                         tp_levels = [TakeProfitLevel(tp['percentage'], tp['close_percentage']) 
                                     for tp in tp_data]
 
                     # Parse SL levels
                     sl_levels = []
-                    if row[18]:  # stop_loss_levels column
-                        sl_data = json.loads(row[18])
+                    if row[19]:  # stop_loss_levels column (shifted by 1)
+                        sl_data = json.loads(row[19])
                         sl_levels = [StopLossLevel(sl['percentage'], sl['close_percentage']) 
                                     for sl in sl_data]
 
@@ -709,26 +715,27 @@ class EnhancedDatabase:
                         telegram_api_id=row[4],
                         telegram_api_hash=row[5],
                         phone=row[6],
-                        is_active=bool(row[7]),
-                        created_at=row[8],
-                        last_used=row[9],
-                        leverage=row[10],
-                        risk_percentage=row[11],
-                        default_symbol=row[12],
-                        auto_trade_enabled=bool(row[13]),
-                        use_percentage_balance=bool(row[14]),
-                        balance_percentage=row[15],
-                        fixed_usdt_amount=row[16],
+                        user_id=int(row[7]) if len(row) > 7 and row[7] else 0,
+                        is_active=bool(row[8]),
+                        created_at=row[9],
+                        last_used=row[10],
+                        leverage=row[11],
+                        risk_percentage=row[12],
+                        default_symbol=row[13],
+                        auto_trade_enabled=bool(row[14]),
+                        use_percentage_balance=bool(row[15]),
+                        balance_percentage=row[16],
+                        fixed_usdt_amount=row[17],
                         take_profit_levels=tp_levels,
                         stop_loss_levels=sl_levels,
-                        monitored_channels=json.loads(row[19]) if row[19] else [],
-                        signal_channels=json.loads(row[20]) if row[20] else [],
-                        use_signal_settings=bool(row[21]) if len(row) > 21 else False,
-                        create_sl_tp=bool(row[22]) if len(row) > 22 else True,
-                        make_webhook_enabled=bool(row[23]) if len(row) > 23 else False,
-                        trailing_enabled=bool(row[24]) if len(row) > 24 else False,
-                        trailing_activation_percent=float(row[25]) if len(row) > 25 else 2.0,
-                        trailing_callback_percent=float(row[26]) if len(row) > 26 else 0.5
+                        monitored_channels=json.loads(row[20]) if row[20] else [],
+                        signal_channels=json.loads(row[21]) if row[21] else [],
+                        use_signal_settings=bool(row[22]) if len(row) > 22 else False,
+                        create_sl_tp=bool(row[23]) if len(row) > 23 else True,
+                        make_webhook_enabled=bool(row[24]) if len(row) > 24 else False,
+                        trailing_enabled=bool(row[25]) if len(row) > 25 else False,
+                        trailing_activation_percent=float(row[26]) if len(row) > 26 else 2.0,
+                        trailing_callback_percent=float(row[27]) if len(row) > 27 else 0.5
                     )
                     accounts.append(account)
                 except Exception as e:
@@ -887,6 +894,20 @@ class EnhancedDatabase:
             return True
         except Exception as e:
             logger.error(f"❌ Failed to update monitored channels for {account_id}: {e}")
+            return False
+    
+    def update_account_user_id(self, account_id: str, user_id: int) -> bool:
+        """Update the user_id for an account"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE accounts SET user_id = ? WHERE account_id = ?', (user_id, account_id))
+            conn.commit()
+            conn.close()
+            logger.info(f"✅ Updated user_id={user_id} for account {account_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update user_id for {account_id}: {e}")
             return False
 
 
@@ -1626,6 +1647,8 @@ class TradingBot:
         for account in accounts:
             if account.account_id == account_id:
                 self.current_accounts[user_id] = account_id
+                # Update the user_id in the database for persistence
+                self.enhanced_db.update_account_user_id(account_id, user_id)
                 return True
         return False
 
@@ -3266,7 +3289,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account_id=str(uuid.uuid4()), account_name=context.user_data.get('acc_name'),
             bingx_api_key=context.user_data.get('acc_key'), bingx_secret_key=text,
             telegram_api_id=DEFAULT_TELEGRAM_API_ID, telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
-            phone="", is_active=True, created_at=datetime.now().isoformat(),
+            phone="", user_id=user_id, is_active=True, created_at=datetime.now().isoformat(),
             last_used=datetime.now().isoformat(), leverage=int(defaults.get('leverage', DEFAULT_SETTINGS['leverage'])),
             risk_percentage=float(defaults.get('risk_percentage', DEFAULT_SETTINGS['risk_percentage'])), use_percentage_balance=True,
             monitored_channels=[], signal_channels=[]
@@ -4963,6 +4986,7 @@ async def handle_account_phone(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Create account configuration
     account_id = str(uuid.uuid4())
+    user_id = update.effective_user.id
     account = AccountConfig(
         account_id=account_id,
         account_name=context.user_data['account_name'],
@@ -4970,7 +4994,8 @@ async def handle_account_phone(update: Update, context: ContextTypes.DEFAULT_TYP
         bingx_secret_key=context.user_data['bingx_secret_key'],
         telegram_api_id=context.user_data['telegram_api_id'],
         telegram_api_hash=context.user_data['telegram_api_hash'],
-        phone=phone
+        phone=phone,
+        user_id=user_id
     )
     
     # Save to database
@@ -5195,11 +5220,18 @@ async def auto_start_monitoring():
         
         for account in accounts:
             try:
+                # Skip accounts without a user_id (not yet associated with a user)
+                if not account.user_id or account.user_id == 0:
+                    logger.info(f"⏭️ Skipping account {account.account_name} ({account.account_id[:8]}...) - no user associated yet")
+                    continue
+                
                 if account.monitored_channels and len(account.monitored_channels) > 0:
                     logger.info(f"🚀 Auto-starting monitoring for user {account.user_id} with {len(account.monitored_channels)} channels")
+                    logger.info(f"   Account: {account.account_name}")
                     logger.info(f"   Channels: {account.monitored_channels}")
                     
-                    # Set the current account
+                    # Set the current account for this user
+                    trading_bot.current_accounts[account.user_id] = account.account_id
                     trading_bot.set_app_setting(f'current_account_{account.user_id}', account.account_id)
                     
                     # Get the bot application
