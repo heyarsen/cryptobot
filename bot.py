@@ -6003,8 +6003,7 @@ channel_conv_handler = ConversationHandler(
         WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
         WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
-    per_message=True
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
 trading_conv_handler = ConversationHandler(
@@ -6025,8 +6024,7 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
-    per_message=True
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
 # Enhanced account conversation handler
