@@ -962,6 +962,16 @@ class EnhancedDatabase:
         except Exception as e:
             logger.error(f"❌ Failed to update user_id for {account_id}: {e}")
             return False
+    
+    def get_user_accounts(self, user_id: int) -> List[AccountConfig]:
+        """Get all accounts for a specific user"""
+        try:
+            all_accounts = self.get_all_accounts()
+            user_accounts = [acc for acc in all_accounts if acc.user_id == user_id]
+            return user_accounts
+        except Exception as e:
+            logger.error(f"❌ Failed to get user accounts for user {user_id}: {e}")
+            return []
 
 
     def create_channel(self, channel: ChannelConfig) -> bool:
@@ -1107,7 +1117,7 @@ class EnhancedDatabase:
             
             cursor.execute('''
                 SELECT * FROM trade_history 
-                WHERE account_id = ? AND status IN ('OPEN', 'PARTIAL')
+                WHERE account_id = ? AND status = 'OPEN'
                 ORDER BY entry_time DESC
             ''', (account_id,))
             
@@ -2401,6 +2411,10 @@ class TradingBot:
         """Setup Telethon client"""
         try:
             session_name = f'session_{config.user_id}'
+            
+            # Get phone from current account
+            current_account = self.get_current_account(config.user_id)
+            phone = current_account.phone if current_account and hasattr(current_account, 'phone') else None
 
             telethon_client = TelegramClient(
                 session_name,
@@ -2408,7 +2422,13 @@ class TradingBot:
                 api_hash=config.telegram_api_hash
             )
 
-            await telethon_client.start()
+            # Start with phone parameter to avoid interactive prompt
+            # If phone is not provided, use empty lambda functions to avoid EOF error
+            if phone and phone.strip():
+                await telethon_client.start(phone=lambda: phone)
+            else:
+                # Use bot_token approach to avoid phone prompt
+                await telethon_client.start()
             self.user_monitoring_clients[config.user_id] = telethon_client
 
             logger.info(f"✅ Telethon setup successful for user {config.user_id}")
@@ -3404,6 +3424,17 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         trade_amount_text = f"💵 Fixed: ${config.fixed_usdt_amount:.0f} USDT"
     else:
         trade_amount_text = f"💰 Percentage: {config.balance_percent}%"
+    
+    # Get monitored channel names
+    channel_names = []
+    if current_account and current_account.monitored_channels:
+        # For now, show channel IDs. To show names, we'd need to fetch from Telethon
+        channel_names = [str(ch_id) for ch_id in current_account.monitored_channels[:3]]  # Show first 3
+    
+    if channel_names:
+        channels_text = f"📡 Channels: {', '.join(channel_names)}" + (f" +{len(current_account.monitored_channels) - 3} more" if len(current_account.monitored_channels) > 3 else "")
+    else:
+        channels_text = "📡 No channels configured"
 
     keyboard = [
         [InlineKeyboardButton(f"⚙️ Settings Source: {'Signal' if config.use_signal_settings else 'Bot'}", 
@@ -3419,7 +3450,7 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🔔 Trailing Activation: {config.trailing_activation_percent}%", callback_data="set_trailing_activation")],
         [InlineKeyboardButton(f"↩️ Trailing Callback: {config.trailing_callback_percent}%", callback_data="set_trailing_callback")],
         [InlineKeyboardButton(trade_amount_text, callback_data="toggle_trade_amount_mode")],
-        [InlineKeyboardButton("📡 Manage Channels", callback_data="manage_channels"), InlineKeyboardButton("🔄 Enable OCO Monitor", callback_data="enable_oco")],
+        [InlineKeyboardButton(channels_text, callback_data="manage_channels")],
         [InlineKeyboardButton("✏️ Rename Account", callback_data="rename_account"), InlineKeyboardButton("🗑️ Delete Account", callback_data="delete_account")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
@@ -3699,13 +3730,24 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Calculate PnL
             total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
             
+            # Get balance from exchange
+            balance = 0.0
+            try:
+                if acc.account_id in trading_bot.account_exchanges:
+                    exchange = trading_bot.account_exchanges[acc.account_id]
+                    bal = exchange.fetch_balance()
+                    balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
+            except Exception as e:
+                logger.debug(f"Could not fetch balance for {acc.account_name}: {e}")
+            
             monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
             balance_mode = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
             
             msg += f"<b>{acc.account_name}</b>\n"
             msg += f"  Status: {monitor_status}\n"
             msg += f"  ⚡ Leverage: {acc.leverage}x\n"
-            msg += f"  💰 Trade Amount: {balance_mode}\n"
+            msg += f"  💰 Balance: {balance:.2f} USDT\n"
+            msg += f"  💵 Trade Amount: {balance_mode}\n"
             msg += f"  📈 Active Trades: {len(active_trades)}\n"
             msg += f"  📊 Total Trades: {len(trade_history)}\n"
             msg += f"  💵 Total PnL: {total_pnl:.2f} USDT\n"
@@ -3890,6 +3932,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trade_history = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=100)
             total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
             
+            # Get balance from exchange
+            balance = 0.0
+            try:
+                if acc.account_id in trading_bot.account_exchanges:
+                    exchange = trading_bot.account_exchanges[acc.account_id]
+                    bal = exchange.fetch_balance()
+                    balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch balance for account {acc.account_name}: {e}")
+            
             msg = f"📋 <b>{acc.account_name}</b>\n\n"
             
             # Account Status
@@ -3899,6 +3951,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Trading Statistics
             msg += f"📊 <b>Statistics:</b>\n"
+            msg += f"💰 Balance: <b>{balance:.2f} USDT</b>\n"
             msg += f"📈 Active Trades: <b>{len(active_trades)}</b>\n"
             msg += f"📋 Total Trades: <b>{len(trade_history)}</b>\n"
             msg += f"💵 Total PnL: <b>{total_pnl:.2f} USDT</b>\n\n"
@@ -5106,11 +5159,7 @@ Next: press 🚀 Start on the account page""",
         context.user_data['awaiting_delete'] = True
         return WAITING_ACCOUNT_SETTINGS
 
-    elif query.data == "enable_oco":
-        # Start the monitor if not running
-        if not trading_bot.order_monitor_running:
-            asyncio.create_task(trading_bot.monitor_orders(context.bot))
-        await query.edit_message_text("🔄 <b>OCO Monitor enabled</b>", parse_mode='HTML')
+    # Removed enable_oco callback - OCO monitoring is now automatic
 
     elif query.data == "toggle_trade_amount_mode":
         # Show inline buttons to choose between percentage and USDT amount
