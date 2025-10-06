@@ -5098,6 +5098,19 @@ Confidence: {signal.confidence:.2f}""")
 
 # ================== CONVERSATION HANDLERS ==================
 
+async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for settings button press"""
+    if update.message and update.message.text == "⚙️ Settings" and 'current_account_id' in context.user_data:
+        user_id = update.effective_user.id
+        keyboard_markup = create_settings_keyboard(user_id)
+        await update.message.reply_text(
+            render_trading_config_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+        return WAITING_SETTINGS_SOURCE
+    return ConversationHandler.END
+
 binance_conv_handler = ConversationHandler(
     entry_points=[MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)],
     states={
@@ -5135,19 +5148,6 @@ channel_conv_handler = ConversationHandler(
         WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
     }
 )
-
-async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point for settings button press"""
-    if update.message and update.message.text == "⚙️ Settings" and 'current_account_id' in context.user_data:
-        user_id = update.effective_user.id
-        keyboard_markup = create_settings_keyboard(user_id)
-        await update.message.reply_text(
-            render_trading_config_text(user_id),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-        return WAITING_SETTINGS_SOURCE
-    return ConversationHandler.END
 
 trading_conv_handler = ConversationHandler(
     entry_points=[
