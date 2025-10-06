@@ -2475,15 +2475,25 @@ class TradingBot:
 
             # Start with phone parameter to avoid interactive prompt
             # If phone is not provided, use lambda that returns empty string to avoid EOF error
-            if phone and phone.strip():
-                await telethon_client.start(phone=lambda: phone)
-            else:
-                # Provide lambda functions that return empty strings to avoid interactive prompts
-                await telethon_client.start(
-                    phone=lambda: '',
-                    password=lambda: '',
-                    code_callback=lambda: ''
-                )
+            try:
+                if phone and phone.strip():
+                    await telethon_client.start(phone=lambda: phone)
+                else:
+                    # Try to connect with existing session
+                    # If session file exists and is authenticated, this should work
+                    await telethon_client.connect()
+                    
+                    # Check if authorized
+                    if not await telethon_client.is_user_authorized():
+                        logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
+                        logger.info(f"ℹ️ Please authorize the account through the bot interface")
+                        # Still store the client, but it won't be able to monitor until authorized
+                        self.user_monitoring_clients[current_account.account_id] = telethon_client
+                        return False
+            except Exception as start_err:
+                logger.error(f"❌ Error starting Telethon client: {start_err}")
+                logger.error(traceback.format_exc())
+                return False
             
             # Store by account_id to support multiple Telegram accounts per user
             self.user_monitoring_clients[current_account.account_id] = telethon_client
@@ -2493,6 +2503,7 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"❌ Telethon setup error: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     async def get_available_channels(self, user_id: int) -> List[Dict]:
@@ -6110,25 +6121,34 @@ async def auto_start_monitoring(application):
                 bot_app = application.bot
                 trading_bot.bot_instances[account.user_id] = bot_app
                 
-                # Start monitoring
-                success = await trading_bot.start_monitoring(account.user_id, bot_app)
-                
-                if success:
-                    trading_bot.monitoring_status[account.user_id] = True
-                    trading_bot.account_monitoring_status[account.account_id] = True
-                    logger.info(f"✅ Auto-started monitoring for account {account.account_id}")
+                # Start monitoring with timeout to prevent hanging
+                try:
+                    success = await asyncio.wait_for(
+                        trading_bot.start_monitoring(account.user_id, bot_app),
+                        timeout=30.0  # 30 second timeout
+                    )
                     
-                    # Send notification to user
-                    try:
-                        await bot_app.send_message(
-                            chat_id=account.user_id,
-                            text=f"🤖 <b>Bot Started</b>\n\n✅ Auto-started monitoring for account <b>{account.account_name}</b>\n📡 Monitoring {len(account.monitored_channels)} channel(s)\n\n🔍 Ready to detect signals!",
-                            parse_mode='HTML'
-                        )
-                    except Exception as e:
-                        logger.warning(f"⚠️ Could not send start notification to user {account.user_id}: {e}")
-                else:
-                    logger.error(f"❌ Failed to auto-start monitoring for user {account.user_id}")
+                    if success:
+                        trading_bot.monitoring_status[account.user_id] = True
+                        trading_bot.account_monitoring_status[account.account_id] = True
+                        logger.info(f"✅ Auto-started monitoring for account {account.account_id}")
+                        
+                        # Send notification to user
+                        try:
+                            await bot_app.send_message(
+                                chat_id=account.user_id,
+                                text=f"🤖 <b>Bot Started</b>\n\n✅ Auto-started monitoring for account <b>{account.account_name}</b>\n📡 Monitoring {len(account.monitored_channels)} channel(s)\n\n🔍 Ready to detect signals!",
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not send start notification to user {account.user_id}: {e}")
+                    else:
+                        logger.error(f"❌ Failed to auto-start monitoring for user {account.user_id}")
+                except asyncio.TimeoutError:
+                    logger.error(f"⏱️ Timeout starting monitoring for account {account.account_id} - continuing anyway")
+                except Exception as monitor_err:
+                    logger.error(f"❌ Error starting monitoring for account {account.account_id}: {monitor_err}")
+                    logger.error(traceback.format_exc())
                     
             except Exception as e:
                 logger.error(f"❌ Error auto-starting monitoring for account {account.account_id}: {e}")
@@ -6191,21 +6211,44 @@ def main():
         # Auto-start monitoring after bot initialization
         async def post_init(app):
             """Called after the bot starts"""
-            logger.info("🚀 Bot initialized, starting auto-monitoring...")
-            await auto_start_monitoring(app)
+            try:
+                logger.info("🚀 Bot initialized, starting auto-monitoring...")
+                await auto_start_monitoring(app)
+                logger.info("✅ Auto-monitoring initialization completed")
+            except Exception as e:
+                logger.error(f"❌ Error in post_init: {e}")
+                logger.error(traceback.format_exc())
         
         application.post_init = post_init
         
-        application.run_polling()
+        # Run polling with proper settings to keep bot alive
+        print("🚀 Starting bot polling loop...")
+        logger.info("🚀 Starting bot polling loop - bot will now run indefinitely")
+        sys.stdout.flush()  # Ensure output is flushed
         
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+        
+        # This should never be reached unless run_polling exits
+        logger.warning("⚠️ Bot polling loop exited unexpectedly")
+        print("⚠️ Bot polling loop exited - this should not happen")
+        
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped by user")
+        logger.info("🛑 Bot stopped by user (KeyboardInterrupt)")
     except Exception as e:
         print(f"❌ Error starting bot: {e}")
+        logger.error(f"❌ Fatal error in main: {e}")
+        logger.error(traceback.format_exc())
         if "Conflict" in str(e):
             print("⚠️ Another bot instance is running. Please stop it first.")
-        print("🔄 Retrying in 5 seconds...")
-        import time
-        time.sleep(5)
-        main()  # Retry
+        else:
+            print("🔄 Retrying in 5 seconds...")
+            import time
+            time.sleep(5)
+            main()  # Retry
 
 if __name__ == '__main__':
     main()
