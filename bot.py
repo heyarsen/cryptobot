@@ -18,6 +18,7 @@ import sqlite3
 import uuid
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
+from typing import List, Dict, Optional, Any, Union
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 import os
@@ -158,6 +159,8 @@ class ActivePosition:
     side: str
     quantity: float
     entry_price: float
+    # Unique identifier for the trade (typically the entry order id)
+    trade_id: Optional[str] = None
     stop_loss_order_id: Optional[int] = None
     take_profit_order_ids: List[int] = None
     filled_take_profit_order_ids: List[int] = None
@@ -476,7 +479,19 @@ class EnhancedDatabase:
     def __init__(self, db_path: str = "enhanced_trading_bot.db"):
         # Choose a persistent database path when available
         try:
+            # Prefer explicit configuration first
             configured_path = os.getenv('ENHANCED_DB_PATH') or os.getenv('DB_PATH')
+            # Then try common Railway volume envs
+            if not configured_path:
+                volume_envs = [
+                    os.getenv('RAILWAY_VOLUME_MOUNT_PATH'),
+                    os.getenv('RAILWAY_VOLUME_DIR'),
+                    os.getenv('RAILWAY_VOLUME_PATH')
+                ]
+                for v in volume_envs:
+                    if v and v.strip():
+                        configured_path = os.path.join(v.strip(), 'enhanced_trading_bot.db')
+                        break
             if configured_path and isinstance(configured_path, str) and configured_path.strip():
                 db_path = configured_path.strip()
             elif db_path == "enhanced_trading_bot.db" and os.path.isdir('/data'):
@@ -1123,6 +1138,38 @@ class EnhancedDatabase:
         except Exception as e:
             logger.error(f"❌ Failed to get active trades: {e}")
             return []
+
+    def update_trade_status(self, trade_id: str, status: Optional[str] = None,
+                             pnl: Optional[float] = None, exit_time: Optional[str] = None) -> bool:
+        """Update trade status/PnL/exit_time for an existing trade id."""
+        try:
+            if not trade_id:
+                return False
+            set_clauses = []
+            values: List[Any] = []
+            if status is not None:
+                set_clauses.append("status = ?")
+                values.append(status)
+            if pnl is not None:
+                set_clauses.append("pnl = ?")
+                values.append(pnl)
+            if exit_time is not None:
+                set_clauses.append("exit_time = ?")
+                values.append(exit_time)
+            if not set_clauses:
+                return True
+            sql = f"UPDATE trade_history SET {', '.join(set_clauses)} WHERE trade_id = ?"
+            values.append(trade_id)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(sql, tuple(values))
+            conn.commit()
+            conn.close()
+            logger.info(f"📝 Trade {trade_id} updated: {', '.join(set_clauses)}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update trade {trade_id}: {e}")
+            return False
 
 class SignalDetector:
     @staticmethod
@@ -2097,6 +2144,11 @@ class TradingBot:
                 if remaining_tps:
                     # Still have unfilled TPs, don't cancel SL/trailing yet
                     logger.info(f"🎯 Take Profit {filled_tp_id} filled for {symbol}, but {len(remaining_tps)} TPs remaining. Keeping SL/trailing active.")
+                    # Mark position PARTIAL in history
+                    try:
+                        self.enhanced_db.update_trade_status(getattr(position, 'trade_id', ''), status="PARTIAL")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to mark trade PARTIAL: {e}")
                     await bot_instance.send_message(
                         chat_id=user_id,
                         text=f"🎯 <b>Take Profit Filled</b>\n\n💰 {symbol}\n✅ TP {filled_tp_id} executed\n📊 Remaining TPs: {len(remaining_tps)}\n🛡️ SL/Trailing still active",
@@ -2149,6 +2201,12 @@ class TradingBot:
                     except Exception as e:
                         logger.error(f"❌ Failed to cancel Trailing: {e}")
 
+            # Update history on closure
+            if filled_order_type == "STOP_LOSS" or (filled_order_type == "TAKE_PROFIT" and not remaining_tps):
+                try:
+                    self.enhanced_db.update_trade_status(getattr(position, 'trade_id', ''), status="CLOSED", exit_time=datetime.now().isoformat())
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to close trade in history: {e}")
             # Remove position from active positions only when all orders are handled
             if filled_order_type == "STOP_LOSS" or (filled_order_type == "TAKE_PROFIT" and not remaining_tps):
                 if symbol in self.active_positions:
@@ -2710,7 +2768,7 @@ class TradingBot:
                                 trailing_params
                             )
                             logger.info(f"🧵 Trailing Stop placed: {trailing_order}")
-                            # Track trailing order in active positions
+                            # Track trailing order in active positions (trade_id will be attached below)
                             self.active_positions[signal.symbol] = ActivePosition(
                                 symbol=signal.symbol,
                                 user_id=config.user_id,
@@ -2726,6 +2784,45 @@ class TradingBot:
                 except Exception as e:
                     logger.warning(f"⚠️ SL/TP creation skipped/failed on BingX: {e}")
                     sl_tp_result = {'stop_loss': None, 'take_profits': []}
+
+            # Ensure active position is tracked even when trailing disabled, and attach trade id
+            try:
+                pos = self.active_positions.get(signal.symbol)
+                if not pos:
+                    self.active_positions[signal.symbol] = ActivePosition(
+                        symbol=signal.symbol,
+                        user_id=config.user_id,
+                        side='LONG' if side == 'BUY' else 'SHORT',
+                        quantity=quantity,
+                        entry_price=current_price,
+                        stop_loss_order_id=sl_tp_result.get('stop_loss'),
+                        take_profit_order_ids=[tp['order_id'] for tp in sl_tp_result.get('take_profits', [])]
+                    )
+                # Attach trade id for DB updates later
+                self.active_positions[signal.symbol].trade_id = str(order.get('id')) if order.get('id') is not None else None
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to register active position: {e}")
+
+            # Persist trade to history as OPEN
+            try:
+                account_id_for_history = current_account.account_id if current_account else ""
+                history_record = TradeHistory(
+                    trade_id=str(order.get('id')),
+                    account_id=account_id_for_history,
+                    symbol=signal.symbol,
+                    side=signal.trade_type,
+                    entry_price=float(entry_price),
+                    quantity=float(quantity),
+                    leverage=int(leverage),
+                    status="OPEN",
+                    pnl=0.0,
+                    stop_loss_price=float(sl_price) if sl_price else None,
+                    take_profit_prices=[float(p) for p in (tp_prices or [])],
+                    channel_id=str(signal.channel_id)
+                )
+                self.enhanced_db.save_trade_history(history_record)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to save trade history: {e}")
 
             if config.make_webhook_enabled and config.user_id in self.webhook_loggers:
                 trade_data = {
