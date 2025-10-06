@@ -3470,6 +3470,7 @@ def build_account_page():
     return ReplyKeyboardMarkup([
         ["🚀 Start", "🛑 Stop"],
         ["📋 History", "📈 Trades"],
+        ["📊 Account Stats"],
         ["⚙️ Settings", "📡 Channels"],
         ["🔙 Accounts"]
     ], resize_keyboard=True)
@@ -3618,40 +3619,188 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔑 <b>Accounts</b>", parse_mode='HTML', reply_markup=build_accounts_menu(accs))
 
     elif text == "📊 Stats":
+        # Show comprehensive stats for all accounts
         accs = trading_bot.enhanced_db.get_all_accounts()
-        msg = "📊 <b>Overall Stats</b>\n\n"
-        msg += f"Total Accounts: {len(accs)}\n"
-        # Add balance calculation here
+        msg = "📊 <b>Overall Statistics</b>\n\n"
+        msg += f"📋 Total Accounts: <b>{len(accs)}</b>\n"
+        
+        active_count = sum(1 for acc in accs if trading_bot.monitoring_status.get(user_id, False))
+        msg += f"🟢 Active Monitoring: <b>{active_count}</b>\n\n"
+        
+        # Per-account stats
+        msg += "💼 <b>Account Details:</b>\n\n"
+        
+        for acc in accs:
+            # Get active trades and history for this account
+            active_trades = trading_bot.enhanced_db.get_active_trades(acc.account_id)
+            trade_history = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=100)
+            
+            # Calculate PnL
+            total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+            
+            monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
+            balance_mode = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
+            
+            msg += f"<b>{acc.account_name}</b>\n"
+            msg += f"  Status: {monitor_status}\n"
+            msg += f"  ⚡ Leverage: {acc.leverage}x\n"
+            msg += f"  💰 Trade Amount: {balance_mode}\n"
+            msg += f"  📈 Active Trades: {len(active_trades)}\n"
+            msg += f"  📊 Total Trades: {len(trade_history)}\n"
+            msg += f"  💵 Total PnL: {total_pnl:.2f} USDT\n"
+            msg += f"  📡 Channels: {len(acc.monitored_channels)}\n\n"
+        
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "🚀 Start All":
         # Start monitoring all accounts
-        await update.message.reply_text("🚀 Starting all accounts...", parse_mode='HTML')
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        started_count = 0
+        failed_accounts = []
+        
+        for acc in accs:
+            if not acc.monitored_channels:
+                continue  # Skip accounts without channels
+            
+            try:
+                # Set current account temporarily
+                trading_bot.set_current_account(user_id, acc.account_id)
+                success = await trading_bot.start_monitoring(user_id, context.bot)
+                if success:
+                    trading_bot.monitoring_status[user_id] = True
+                    started_count += 1
+                else:
+                    failed_accounts.append(acc.account_name)
+            except Exception as e:
+                logger.error(f"Error starting {acc.account_name}: {e}")
+                failed_accounts.append(acc.account_name)
+        
+        msg = f"🚀 <b>Start All Accounts</b>\n\n"
+        msg += f"✅ Successfully started: {started_count}\n"
+        if failed_accounts:
+            msg += f"❌ Failed: {len(failed_accounts)}\n"
+            msg += f"Failed accounts: {', '.join(failed_accounts[:5])}"
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "🛑 Stop All":
-        await update.message.reply_text("🛑 Stopping all accounts...", parse_mode='HTML')
+        # Stop monitoring all accounts
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        stopped_count = 0
+        
+        for acc in accs:
+            try:
+                # Stop monitoring for this account
+                trading_bot.active_monitoring[user_id] = False
+                trading_bot.monitoring_status[user_id] = False
+                
+                # Stop any running monitoring tasks
+                if user_id in trading_bot.monitoring_tasks:
+                    task = trading_bot.monitoring_tasks[user_id]
+                    if not task.done():
+                        task.cancel()
+                    del trading_bot.monitoring_tasks[user_id]
+                
+                # Close telethon client if exists
+                if user_id in trading_bot.user_monitoring_clients:
+                    try:
+                        client = trading_bot.user_monitoring_clients[user_id]
+                        if client.is_connected():
+                            await client.disconnect()
+                        del trading_bot.user_monitoring_clients[user_id]
+                    except Exception:
+                        pass
+                
+                stopped_count += 1
+            except Exception as e:
+                logger.error(f"Error stopping {acc.account_name}: {e}")
+        
+        msg = f"🛑 <b>Stop All Accounts</b>\n\n"
+        msg += f"✅ Successfully stopped: {stopped_count}\n"
+        msg += f"All trading activities have been stopped."
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "📋 All History":
-        await update.message.reply_text("📋 Trade history across all accounts", parse_mode='HTML')
+        # Show trade history from all accounts
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        all_trades = []
+        
+        for acc in accs:
+            trades = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=20)
+            for trade in trades:
+                all_trades.append((acc.account_name, trade))
+        
+        if not all_trades:
+            await update.message.reply_text(
+                "📋 <b>No Trade History</b>\n\n"
+                "No trades found across all accounts.",
+                parse_mode='HTML',
+                reply_markup=build_main_menu()
+            )
+        else:
+            # Sort by entry time (most recent first)
+            all_trades.sort(key=lambda x: x[1].entry_time if x[1].entry_time else "", reverse=True)
+            text = f"📋 <b>All Accounts Trade History ({len(all_trades)})</b>\n\n"
+            
+            for acc_name, trade in all_trades[:20]:  # Limit to 20 most recent
+                status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
+                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
+                text += f"Account: {acc_name}\n"
+                text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
+                text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
+            
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "📈 All Trades":
-        await update.message.reply_text("📈 Active trades across all accounts", parse_mode='HTML')
+        # Show active trades from all accounts
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        all_active_trades = []
+        
+        for acc in accs:
+            trades = trading_bot.enhanced_db.get_active_trades(acc.account_id)
+            for trade in trades:
+                all_active_trades.append((acc.account_name, trade))
+        
+        if not all_active_trades:
+            await update.message.reply_text(
+                "📈 <b>No Active Trades</b>\n\n"
+                "No open positions across all accounts.",
+                parse_mode='HTML',
+                reply_markup=build_main_menu()
+            )
+        else:
+            text = f"📈 <b>All Active Trades ({len(all_active_trades)})</b>\n\n"
+            
+            for acc_name, trade in all_active_trades:
+                text += f"<b>{trade.symbol}</b> {trade.side}\n"
+                text += f"Account: {acc_name}\n"
+                text += f"Entry: {trade.entry_price}\n"
+                text += f"Quantity: {trade.quantity}\n"
+                text += f"Leverage: {trade.leverage}x\n\n"
+            
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "⚙️ Default Settings":
-        # Show editable defaults and instructions
+        # Show editable defaults and instructions (matching account settings style)
         current = trading_bot.enhanced_db.get_default_settings()
-        msg = (
-            "⚙️ <b>Default Settings</b>\n\n"
-            f"📊 Leverage: {current['leverage']}x\n"
-            f"💰 Risk: {current['risk_percentage']}%\n"
-            f"🎯 TP Levels: {current['tp_levels']} (as % of entry deltas)\n"
-            f"🛡️ SL: {current['sl_level']}%\n\n"
-            "To update, send commands:\n"
-            "• default leverage 10\n"
-            "• default risk 2.0\n"
-            "• default sl -10\n"
-            "• default tp 2.0,3.5,5.0\n"
-        )
+        
+        msg = "⚙️ <b>Default Settings for New Accounts</b>\n\n"
+        msg += "These settings will be applied to newly created accounts:\n\n"
+        
+        msg += "<b>Trading Configuration:</b>\n"
+        msg += f"⚡ Leverage: <b>{current['leverage']}x</b>\n"
+        msg += f"💰 Risk Percentage: <b>{current['risk_percentage']}%</b>\n"
+        msg += f"🎯 TP Levels: <b>{current['tp_levels']}</b>\n"
+        msg += f"🛡️ Stop Loss: <b>{current['sl_level']}%</b>\n\n"
+        
+        msg += "<b>How to Update:</b>\n"
+        msg += "Send commands in this format:\n\n"
+        msg += "• <code>default leverage 10</code>\n"
+        msg += "• <code>default risk 2.0</code>\n"
+        msg += "• <code>default sl -10</code>\n"
+        msg += "• <code>default tp 2.0,3.5,5.0</code>\n\n"
+        
+        msg += "💡 <i>Tip: These settings only affect new accounts. Existing accounts keep their current settings.</i>"
+        
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     # Accounts menu buttons
@@ -3671,22 +3820,61 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             
-            # Display complete account settings (synced with settings view)
+            # Display complete account settings with all details
             balance_mode = "Percentage" if acc.use_percentage_balance else "Fixed USDT"
             balance_value = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
             
+            # Get stats for this account
+            active_trades = trading_bot.enhanced_db.get_active_trades(acc.account_id)
+            trade_history = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=100)
+            total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+            
             msg = f"📋 <b>{acc.account_name}</b>\n\n"
+            
+            # Account Status
+            monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
+            msg += f"🔄 <b>Monitoring:</b> {monitor_status}\n"
+            msg += f"📡 <b>Channels:</b> {len(acc.monitored_channels)}\n\n"
+            
+            # Trading Statistics
+            msg += f"📊 <b>Statistics:</b>\n"
+            msg += f"📈 Active Trades: <b>{len(active_trades)}</b>\n"
+            msg += f"📋 Total Trades: <b>{len(trade_history)}</b>\n"
+            msg += f"💵 Total PnL: <b>{total_pnl:.2f} USDT</b>\n\n"
+            
+            # Trading Settings
             msg += f"⚙️ <b>Trading Settings:</b>\n"
             msg += f"⚡ Leverage: <b>{acc.leverage}x</b>\n"
-            msg += f"💰 Risk: <b>{acc.risk_percentage}%</b>\n"
+            msg += f"💰 Risk %: <b>{acc.risk_percentage}%</b>\n"
             msg += f"💵 Balance Mode: <b>{balance_mode}</b>\n"
-            msg += f"💵 Trade Amount: <b>{balance_value}</b>\n"
-            msg += f"🎯 Take Profits: <b>{len(acc.take_profit_levels)} levels</b>\n"
-            msg += f"🛑 Stop Losses: <b>{len(acc.stop_loss_levels)} levels</b>\n"
-            # Monitoring status line
-            monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
-            msg += f"📡 Channels: <b>{len(acc.monitored_channels)}</b>\n"
-            msg += f"🔄 Monitoring: <b>{monitor_status}</b>\n\n"
+            msg += f"💵 Trade Amount: <b>{balance_value}</b>\n\n"
+            
+            # TP/SL Configuration
+            msg += f"🎯 <b>TP/SL Configuration:</b>\n"
+            msg += f"🎯 Take Profit Levels: <b>{len(acc.take_profit_levels)}</b>\n"
+            if acc.take_profit_levels:
+                for i, tp in enumerate(acc.take_profit_levels[:3], 1):
+                    msg += f"  TP{i}: {tp.percentage}% → Close {tp.close_percentage}%\n"
+            msg += f"🛑 Stop Loss Levels: <b>{len(acc.stop_loss_levels)}</b>\n"
+            if acc.stop_loss_levels:
+                for i, sl in enumerate(acc.stop_loss_levels[:3], 1):
+                    msg += f"  SL{i}: {sl.percentage}% → Close {sl.close_percentage}%\n"
+            msg += "\n"
+            
+            # Trailing Stop Settings
+            trailing_status = "🟢 ON" if acc.trailing_enabled else "🔴 OFF"
+            msg += f"📉 <b>Trailing Stop:</b> {trailing_status}\n"
+            if acc.trailing_enabled:
+                msg += f"  🔔 Activation: <b>{acc.trailing_activation_percent}%</b>\n"
+                msg += f"  ↩️ Callback: <b>{acc.trailing_callback_percent}%</b>\n"
+            msg += "\n"
+            
+            # Advanced Features
+            msg += f"✅ <b>Features:</b>\n"
+            msg += f"  Signal Settings: <b>{'ON' if acc.use_signal_settings else 'OFF'}</b>\n"
+            msg += f"  Create SL/TP: <b>{'ON' if acc.create_sl_tp else 'OFF'}</b>\n"
+            msg += f"  Make Webhook: <b>{'ON' if acc.make_webhook_enabled else 'OFF'}</b>\n\n"
+            
             msg += "Use the buttons below to manage this account."
             await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
 
@@ -3708,10 +3896,126 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_stop_trading(update, context)
 
     elif text == "📋 History" and 'current_account_id' in context.user_data:
-        await update.message.reply_text("📋 Trade history for this account", parse_mode='HTML')
+        # Show trade history for current account only
+        acc_id = context.user_data.get('current_account_id')
+        acc_name = context.user_data.get('current_account_name', 'Account')
+        
+        trade_history = trading_bot.enhanced_db.get_trade_history(acc_id, limit=20)
+        
+        if not trade_history:
+            await update.message.reply_text(
+                f"📋 <b>No Trade History</b>\n\n"
+                f"Account: {acc_name}\n\n"
+                f"You haven't made any trades yet on this account.",
+                parse_mode='HTML',
+                reply_markup=build_account_page()
+            )
+        else:
+            text = f"📋 <b>Trade History - {acc_name}</b>\n\n"
+            text += f"Recent trades ({len(trade_history)}):\n\n"
+            
+            for trade in trade_history:
+                status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
+                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
+                text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
+                text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
+            
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "📈 Trades" and 'current_account_id' in context.user_data:
-        await update.message.reply_text("📈 Active trades for this account", parse_mode='HTML')
+        # Show active trades for current account only
+        acc_id = context.user_data.get('current_account_id')
+        acc_name = context.user_data.get('current_account_name', 'Account')
+        
+        active_trades = trading_bot.enhanced_db.get_active_trades(acc_id)
+        
+        if not active_trades:
+            await update.message.reply_text(
+                f"📈 <b>No Active Trades</b>\n\n"
+                f"Account: {acc_name}\n\n"
+                f"You don't have any open positions on this account.",
+                parse_mode='HTML',
+                reply_markup=build_account_page()
+            )
+        else:
+            text = f"📈 <b>Active Trades - {acc_name}</b>\n\n"
+            text += f"Open positions ({len(active_trades)}):\n\n"
+            
+            for trade in active_trades:
+                text += f"<b>{trade.symbol}</b> {trade.side}\n"
+                text += f"Entry: {trade.entry_price}\n"
+                text += f"Quantity: {trade.quantity}\n"
+                text += f"Leverage: {trade.leverage}x\n"
+                text += f"Status: {trade.status}\n\n"
+            
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
+
+    elif text == "📊 Account Stats" and 'current_account_id' in context.user_data:
+        # Show detailed stats for current account
+        acc_id = context.user_data.get('current_account_id')
+        acc_name = context.user_data.get('current_account_name', 'Account')
+        
+        # Get account from database
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        acc = next((a for a in accs if a.account_id == acc_id), None)
+        
+        if not acc:
+            await update.message.reply_text(
+                "❌ Account not found",
+                parse_mode='HTML',
+                reply_markup=build_account_page()
+            )
+            return
+        
+        # Get trades and calculate stats
+        active_trades = trading_bot.enhanced_db.get_active_trades(acc_id)
+        trade_history = trading_bot.enhanced_db.get_trade_history(acc_id, limit=100)
+        
+        # Calculate statistics
+        total_trades = len(trade_history)
+        winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+        losing_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) < 0)
+        total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        
+        # Build stats message
+        msg = f"📊 <b>Account Statistics - {acc_name}</b>\n\n"
+        
+        # Trading Performance
+        msg += f"📈 <b>Trading Performance:</b>\n"
+        msg += f"Total Trades: <b>{total_trades}</b>\n"
+        msg += f"✅ Winning Trades: <b>{winning_trades}</b>\n"
+        msg += f"❌ Losing Trades: <b>{losing_trades}</b>\n"
+        msg += f"📊 Win Rate: <b>{win_rate:.1f}%</b>\n"
+        msg += f"💵 Total PnL: <b>{total_pnl:.2f} USDT</b>\n\n"
+        
+        # Active Positions
+        msg += f"📍 <b>Active Positions:</b>\n"
+        msg += f"Open Trades: <b>{len(active_trades)}</b>\n"
+        if active_trades:
+            active_pnl = sum(float(t.pnl) if t.pnl else 0 for t in active_trades)
+            msg += f"Active PnL: <b>{active_pnl:.2f} USDT</b>\n"
+        msg += "\n"
+        
+        # Account Configuration
+        balance_mode = "Percentage" if acc.use_percentage_balance else "Fixed USDT"
+        balance_value = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
+        
+        msg += f"⚙️ <b>Configuration:</b>\n"
+        msg += f"⚡ Leverage: <b>{acc.leverage}x</b>\n"
+        msg += f"💰 Risk: <b>{acc.risk_percentage}%</b>\n"
+        msg += f"💵 Trade Amount: <b>{balance_value}</b>\n"
+        msg += f"🎯 TP Levels: <b>{len(acc.take_profit_levels)}</b>\n"
+        msg += f"🛑 SL Levels: <b>{len(acc.stop_loss_levels)}</b>\n"
+        msg += f"📉 Trailing Stop: <b>{'ON' if acc.trailing_enabled else 'OFF'}</b>\n\n"
+        
+        # Monitoring Status
+        monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
+        msg += f"🔄 <b>Status:</b>\n"
+        msg += f"Monitoring: <b>{monitor_status}</b>\n"
+        msg += f"📡 Channels: <b>{len(acc.monitored_channels)}</b>\n"
+        
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "⚙️ Settings" and 'current_account_id' in context.user_data:
         # This will be handled by the conversation handler
@@ -4723,27 +5027,56 @@ Next: press 🚀 Start on the account page""",
         await query.edit_message_text("🔄 <b>OCO Monitor enabled</b>", parse_mode='HTML')
 
     elif query.data == "toggle_trade_amount_mode":
-        config.use_fixed_usdt_amount = not config.use_fixed_usdt_amount
-        if config.use_fixed_usdt_amount:
-            await query.edit_message_text(
-                f"💵 <b>Set Fixed USDT Amount</b>\n\nCurrent: ${config.fixed_usdt_amount:.0f}\nSend new amount:",
-                parse_mode='HTML'
-            )
-            return WAITING_USDT_AMOUNT
-        else:
-            # Persist the toggle to database
-            try:
-                current_account = trading_bot.get_current_account(user_id)
-                if current_account:
-                    trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_percentage_balance=not config.use_fixed_usdt_amount)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to persist trade amount mode: {e}")
-            keyboard_markup = create_settings_keyboard(user_id)
-            await query.edit_message_text(
-                render_trading_config_text(user_id),
-                reply_markup=keyboard_markup,
-                parse_mode='HTML'
-            )
+        # Show inline buttons to choose between percentage and USDT amount
+        keyboard = [
+            [InlineKeyboardButton("💰 Percentage", callback_data="choose_percentage")],
+            [InlineKeyboardButton("💵 Fixed USDT", callback_data="choose_fixed_usdt")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_to_settings")]
+        ]
+        await query.edit_message_text(
+            "💰 <b>Choose Trade Amount Mode:</b>\n\n"
+            "Select how you want to configure your trade amount:",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_SETTINGS_SOURCE
+    
+    elif query.data == "choose_percentage":
+        config.use_fixed_usdt_amount = False
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_percentage_balance=True)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist trade amount mode: {e}")
+        await query.edit_message_text(
+            f"💰 <b>Set Balance Percentage</b>\n\nCurrent: {config.balance_percent}%\n\nSend percentage (1-100):",
+            parse_mode='HTML'
+        )
+        return WAITING_BALANCE_PERCENT
+    
+    elif query.data == "choose_fixed_usdt":
+        config.use_fixed_usdt_amount = True
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            if current_account:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_percentage_balance=False)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist trade amount mode: {e}")
+        await query.edit_message_text(
+            f"💵 <b>Set Fixed USDT Amount</b>\n\nCurrent: ${config.fixed_usdt_amount:.0f}\n\nSend new amount:",
+            parse_mode='HTML'
+        )
+        return WAITING_USDT_AMOUNT
+    
+    elif query.data == "back_to_settings":
+        keyboard_markup = create_settings_keyboard(user_id)
+        await query.edit_message_text(
+            render_trading_config_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+        return WAITING_SETTINGS_SOURCE
 
     elif query.data == "configure_take_profits":
         # Render TP levels with totals for clarity
@@ -5199,16 +5532,61 @@ async def handle_account_bingx_key(update: Update, context: ContextTypes.DEFAULT
     return WAITING_ACCOUNT_BINGX_SECRET
 
 async def handle_account_bingx_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle BingX secret key input"""
+    """Handle BingX secret key input and create account (using default Telegram credentials)"""
     secret_key = update.message.text.strip()
-    context.user_data['bingx_secret_key'] = secret_key
     
-    await update.message.reply_text(
-        "✅ Secret Key saved!\n\n"
-        "Now provide your Telegram API ID:",
-        parse_mode='HTML'
+    # Create account configuration using default Telegram credentials
+    account_id = str(uuid.uuid4())
+    user_id = update.effective_user.id
+    
+    # Get default settings
+    defaults = trading_bot.enhanced_db.get_default_settings()
+    
+    account = AccountConfig(
+        account_id=account_id,
+        account_name=context.user_data['account_name'],
+        bingx_api_key=context.user_data['bingx_api_key'],
+        bingx_secret_key=secret_key,
+        telegram_api_id=DEFAULT_TELEGRAM_API_ID,
+        telegram_api_hash=DEFAULT_TELEGRAM_API_HASH,
+        phone="",  # Not required when using default credentials
+        user_id=user_id,
+        is_active=True,
+        created_at=datetime.now().isoformat(),
+        last_used=datetime.now().isoformat(),
+        leverage=int(defaults.get('leverage', DEFAULT_SETTINGS['leverage'])),
+        risk_percentage=float(defaults.get('risk_percentage', DEFAULT_SETTINGS['risk_percentage'])),
+        use_percentage_balance=True,
+        monitored_channels=[],
+        signal_channels=[]
     )
-    return WAITING_ACCOUNT_TELEGRAM_ID
+    
+    # Save to database
+    if trading_bot.enhanced_db.create_account(account):
+        await update.message.reply_text(
+            f"🎉 <b>Account Created Successfully!</b>\n\n"
+            f"Account: <b>{account.account_name}</b>\n"
+            f"ID: <code>{account_id}</code>\n\n"
+            f"Default settings applied:\n"
+            f"⚡ Leverage: {account.leverage}x\n"
+            f"💰 Risk: {account.risk_percentage}%\n\n"
+            f"You can now:\n"
+            f"• Configure account settings\n"
+            f"• Add channels to monitor\n"
+            f"• Start receiving signals",
+            parse_mode='HTML',
+            reply_markup=build_accounts_menu(trading_bot.enhanced_db.get_all_accounts())
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Failed to create account. Please try again.",
+            parse_mode='HTML'
+        )
+    
+    # Clear user data
+    context.user_data.clear()
+    
+    return ConversationHandler.END
 
 async def handle_account_telegram_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Telegram API ID input"""
@@ -5428,9 +5806,6 @@ account_conv_handler = ConversationHandler(
         WAITING_ACCOUNT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_name)],
         WAITING_ACCOUNT_BINGX_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_bingx_key)],
         WAITING_ACCOUNT_BINGX_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_bingx_secret)],
-        WAITING_ACCOUNT_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_id)],
-        WAITING_ACCOUNT_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_hash)],
-        WAITING_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_phone)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
