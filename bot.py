@@ -2568,19 +2568,50 @@ class TradingBot:
                 logger.error(f"❌ Telethon client not authorized for account {account_id}")
                 logger.info(f"ℹ️ Please authorize the account through the bot interface")
                 return []
+            
+            # Ensure client is connected
+            if not telethon_client.is_connected():
+                logger.info(f"🔌 Connecting Telethon client for account {account_id}...")
+                try:
+                    await telethon_client.connect()
+                except Exception as conn_error:
+                    logger.error(f"❌ Failed to connect Telethon client: {conn_error}")
+                    return []
 
             channels = []
             # Fetch ALL dialogs with limit=None to get all subscribed channels
-            async for dialog in telethon_client.iter_dialogs(limit=None):
-                if isinstance(dialog.entity, Channel):
-                    channel_id = str(-abs(dialog.entity.id))
-                    channels.append({
-                        'id': channel_id,
-                        'title': dialog.entity.title or "Unknown Channel",
-                        'username': getattr(dialog.entity, 'username', 'N/A')
-                    })
-
-            logger.info(f"📡 Found {len(channels)} channels for account {account_id}")
+            try:
+                logger.info(f"🔍 Fetching dialogs for account {account_id}...")
+                
+                # Wrap the iteration in a coroutine with timeout (30 seconds)
+                async def fetch_dialogs():
+                    dialog_channels = []
+                    async for dialog in telethon_client.iter_dialogs(limit=None):
+                        try:
+                            if isinstance(dialog.entity, Channel):
+                                channel_id = str(-abs(dialog.entity.id))
+                                dialog_channels.append({
+                                    'id': channel_id,
+                                    'title': dialog.entity.title or "Unknown Channel",
+                                    'username': getattr(dialog.entity, 'username', 'N/A')
+                                })
+                        except Exception as dialog_error:
+                            logger.warning(f"⚠️ Error processing dialog: {dialog_error}")
+                            continue  # Skip this dialog and continue with the next one
+                    return dialog_channels
+                
+                # Add 30-second timeout to prevent hanging
+                channels = await asyncio.wait_for(fetch_dialogs(), timeout=30.0)
+                logger.info(f"📡 Found {len(channels)} channels for account {account_id}")
+                
+            except asyncio.TimeoutError:
+                logger.error(f"⏱️ Timeout while fetching dialogs for account {account_id}")
+                logger.info(f"ℹ️ This may be due to slow network or too many channels. Try again later.")
+            except Exception as iter_error:
+                logger.error(f"❌ Error iterating dialogs: {iter_error}")
+                logger.error(traceback.format_exc())
+                logger.info(f"ℹ️ Returning {len(channels)} channels fetched before error")
+            
             return channels
 
         except Exception as e:
@@ -4921,10 +4952,31 @@ async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_text("🔍 <b>Loading channels...</b>", parse_mode='HTML')
 
-    channels = await trading_bot.get_available_channels(user_id)
+    try:
+        channels = await trading_bot.get_available_channels(user_id)
+    except Exception as e:
+        logger.error(f"❌ Error in setup_channels: {e}")
+        logger.error(traceback.format_exc())
+        await send_text(
+            "❌ <b>Error loading channels!</b>\n\n"
+            "This may be due to:\n"
+            "• Network connection issues\n"
+            "• Telegram API rate limiting\n"
+            "• Invalid Telegram credentials\n\n"
+            "Please try again in a few moments.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
 
     if not channels:
-        await send_text("❌ <b>No channels!</b> Add an account and configure 📡 Channels from the account page.", parse_mode='HTML')
+        await send_text(
+            "ℹ️ <b>No channels found!</b>\n\n"
+            "Make sure you:\n"
+            "• Have joined Telegram channels\n"
+            "• Configured Telegram API credentials\n"
+            "• Are logged into the correct Telegram account",
+            parse_mode='HTML'
+        )
         return ConversationHandler.END
 
     context.user_data['available_channels'] = channels
