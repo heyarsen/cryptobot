@@ -2290,6 +2290,36 @@ class TradingBot:
                         try:
                             if not self.exchange:
                                 continue
+                            
+                            # Check if position still exists on exchange (detect manual closes)
+                            try:
+                                positions = self.exchange.fetch_positions([self.to_bingx_symbol(symbol)])
+                                position_exists = False
+                                for pos in positions:
+                                    if pos.get('contracts', 0) > 0 or abs(float(pos.get('contractSize', 0))) > 0:
+                                        position_exists = True
+                                        break
+                                
+                                # If position doesn't exist on exchange, mark as closed
+                                if not position_exists:
+                                    logger.info(f"📭 Position {symbol} closed manually on exchange")
+                                    try:
+                                        self.enhanced_db.update_trade_status(
+                                            getattr(position, 'trade_id', ''), 
+                                            status="CLOSED", 
+                                            exit_time=datetime.now().isoformat()
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ Failed to close trade in history: {e}")
+                                    
+                                    # Remove from active positions
+                                    if symbol in self.active_positions:
+                                        del self.active_positions[symbol]
+                                        logger.info(f"🗑️ Removed {symbol} from active positions (manual close)")
+                                    continue
+                            except Exception as e:
+                                logger.debug(f"Could not check position status for {symbol}: {e}")
+                            
                             open_orders = self.exchange.fetch_open_orders(self.to_bingx_symbol(symbol))
                             open_order_ids = [int(order['id']) for order in open_orders]
 
@@ -2410,28 +2440,42 @@ class TradingBot:
     async def setup_telethon_client(self, config: BotConfig) -> bool:
         """Setup Telethon client"""
         try:
-            session_name = f'session_{config.user_id}'
-            
-            # Get phone from current account
+            # Get current account to use account-specific credentials
             current_account = self.get_current_account(config.user_id)
-            phone = current_account.phone if current_account and hasattr(current_account, 'phone') else None
+            if not current_account:
+                logger.error("❌ No current account set for Telethon setup")
+                return False
+            
+            # Use account_id for session to support multiple Telegram accounts per user
+            session_name = f'session_{current_account.account_id}'
+            phone = current_account.phone if hasattr(current_account, 'phone') else None
+            
+            # Use account-specific Telegram credentials
+            api_id = current_account.telegram_api_id
+            api_hash = current_account.telegram_api_hash
 
             telethon_client = TelegramClient(
                 session_name,
-                api_id=int(config.telegram_api_id),
-                api_hash=config.telegram_api_hash
+                api_id=int(api_id),
+                api_hash=api_hash
             )
 
             # Start with phone parameter to avoid interactive prompt
-            # If phone is not provided, use empty lambda functions to avoid EOF error
+            # If phone is not provided, use lambda that returns empty string to avoid EOF error
             if phone and phone.strip():
                 await telethon_client.start(phone=lambda: phone)
             else:
-                # Use bot_token approach to avoid phone prompt
-                await telethon_client.start()
-            self.user_monitoring_clients[config.user_id] = telethon_client
+                # Provide lambda functions that return empty strings to avoid interactive prompts
+                await telethon_client.start(
+                    phone=lambda: '',
+                    password=lambda: '',
+                    code_callback=lambda: ''
+                )
+            
+            # Store by account_id to support multiple Telegram accounts per user
+            self.user_monitoring_clients[current_account.account_id] = telethon_client
 
-            logger.info(f"✅ Telethon setup successful for user {config.user_id}")
+            logger.info(f"✅ Telethon setup successful for account {current_account.account_id}")
             return True
 
         except Exception as e:
@@ -2440,13 +2484,22 @@ class TradingBot:
 
     async def get_available_channels(self, user_id: int) -> List[Dict]:
         try:
+            # Get current account to use account-specific Telethon client
+            current_account = self.get_current_account(user_id)
+            if not current_account:
+                logger.error("❌ No current account set for getting channels")
+                return []
+            
             config = self.get_user_config(user_id)
+            account_id = current_account.account_id
 
-            if user_id not in self.user_monitoring_clients:
+            # Check if Telethon client exists for this account
+            if account_id not in self.user_monitoring_clients:
                 await self.setup_telethon_client(config)
 
-            telethon_client = self.user_monitoring_clients.get(user_id)
+            telethon_client = self.user_monitoring_clients.get(account_id)
             if not telethon_client:
+                logger.error(f"❌ Failed to get Telethon client for account {account_id}")
                 return []
 
             channels = []
@@ -2459,7 +2512,7 @@ class TradingBot:
                         'username': getattr(dialog.entity, 'username', 'N/A')
                     })
 
-            logger.info(f"📡 Found {len(channels)} channels for user {user_id}")
+            logger.info(f"📡 Found {len(channels)} channels for account {account_id}")
             return channels
 
         except Exception as e:
@@ -2952,19 +3005,26 @@ class TradingBot:
     async def start_monitoring(self, user_id: int, bot_instance) -> bool:
         try:
             config = self.get_user_config(user_id)
+            current_account = self.get_current_account(user_id)
+            
+            if not current_account:
+                logger.error("❌ No current account set for monitoring")
+                return False
 
             if not config.monitored_channels:
                 return False
 
             # Store bot instance for notifications
             self.bot_instances[user_id] = bot_instance
+            
+            account_id = current_account.account_id
 
-            telethon_client = self.user_monitoring_clients.get(user_id)
+            telethon_client = self.user_monitoring_clients.get(account_id)
             if not telethon_client:
                 success = await self.setup_telethon_client(config)
                 if not success:
                     return False
-                telethon_client = self.user_monitoring_clients[user_id]
+                telethon_client = self.user_monitoring_clients[account_id]
 
             self.setup_make_webhook(user_id)
 
@@ -3111,9 +3171,16 @@ class TradingBot:
         when integrating with other async frameworks like python-telegram-bot.
         """
         try:
-            telethon_client = self.user_monitoring_clients.get(user_id)
+            # Get current account to use account-specific Telethon client
+            current_account = self.get_current_account(user_id)
+            if not current_account:
+                logger.error(f"❌ No current account found for user {user_id}")
+                return
+            
+            account_id = current_account.account_id
+            telethon_client = self.user_monitoring_clients.get(account_id)
             if not telethon_client:
-                logger.error(f"❌ No Telethon client found for user {user_id}")
+                logger.error(f"❌ No Telethon client found for account {account_id}")
                 return
             
             logger.info(f"🔄 [_run_telethon_client] Starting message polling for user {user_id}")
@@ -3150,16 +3217,36 @@ class TradingBot:
                     
                     logger.debug(f"🔍 Polling {len(config.monitored_channels)} channels for user {user_id}: {config.monitored_channels}")
                     
+                    # Get current account to filter channels
+                    current_account = self.get_current_account(user_id)
+                    
+                    # Only monitor channels for accounts that are actively monitoring
+                    if current_account and not self.account_monitoring_status.get(current_account.account_id, False):
+                        logger.debug(f"⏸️ Account {current_account.account_name} monitoring is paused, skipping...")
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    # Filter to only the current account's channels
+                    account_channels = current_account.monitored_channels if current_account else []
+                    channels_to_check = [ch for ch in config.monitored_channels if ch in account_channels]
+                    
                     # Check each monitored channel for new messages
-                    for channel_id_str in config.monitored_channels:
+                    for channel_id_str in channels_to_check:
                         try:
                             # Convert string channel ID to entity
                             channel_id = int(channel_id_str)
                             
                             logger.debug(f"🔎 Checking channel {channel_id_str} for new messages...")
                             
+                            # Get entity first to avoid ChatIdInvalidError
+                            try:
+                                entity = await telethon_client.get_entity(channel_id)
+                            except Exception as entity_error:
+                                logger.warning(f"⚠️ Could not get entity for channel {channel_id_str}: {entity_error}")
+                                continue
+                            
                             # Get the latest message from this channel
-                            messages = await telethon_client.get_messages(channel_id, limit=1)
+                            messages = await telethon_client.get_messages(entity, limit=1)
                             
                             if not messages:
                                 logger.debug(f"📭 No messages found in channel {channel_id_str}")
@@ -3771,6 +3858,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success = await trading_bot.start_monitoring(user_id, context.bot)
                 if success:
                     trading_bot.monitoring_status[user_id] = True
+                    trading_bot.account_monitoring_status[acc.account_id] = True
                     started_count += 1
                 else:
                     failed_accounts.append(acc.account_name)
@@ -3787,35 +3875,38 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "🛑 Stop All":
         # Stop monitoring all accounts
-        accs = trading_bot.enhanced_db.get_all_accounts()
+        accs = trading_bot.enhanced_db.get_user_accounts(user_id)
         stopped_count = 0
         
         for acc in accs:
             try:
                 # Stop monitoring for this account
-                trading_bot.active_monitoring[user_id] = False
-                trading_bot.monitoring_status[user_id] = False
+                trading_bot.account_monitoring_status[acc.account_id] = False
                 
-                # Stop any running monitoring tasks
-                if user_id in trading_bot.monitoring_tasks:
-                    task = trading_bot.monitoring_tasks[user_id]
-                    if not task.done():
-                        task.cancel()
-                    del trading_bot.monitoring_tasks[user_id]
-                
-                # Close telethon client if exists
-                if user_id in trading_bot.user_monitoring_clients:
+                # Close telethon client if exists for this account
+                if acc.account_id in trading_bot.user_monitoring_clients:
                     try:
-                        client = trading_bot.user_monitoring_clients[user_id]
+                        client = trading_bot.user_monitoring_clients[acc.account_id]
                         if client.is_connected():
                             await client.disconnect()
-                        del trading_bot.user_monitoring_clients[user_id]
+                        del trading_bot.user_monitoring_clients[acc.account_id]
                     except Exception:
                         pass
                 
                 stopped_count += 1
             except Exception as e:
                 logger.error(f"Error stopping {acc.account_name}: {e}")
+        
+        # Stop user-level monitoring
+        trading_bot.active_monitoring[user_id] = False
+        trading_bot.monitoring_status[user_id] = False
+        
+        # Stop any running monitoring tasks
+        if user_id in trading_bot.monitoring_tasks:
+            task = trading_bot.monitoring_tasks[user_id]
+            if not task.done():
+                task.cancel()
+            del trading_bot.monitoring_tasks[user_id]
         
         msg = f"🛑 <b>Stop All Accounts</b>\n\n"
         msg += f"✅ Successfully stopped: {stopped_count}\n"
@@ -4448,15 +4539,17 @@ async def handle_stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
                     task.cancel()
                 del trading_bot.monitoring_tasks[user_id]
             
-            # Close telethon client if exists
-            if user_id in trading_bot.user_monitoring_clients:
-                try:
-                    client = trading_bot.user_monitoring_clients[user_id]
-                    if client.is_connected():
-                        await client.disconnect()
-                    del trading_bot.user_monitoring_clients[user_id]
-                except Exception as e:
-                    logger.error(f"Error closing telethon client: {e}")
+            # Close telethon client if exists for all user's accounts
+            user_accounts = trading_bot.enhanced_db.get_user_accounts(user_id)
+            for acc in user_accounts:
+                if acc.account_id in trading_bot.user_monitoring_clients:
+                    try:
+                        client = trading_bot.user_monitoring_clients[acc.account_id]
+                        if client.is_connected():
+                            await client.disconnect()
+                        del trading_bot.user_monitoring_clients[acc.account_id]
+                    except Exception as e:
+                        logger.error(f"Error closing telethon client for account {acc.account_id}: {e}")
         
         await update.message.reply_text(
             f"🛑 <b>Trading Stopped Successfully!</b>\n\n"
@@ -6009,7 +6102,8 @@ async def auto_start_monitoring():
                     
                     if success:
                         trading_bot.monitoring_status[account.user_id] = True
-                        logger.info(f"✅ Auto-started monitoring for user {account.user_id}")
+                        trading_bot.account_monitoring_status[account.account_id] = True
+                        logger.info(f"✅ Auto-started monitoring for account {account.account_id}")
                         
                         # Send notification to user
                         try:
