@@ -6085,9 +6085,9 @@ async def auto_start_monitoring():
                     logger.info(f"   Account: {account.account_name}")
                     logger.info(f"   Channels: {account.monitored_channels}")
                     
-                    # Set the current account for this user and bind exchange client
-                    trading_bot.set_current_account(account.user_id, account.account_id)
-                    trading_bot.set_app_setting(f'current_account_{account.user_id}', account.account_id)
+                # Set the current account for this user and bind exchange client
+                trading_bot.set_current_account(account.user_id, account.account_id)
+                trading_bot.enhanced_db.set_app_setting(f'current_account_{account.user_id}', account.account_id)
                     
                     # Get the bot application
                     bot_app = trading_bot.bot_instances.get(account.user_id)
