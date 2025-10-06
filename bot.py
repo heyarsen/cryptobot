@@ -6004,7 +6004,8 @@ channel_conv_handler = ConversationHandler(
         WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
-    per_message=True
+    per_user=True,
+    per_chat=True,
 )
 
 trading_conv_handler = ConversationHandler(
@@ -6026,7 +6027,8 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
-    per_message=True
+    per_user=True,
+    per_chat=True,
 )
 
 # Enhanced account conversation handler
