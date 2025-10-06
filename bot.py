@@ -295,7 +295,6 @@ class ParsedSignal:
     """Enhanced signal structure"""
     signal_id: str
     channel_id: int
-    account_id: str
     raw_text: str
     symbol: str
     side: str  # LONG/SHORT
@@ -309,6 +308,7 @@ class ParsedSignal:
     trade_executed: bool = False
     trade_id: Optional[str] = None
     confidence: float = 0.0  # Confidence score 0-1
+    account_id: str = ""
     
     def __post_init__(self):
         if self.take_profit is None:
@@ -486,11 +486,31 @@ class EnhancedDatabase:
             parent_dir = os.path.dirname(db_path)
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
+            # If the chosen DB path does not exist but we can find an existing DB
+            # in common previous locations, migrate it so accounts persist across redeploys
+            try:
+                if not os.path.exists(db_path):
+                    candidate_old_paths = [
+                        os.path.join(os.getcwd(), 'enhanced_trading_bot.db'),
+                        os.path.join('/workspace', 'enhanced_trading_bot.db'),
+                        os.path.join(os.path.dirname(__file__), 'enhanced_trading_bot.db'),
+                    ]
+                    for old_path in candidate_old_paths:
+                        if old_path != db_path and os.path.exists(old_path):
+                            try:
+                                shutil.copy2(old_path, db_path)
+                                logger.info(f"📦 Migrated database from {old_path} -> {db_path}")
+                                break
+                            except Exception as mig_e:
+                                logger.warning(f"⚠️ Database migration attempt failed from {old_path}: {mig_e}")
+            except Exception as mig_outer:
+                logger.debug(f"DB migration check error: {mig_outer}")
         except Exception:
             # Fall back silently to provided db_path
             pass
 
         self.db_path = db_path
+        logger.info(f"🗄️ Using database at: {self.db_path}")
         self.init_database()
     
     def init_database(self):
@@ -2035,8 +2055,14 @@ class TradingBot:
             qty_decimal = Decimal(str(quantity))
             step_decimal = Decimal(str(step_size))
             
-            rounded = float((qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_decimal)
-            rounded = round(rounded, qty_precision)
+            # First, floor to the nearest step multiple to avoid oversizing
+            rounded_decimal = (qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_decimal
+
+            # Then, floor to declared precision (never round up here)
+            if isinstance(qty_precision, int) and qty_precision >= 0:
+                precision_quant = Decimal('1').scaleb(-qty_precision)
+                rounded_decimal = Decimal(rounded_decimal).quantize(precision_quant, rounding=ROUND_DOWN)
+            rounded = float(rounded_decimal)
             
             if rounded < step_size:
                 rounded = step_size
@@ -2543,7 +2569,8 @@ class TradingBot:
                                 'stopPrice': rounded_sl,
                                 'triggerPrice': rounded_sl,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'reduceOnly': True
                             }
                         )
                         logger.info(f"🛑 Stop Loss order placed: {sl_order}")
@@ -2581,20 +2608,47 @@ class TradingBot:
                     
                     tp_targets = adjusted_tp_targets
                     
-                    # Calculate quantities based on custom close percentages
-                    quantities = []
-                    remaining_quantity = quantity
-                    
+                    # Calculate quantities based on custom close percentages, then cap and floor so sum <= position
+                    requested_quantities: List[float] = []
+                    remaining_unrounded = quantity
                     for i, tp_level in enumerate(config.custom_take_profits[:len(tp_targets)]):
-                        if i == len(tp_targets) - 1:  # Last TP level closes all remaining
-                            quantities.append(remaining_quantity)
+                        if i == len(tp_targets) - 1:
+                            requested_quantities.append(remaining_unrounded)
                         else:
-                            close_qty = remaining_quantity * (tp_level.close_percentage / 100)
-                            quantities.append(close_qty)
-                            remaining_quantity -= close_qty
+                            desired_close = max(0.0, remaining_unrounded * (tp_level.close_percentage / 100.0))
+                            requested_quantities.append(desired_close)
+                            remaining_unrounded -= desired_close
 
-                    for tp, q in zip(tp_targets, quantities):
-                        each_qty = self.round_quantity(q, precision_info['step_size'], precision_info['qty_precision'])
+                    rounded_quantities: List[float] = []
+                    cumulative_assigned = 0.0
+                    total_levels = len(requested_quantities)
+                    step_size = precision_info['step_size']
+                    for i, requested in enumerate(requested_quantities):
+                        remaining_levels = total_levels - i
+                        remaining_capacity = max(quantity - cumulative_assigned, 0.0)
+                        # Keep room for at least step_size for remaining levels
+                        min_reserved_for_rest = step_size * max(remaining_levels - 1, 0)
+                        alloc = min(requested, max(remaining_capacity - min_reserved_for_rest, 0.0))
+                        each_qty = self.round_quantity(alloc, step_size, precision_info['qty_precision'])
+                        if each_qty < step_size:
+                            # Skip this level unless it's the last one
+                            if i != total_levels - 1:
+                                continue
+                            # Last level gets the remainder
+                            each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
+                        if cumulative_assigned + each_qty > quantity:
+                            each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
+                        if each_qty < step_size:
+                            continue
+                        rounded_quantities.append(each_qty)
+                        cumulative_assigned += each_qty
+                        if cumulative_assigned >= quantity - (step_size * 1e-9):
+                            break
+
+                    # Align number of TP targets with actual rounded quantities
+                    effective_tp_pairs = list(zip(tp_targets[:len(rounded_quantities)], rounded_quantities))
+
+                    for tp, each_qty in effective_tp_pairs:
                         rounded_tp = self.round_price(tp, precision_info['tick_size'], precision_info['price_precision'])
                         # Ensure TP is on the correct side of current mark price
                         try:
@@ -2621,7 +2675,8 @@ class TradingBot:
                                 'stopPrice': rounded_tp,
                                 'triggerPrice': rounded_tp,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'reduceOnly': True
                             }
                         )
                         logger.info(f"🎯 Take Profit order placed: {tp_order}")
@@ -2643,7 +2698,8 @@ class TradingBot:
                                 'activationPrice': activation_price,
                                 'priceRate': round(callback_percent, 3),
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'reduceOnly': True
                             }
                             trailing_order = self.exchange.create_order(
                                 market_symbol,
