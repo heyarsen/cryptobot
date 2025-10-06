@@ -976,6 +976,42 @@ class EnhancedDatabase:
             logger.error(f"❌ Failed to update user_id for {account_id}: {e}")
             return False
     
+    def update_account_credentials(self, account_id: str, telegram_api_id: str = None, 
+                                   telegram_api_hash: str = None, phone: str = None) -> bool:
+        """Update account's Telegram credentials"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            updates = []
+            values = []
+            
+            if telegram_api_id is not None:
+                updates.append('telegram_api_id = ?')
+                values.append(telegram_api_id)
+            
+            if telegram_api_hash is not None:
+                updates.append('telegram_api_hash = ?')
+                values.append(telegram_api_hash)
+            
+            if phone is not None:
+                updates.append('phone = ?')
+                values.append(phone)
+            
+            if not updates:
+                return True
+            
+            values.append(account_id)
+            query = f"UPDATE accounts SET {', '.join(updates)} WHERE account_id = ?"
+            cursor.execute(query, values)
+            conn.commit()
+            conn.close()
+            logger.info(f"✅ Updated credentials for account {account_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update credentials for {account_id}: {e}")
+            return False
+    
     def get_user_accounts(self, user_id: int) -> List[AccountConfig]:
         """Get all accounts for a specific user"""
         try:
@@ -2474,22 +2510,23 @@ class TradingBot:
             )
 
             # Start with phone parameter to avoid interactive prompt
-            # If phone is not provided, use lambda that returns empty string to avoid EOF error
+            # Always use .start() method which handles authorization properly
             try:
-                if phone and phone.strip():
-                    await telethon_client.start(phone=lambda: phone)
-                else:
-                    # Try to connect with existing session
-                    # If session file exists and is authenticated, this should work
-                    await telethon_client.connect()
-                    
-                    # Check if authorized
-                    if not await telethon_client.is_user_authorized():
-                        logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
-                        logger.info(f"ℹ️ Please authorize the account through the bot interface")
-                        # Still store the client, but it won't be able to monitor until authorized
-                        self.user_monitoring_clients[current_account.account_id] = telethon_client
-                        return False
+                # Ensure phone is always provided, even if empty string
+                phone_to_use = phone if (phone and phone.strip()) else ""
+                
+                # Use .start() which will:
+                # 1. Use existing session if authenticated
+                # 2. Request authorization if needed
+                await telethon_client.start(phone=lambda: phone_to_use)
+                
+                # After start, verify authorization
+                if not await telethon_client.is_user_authorized():
+                    logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
+                    logger.info(f"ℹ️ Please authorize the account through the bot interface")
+                    # Still store the client, but it won't be able to monitor until authorized
+                    self.user_monitoring_clients[current_account.account_id] = telethon_client
+                    return False
             except Exception as start_err:
                 logger.error(f"❌ Error starting Telethon client: {start_err}")
                 logger.error(traceback.format_exc())
@@ -3579,6 +3616,7 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
                             callback_data="toggle_sl_tp")],
         [InlineKeyboardButton(f"🔗 Make.com Webhook: {'ON' if config.make_webhook_enabled else 'OFF'}", 
                             callback_data="toggle_webhook")],
+        [InlineKeyboardButton("🔐 Update Telegram Credentials", callback_data="update_telegram_creds")],
         [InlineKeyboardButton(f"⚡ Leverage: {config.leverage}x", callback_data="set_leverage")],
         [InlineKeyboardButton(f"🛑 Stop Loss: {config.stop_loss_percent}%", callback_data="set_stop_loss")],
         [InlineKeyboardButton(f"🎯 Custom Take Profits ({len(config.custom_take_profits)} levels)", callback_data="configure_take_profits")],
@@ -5297,6 +5335,16 @@ Next: press 🚀 Start on the account page""",
         )
         return WAITING_TRAILING_CALLBACK
 
+    elif query.data == "update_telegram_creds":
+        # Ask user to enter new Telegram API ID
+        await query.edit_message_text(
+            "🔐 <b>Update Telegram Credentials</b>\n\n"
+            "Please send your Telegram API ID:",
+            parse_mode='HTML'
+        )
+        context.user_data['updating_telegram_creds'] = True
+        return WAITING_ACCOUNT_TELEGRAM_ID
+    
     elif query.data == "manage_channels":
         # Exit trading settings conversation and defer to /setup_channels flow
         await query.edit_message_text("📡 <b>Opening channel manager...</b>", parse_mode='HTML')
@@ -5887,7 +5935,7 @@ async def handle_account_bingx_secret(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 async def handle_account_telegram_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Telegram API ID input"""
+    """Handle Telegram API ID input for new account or credential update"""
     api_id = update.message.text.strip()
     context.user_data['telegram_api_id'] = api_id
     
@@ -5899,7 +5947,7 @@ async def handle_account_telegram_id(update: Update, context: ContextTypes.DEFAU
     return WAITING_ACCOUNT_TELEGRAM_HASH
 
 async def handle_account_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Telegram API hash input"""
+    """Handle Telegram API hash input for new account or credential update"""
     api_hash = update.message.text.strip()
     context.user_data['telegram_api_hash'] = api_hash
     
@@ -5911,42 +5959,88 @@ async def handle_account_telegram_hash(update: Update, context: ContextTypes.DEF
     return WAITING_ACCOUNT_PHONE
 
 async def handle_account_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone number input and create account"""
+    """Handle phone number input and create/update account"""
     phone = update.message.text.strip()
-    
-    # Create account configuration
-    account_id = str(uuid.uuid4())
     user_id = update.effective_user.id
-    account = AccountConfig(
-        account_id=account_id,
-        account_name=context.user_data['account_name'],
-        bingx_api_key=context.user_data['bingx_api_key'],
-        bingx_secret_key=context.user_data['bingx_secret_key'],
-        telegram_api_id=context.user_data['telegram_api_id'],
-        telegram_api_hash=context.user_data['telegram_api_hash'],
-        phone=phone,
-        user_id=user_id
-    )
     
-    # Save to database
-    if trading_bot.enhanced_db.create_account(account):
-        await update.message.reply_text(
-            f"🎉 <b>Account Created Successfully!</b>\n\n"
-            f"Account: <b>{account.account_name}</b>\n"
-            f"ID: <code>{account_id}</code>\n\n"
-            f"You can now:\n"
-            f"• Add channels to monitor\n"
-            f"• Configure trading settings\n"
-            f"• Start receiving signals",
-            parse_mode='HTML'
-        )
+    # Check if we're updating existing account credentials
+    if context.user_data.get('updating_telegram_creds'):
+        current_account = trading_bot.get_current_account(user_id)
+        if current_account:
+            # Update existing account credentials
+            success = trading_bot.enhanced_db.update_account_credentials(
+                current_account.account_id,
+                telegram_api_id=context.user_data['telegram_api_id'],
+                telegram_api_hash=context.user_data['telegram_api_hash'],
+                phone=phone
+            )
+            
+            if success:
+                # Clear any existing Telethon session for this account
+                session_name = f'session_{current_account.account_id}'
+                try:
+                    if os.path.exists(f'{session_name}.session'):
+                        os.remove(f'{session_name}.session')
+                        logger.info(f"🗑️ Removed old session file for account {current_account.account_id}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to remove old session: {e}")
+                
+                # Remove client from monitoring clients to force recreation
+                if current_account.account_id in trading_bot.user_monitoring_clients:
+                    old_client = trading_bot.user_monitoring_clients.pop(current_account.account_id)
+                    try:
+                        await old_client.disconnect()
+                    except:
+                        pass
+                
+                await update.message.reply_text(
+                    f"✅ <b>Telegram Credentials Updated!</b>\n\n"
+                    f"API ID: <code>{context.user_data['telegram_api_id']}</code>\n"
+                    f"Phone: <code>{phone}</code>\n\n"
+                    f"The Telethon client will be re-initialized on next use.",
+                    parse_mode='HTML'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to update credentials. Please try again.",
+                    parse_mode='HTML'
+                )
+            
+            context.user_data.pop('updating_telegram_creds', None)
+            return WAITING_SETTINGS_SOURCE
     else:
-        await update.message.reply_text(
-            "❌ Failed to create account. Please try again.",
-            parse_mode='HTML'
+        # Create new account configuration
+        account_id = str(uuid.uuid4())
+        account = AccountConfig(
+            account_id=account_id,
+            account_name=context.user_data['account_name'],
+            bingx_api_key=context.user_data['bingx_api_key'],
+            bingx_secret_key=context.user_data['bingx_secret_key'],
+            telegram_api_id=context.user_data['telegram_api_id'],
+            telegram_api_hash=context.user_data['telegram_api_hash'],
+            phone=phone,
+            user_id=user_id
         )
-    
-    return ConversationHandler.END
+        
+        # Save to database
+        if trading_bot.enhanced_db.create_account(account):
+            await update.message.reply_text(
+                f"🎉 <b>Account Created Successfully!</b>\n\n"
+                f"Account: <b>{account.account_name}</b>\n"
+                f"ID: <code>{account_id}</code>\n\n"
+                f"You can now:\n"
+                f"• Add channels to monitor\n"
+                f"• Configure trading settings\n"
+                f"• Start receiving signals",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to create account. Please try again.",
+                parse_mode='HTML'
+            )
+        
+        return ConversationHandler.END
 
 async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all accounts"""
@@ -6095,6 +6189,9 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_CONFIG: [CallbackQueryHandler(handle_tp_config)],
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
+        WAITING_ACCOUNT_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_id)],
+        WAITING_ACCOUNT_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_hash)],
+        WAITING_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_phone)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
     per_user=True,
