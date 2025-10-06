@@ -34,6 +34,11 @@ import warnings
 from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*CallbackQueryHandler.*per_message.*")
 
+# Now continue with your existing imports
+import asyncio
+import re
+import json
+
 # Import python-telegram-bot
 from telegram import (
     Update,
