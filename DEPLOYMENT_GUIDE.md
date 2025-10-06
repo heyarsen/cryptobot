@@ -33,6 +33,9 @@ The updated `bot.py` is ready to deploy. No database migrations needed.
 ### 3. Start the Bot
 
 ```bash
+export ENHANCED_DB_PATH=/data/enhanced_trading_bot.db   # persist DB across restarts (Railway volume)
+export BINGX_API_KEY=...                                 # optional fallback, per-account keys preferred
+export BINGX_API_SECRET=...
 python3 bot.py
 ```
 
@@ -109,6 +112,14 @@ Check logs for these messages (every 5 seconds during polling):
 - Run the bot and manually start monitoring once
 - The configuration will be saved
 - Next restart should auto-start
+
+### Issue: Accounts not retrieved after redeploy
+
+**Check:**
+- Are you using a persistent SQLite path? The DB defaults to `enhanced_trading_bot.db` in CWD unless `ENHANCED_DB_PATH` or `DB_PATH` is set, or `/data` exists.
+
+**Fix:**
+- Set `ENHANCED_DB_PATH=/data/enhanced_trading_bot.db` (or mount a volume) before starting the bot so accounts persist across deployments.
 
 ### Issue: Messages not being detected
 
