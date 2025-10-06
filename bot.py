@@ -26,6 +26,7 @@ import traceback
 import requests
 import subprocess
 import signal
+import shutil
 
 # Import python-telegram-bot
 from telegram import (
@@ -57,8 +58,9 @@ from telethon.errors import ApiIdInvalidError
 BOT_PIN_CODE = "496745"  # PIN code for bot access
 DEFAULT_TELEGRAM_API_ID = '28270452'
 DEFAULT_TELEGRAM_API_HASH = '8bb0aa3065dd515fb6e105f1fc60fdb6'
-DEFAULT_BINANCE_API_KEY = 'ojMy5XVmKUFxfoAG1SwR2jCiYqYGuHfFb3CmM1tPv01rvtLcIQL68wTUwtU8mMijfaWc2aOPsiGZSSqg'
-DEFAULT_BINANCE_API_SECRET = 'R26Tvlq8rRjK4HCqhG5EstMXGAqHr1B22DH3IuTRjHOiEanmIlCRPowDcOGH8oKDjnVypPM5fXUg3lbYhQ'
+# Defaults are empty; real keys are loaded per-account or via settings UI
+DEFAULT_BINANCE_API_KEY = os.getenv('BINGX_API_KEY', '')
+DEFAULT_BINANCE_API_SECRET = os.getenv('BINGX_API_SECRET', '')
 
 (WAITING_BINANCE_KEY, WAITING_BINANCE_SECRET,
  WAITING_TELEGRAM_ID, WAITING_TELEGRAM_HASH,
@@ -472,6 +474,22 @@ class MakeWebhookLogger:
 
 class EnhancedDatabase:
     def __init__(self, db_path: str = "enhanced_trading_bot.db"):
+        # Choose a persistent database path when available
+        try:
+            configured_path = os.getenv('ENHANCED_DB_PATH') or os.getenv('DB_PATH')
+            if configured_path and isinstance(configured_path, str) and configured_path.strip():
+                db_path = configured_path.strip()
+            elif db_path == "enhanced_trading_bot.db" and os.path.isdir('/data'):
+                # Prefer a typical persistent mount path if present (e.g., Railway volume)
+                db_path = "/data/enhanced_trading_bot.db"
+            # Ensure parent directory exists
+            parent_dir = os.path.dirname(db_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+        except Exception:
+            # Fall back silently to provided db_path
+            pass
+
         self.db_path = db_path
         self.init_database()
     
@@ -1642,13 +1660,26 @@ class TradingBot:
         return None
     
     def set_current_account(self, user_id: int, account_id: str) -> bool:
-        """Set current account for user"""
+        """Set current account for user and bind per-account exchange client"""
         accounts = self.enhanced_db.get_all_accounts()
         for account in accounts:
             if account.account_id == account_id:
                 self.current_accounts[user_id] = account_id
                 # Update the user_id in the database for persistence
                 self.enhanced_db.update_account_user_id(account_id, user_id)
+                # Prepare a dedicated ccxt client for this account using its BingX keys
+                try:
+                    if account.bingx_api_key and account.bingx_secret_key:
+                        self.account_exchanges[account.account_id] = ccxt.bingx({
+                            'apiKey': account.bingx_api_key,
+                            'secret': account.bingx_secret_key,
+                            'options': {'defaultType': 'swap'},
+                            'enableRateLimit': True,
+                            'timeout': 60000
+                        })
+                        logger.info(f"✅ Bound BingX client to account {account.account_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to bind exchange for account {account.account_name}: {e}")
                 return True
         return False
 
@@ -1805,6 +1836,11 @@ class TradingBot:
         try:
             current_account = self.get_current_account(user_id)
             if current_account:
+                # Map account BingX API keys into session config so all flows use correct credentials
+                if getattr(current_account, 'bingx_api_key', None):
+                    config.binance_api_key = current_account.bingx_api_key
+                if getattr(current_account, 'bingx_secret_key', None):
+                    config.binance_api_secret = current_account.bingx_secret_key
                 config.leverage = int(current_account.leverage)
                 # Stop loss percent: prefer first stop loss level if any
                 if current_account.stop_loss_levels:
@@ -2170,10 +2206,19 @@ class TradingBot:
     async def get_account_balance(self, config: BotConfig) -> Dict[str, float]:
         """Get detailed account balance information"""
         try:
+            # Prefer per-account exchange client
+            current_account = self.get_current_account(config.user_id)
+            account_key = current_account.account_id if current_account else None
+
+            if account_key and account_key in self.account_exchanges:
+                self.exchange = self.account_exchanges[account_key]
+
             if not self.exchange:
                 success = await self.setup_binance_client(config)
                 if not success:
                     return {'success': False, 'error': 'Failed to connect to BingX API'}
+                if account_key:
+                    self.account_exchanges[account_key] = self.exchange
 
             bal = self.exchange.fetch_balance()
             usdt = bal.get('USDT', {}) if isinstance(bal, dict) else {}
@@ -2201,15 +2246,22 @@ class TradingBot:
 
     async def setup_binance_client(self, config: BotConfig) -> bool:
         try:
-            self.exchange = ccxt.bingx({
-                'apiKey': config.binance_api_key,
-                'secret': config.binance_api_secret,
-                'options': {
-                    'defaultType': 'swap'
-                },
-                'enableRateLimit': True,
-                'timeout': 60000
-            })
+            # If this user has a bound account/exchange, reuse it
+            current_account = self.get_current_account(config.user_id)
+            if current_account and current_account.account_id in self.account_exchanges:
+                self.exchange = self.account_exchanges[current_account.account_id]
+            else:
+                self.exchange = ccxt.bingx({
+                    'apiKey': config.binance_api_key,
+                    'secret': config.binance_api_secret,
+                    'options': {
+                        'defaultType': 'swap'
+                    },
+                    'enableRateLimit': True,
+                    'timeout': 60000
+                })
+                if current_account:
+                    self.account_exchanges[current_account.account_id] = self.exchange
 
             bal = self.exchange.fetch_balance()
             usdt_total = bal.get('USDT', {}).get('total', 'N/A') if isinstance(bal, dict) else 'N/A'
@@ -2285,13 +2337,35 @@ class TradingBot:
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
+            # Ensure we are using the exchange client tied to the current account (originating user)
+            current_account = self.get_current_account(config.user_id)
+            account_key = current_account.account_id if current_account else None
+
+            if account_key and account_key in self.account_exchanges:
+                self.exchange = self.account_exchanges[account_key]
+            
             if not self.exchange:
                 success = await self.setup_binance_client(config)
                 if not success:
                     return {'success': False, 'error': 'Failed to connect to BingX API'}
+                # Cache the exchange per account for future orders
+                if account_key:
+                    self.account_exchanges[account_key] = self.exchange
 
             try:
                 logger.info(f"💰 Getting account balance...")
+                # If per-account API keys are configured, switch keys before fetching balance
+                if current_account and current_account.bingx_api_key and current_account.bingx_secret_key:
+                    # Build a per-account client (ccxt is lightweight for this usage)
+                    self.account_exchanges[account_key] = ccxt.bingx({
+                        'apiKey': current_account.bingx_api_key,
+                        'secret': current_account.bingx_secret_key,
+                        'options': {'defaultType': 'swap'},
+                        'enableRateLimit': True,
+                        'timeout': 60000
+                    })
+                    self.exchange = self.account_exchanges[account_key]
+
                 bal = self.exchange.fetch_balance()
                 usdt_balance = 0
                 if isinstance(bal, dict) and 'USDT' in bal:
@@ -2935,6 +3009,29 @@ class TradingBot:
         """Handle a new message from a monitored channel"""
         try:
             logger.info(f"🔔 [_handle_new_message] Called for user {user_id}, channel {channel_id}")
+
+            # Route to the correct trading account based on the channel
+            try:
+                accounts = self.enhanced_db.get_all_accounts()
+                matching = None
+                for acc in accounts:
+                    if int(acc.user_id or 0) != int(user_id):
+                        continue
+                    try:
+                        if channel_id and int(channel_id) in [int(str(c)) for c in (acc.monitored_channels or [])]:
+                            matching = acc
+                            break
+                    except Exception:
+                        continue
+                if matching:
+                    current = self.get_current_account(user_id)
+                    if not current or current.account_id != matching.account_id:
+                        logger.info(f"🔗 [_handle_new_message] Switching current account to '{matching.account_name}' based on channel {channel_id}")
+                        self.set_current_account(user_id, matching.account_id)
+                else:
+                    logger.info(f"ℹ️ [_handle_new_message] No specific account matched for channel {channel_id}; using current account")
+            except Exception as e:
+                logger.warning(f"⚠️ [_handle_new_message] Account routing by channel failed: {e}")
             
             config = self.get_user_config(user_id)
             logger.info(f"🔧 [_handle_new_message] Config loaded - monitored channels: {config.monitored_channels}")
@@ -5232,8 +5329,8 @@ async def auto_start_monitoring():
                     logger.info(f"   Account: {account.account_name}")
                     logger.info(f"   Channels: {account.monitored_channels}")
                     
-                    # Set the current account for this user
-                    trading_bot.current_accounts[account.user_id] = account.account_id
+                    # Set the current account for this user and bind exchange client
+                    trading_bot.set_current_account(account.user_id, account.account_id)
                     trading_bot.set_app_setting(f'current_account_{account.user_id}', account.account_id)
                     
                     # Get the bot application
