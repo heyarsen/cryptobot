@@ -3258,6 +3258,21 @@ async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAUL
             parse_mode='HTML'
         )
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start: welcome and prompt for PIN or show menu"""
+    user_id = update.effective_user.id
+    if trading_bot.is_authenticated(user_id):
+        await update.message.reply_text(
+            "🏠 Main Menu",
+            parse_mode='HTML',
+            reply_markup=build_main_menu()
+        )
+    else:
+        await update.message.reply_text(
+            "👋 <b>Welcome!</b>\n\nPlease enter your PIN to access the bot.",
+            parse_mode='HTML'
+        )
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Complete navigation system"""
     user_id = update.effective_user.id
@@ -3418,7 +3433,10 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"💵 Trade Amount: <b>{balance_value}</b>\n"
             msg += f"🎯 Take Profits: <b>{len(acc.take_profit_levels)} levels</b>\n"
             msg += f"🛑 Stop Losses: <b>{len(acc.stop_loss_levels)} levels</b>\n"
-            msg += f"📡 Channels: <b>{len(acc.monitored_channels)}</b>\n\n"
+            # Monitoring status line
+            monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
+            msg += f"📡 Channels: <b>{len(acc.monitored_channels)}</b>\n"
+            msg += f"🔄 Monitoring: <b>{monitor_status}</b>\n\n"
             msg += "Use the buttons below to manage this account."
             await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
 
@@ -3432,12 +3450,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Account page buttons
     elif text == "🚀 Start":
-        acc_name = context.user_data.get('current_account_name', 'this account')
-        await update.message.reply_text(f"🚀 Starting monitoring for {acc_name}", parse_mode='HTML')
+        # Delegate to start trading handler to actually start monitoring
+        await handle_start_trading(update, context)
 
     elif text == "🛑 Stop":
-        acc_name = context.user_data.get('current_account_name', 'this account')
-        await update.message.reply_text(f"🛑 Stopped monitoring for {acc_name}", parse_mode='HTML')
+        # Delegate to stop trading handler to actually stop monitoring
+        await handle_stop_trading(update, context)
 
     elif text == "📋 History" and 'current_account_id' in context.user_data:
         await update.message.reply_text("📋 Trade history for this account", parse_mode='HTML')
@@ -3766,40 +3784,18 @@ async def handle_stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = f"""<b>📖 All Commands</b>
-
-<b>Setup:</b>
-/setup_binance - BingX API
-/setup_telegram - Telegram API  
-/setup_channels - Channels
-/setup_trading - Parameters
-
-<b>Control:</b>
-/start_monitoring - Start ✅
-/stop_monitoring - Stop ❌
-/status - Status
-/balance - Balance
-
-<b>Testing:</b>
-/test_simple - Simple test
-/test_basic - Basic test
-/test_advanced - Full test
-/test_signal - Parser test
-
-🔗 {DEFAULT_WEBHOOK_URL[:50]}...
-
-<b>OCO Feature:</b>
-When TP fills → SL auto-cancels
-When SL fills → All TPs auto-cancel
-"""
+    help_text = (
+        "<b>🤖 Bot Controls</b>\n\n"
+        "Use the on-screen buttons to control the bot.\n"
+        "Only /start command is available to open the menu.\n\n"
+        "- 🔑 Accounts: manage accounts\n"
+        "- ⚙️ Settings: configure trading\n"
+        "- 📡 Channels: choose channels\n"
+        "- 🚀 Start / 🛑 Stop: control monitoring\n"
+    )
     await update.message.reply_text(help_text, parse_mode='HTML')
     # Ensure main menu visible
-    main_menu = ReplyKeyboardMarkup(
-        [[KeyboardButton("📊 Status"), KeyboardButton("💰 Balance")],
-         [KeyboardButton("🚀 Start"), KeyboardButton("🛑 Stop")],
-         [KeyboardButton("⚙️ Settings")]],
-        resize_keyboard=True
-    )
+    main_menu = build_main_menu()
     try:
         await update.message.reply_text("Choose an action:", reply_markup=main_menu)
     except Exception:
@@ -3822,8 +3818,6 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await setup_trading(update, context)
     elif text == "🔑 Accounts":
         await list_accounts(update, context)
-    elif text == "/setup_channels":
-        await setup_channels(update, context)
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check account balance"""
@@ -3831,7 +3825,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = trading_bot.get_user_config(user_id)
 
     if not config.binance_api_key or not config.binance_api_secret:
-        await update.message.reply_text("❌ <b>BingX API not configured!</b> Use /setup_binance first.", parse_mode='HTML')
+        await update.message.reply_text("❌ <b>BingX API not configured!</b> Open ⚙️ Settings to configure.", parse_mode='HTML')
         return
 
     await update.message.reply_text("💰 <b>Checking account balance...</b>", parse_mode='HTML')
@@ -4044,19 +4038,26 @@ async def handle_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # Support being called from both message and callback contexts
+    if update.message and hasattr(update.message, 'reply_text'):
+        async def send_text(text: str, **kwargs):
+            return await update.message.reply_text(text, **kwargs)
+    else:
+        async def send_text(text: str, **kwargs):
+            return await context.bot.send_message(chat_id=user_id, text=text, **kwargs)
 
-    await update.message.reply_text("🔍 <b>Loading channels...</b>", parse_mode='HTML')
+    await send_text("🔍 <b>Loading channels...</b>", parse_mode='HTML')
 
     channels = await trading_bot.get_available_channels(user_id)
 
     if not channels:
-        await update.message.reply_text("❌ <b>No channels!</b> Use /setup_telegram first", parse_mode='HTML')
+        await send_text("❌ <b>No channels!</b> Add an account and configure 📡 Channels from the account page.", parse_mode='HTML')
         return ConversationHandler.END
 
     context.user_data['available_channels'] = channels
     keyboard_markup = create_channel_keyboard(user_id, channels)
 
-    await update.message.reply_text(
+    await send_text(
         create_channel_selection_text(user_id),
         reply_markup=keyboard_markup,
         parse_mode='HTML'
@@ -4095,7 +4096,7 @@ async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT
 🆔 ID: <code>{channel_id}</code>
 📊 Total channels: <b>{len(config.monitored_channels)}</b>
 
-Use /setup_channels to continue managing channels.""",
+Open 📡 Channels again to continue managing.""",
                 parse_mode='HTML'
             )
             return WAITING_CHANNEL_SELECTION
@@ -4113,7 +4114,7 @@ Use /setup_channels to continue managing channels.""",
 
 Monitoring: <b>{len(config.monitored_channels)}</b> channels
 
-Next: /setup_trading""",
+Next: open ⚙️ Settings""",
             parse_mode='HTML'
         )
         # Persist monitored channels to the current account if available
@@ -4220,15 +4221,15 @@ async def handle_manual_channel(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
 
-    await update.message.reply_text(
-        f"""✅ <b>Channel added!</b>
+            await update.message.reply_text(
+                f"""✅ <b>Channel added!</b>
 
 Channel ID: <code>{channel_id}</code>
 Total: <b>{len(config.monitored_channels)}</b>
 
-Use /setup_trading next""",
-        parse_mode='HTML'
-    )
+Next: open ⚙️ Settings""",
+                parse_mode='HTML'
+            )
 
     return ConversationHandler.END
 
@@ -4264,16 +4265,16 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
 
-        await update.message.reply_text(
-            f"""✅ <b>Channel Added!</b>
+            await update.message.reply_text(
+                f"""✅ <b>Channel Added!</b>
 
 📡 Channel: {channel_name}
 🆔 ID: <code>{channel_id}</code>
 📊 Total channels: <b>{len(config.monitored_channels)}</b>
 
-Use /setup_channels to manage or continue setup.""",
-            parse_mode='HTML'
-        )
+Open 📡 Channels to manage or continue setup.""",
+                parse_mode='HTML'
+            )
     else:
         await update.message.reply_text(
             """❌ <b>Failed to resolve channel</b>
@@ -4318,7 +4319,7 @@ async def handle_trading_settings(update: Update, context: ContextTypes.DEFAULT_
             f"""✅ <b>Configuration complete!</b>
 
 All settings saved.
-Next: /start_monitoring""",
+Next: press 🚀 Start on the account page""",
             parse_mode='HTML'
         )
         return ConversationHandler.END
@@ -4442,7 +4443,9 @@ Next: /start_monitoring""",
 
     elif query.data == "manage_channels":
         # Exit trading settings conversation and defer to /setup_channels flow
-        await query.edit_message_text("📡 <b>Opening channel manager...</b> Use /setup_channels", parse_mode='HTML')
+        await query.edit_message_text("📡 <b>Opening channel manager...</b>", parse_mode='HTML')
+        # Directly open channels manager via button flow
+        await setup_channels(update, context)
         return ConversationHandler.END
 
     elif query.data == "rename_account":
@@ -4693,7 +4696,7 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not config.monitored_channels:
-        await update.message.reply_text("❌ No channels! Use /setup_channels", parse_mode='HTML')
+        await update.message.reply_text("❌ No channels configured. Open 📡 Channels in the account.", parse_mode='HTML')
         return
 
     await update.message.reply_text("🚀 <b>Starting...</b>", parse_mode='HTML')
@@ -4701,16 +4704,16 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await trading_bot.start_monitoring(user_id, context.bot)
 
     if success:
-        status_msg = f"""✅ <b>MONITORING STARTED!</b>
-
-📡 Monitoring: <b>{len(config.monitored_channels)}</b> channels
-⚙️ Settings: {'Signal' if config.use_signal_settings else 'Bot'}
-📊 SL/TP: {'ON' if config.create_sl_tp else 'OFF'}
-🔄 OCO: Auto-cancel enabled
-🔗 Webhook: ENABLED
-
-🎯 Ready to trade!
-Use /stop_monitoring to stop."""
+        trading_bot.monitoring_status[user_id] = True
+        status_msg = (
+            f"✅ <b>MONITORING STARTED!</b>\n\n"
+            f"📡 Monitoring: <b>{len(config.monitored_channels)}</b> channels\n"
+            f"⚙️ Settings: {'Signal' if config.use_signal_settings else 'Bot'}\n"
+            f"📊 SL/TP: {'ON' if config.create_sl_tp else 'OFF'}\n"
+            f"🔄 OCO: Auto-cancel enabled\n"
+            f"🔗 Webhook: {'ENABLED' if config.make_webhook_enabled else 'DISABLED'}\n\n"
+            f"🎯 Ready to trade!"
+        )
 
         await update.message.reply_text(status_msg, parse_mode='HTML')
         # Ensure OCO monitor is running
@@ -4722,6 +4725,7 @@ Use /stop_monitoring to stop."""
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     trading_bot.active_monitoring[user_id] = False
+    trading_bot.monitoring_status[user_id] = False
     trading_bot.order_monitor_running = False
 
     await update.message.reply_text("🛑 <b>Monitoring stopped!</b>", parse_mode='HTML')
@@ -5095,7 +5099,7 @@ Confidence: {signal.confidence:.2f}""")
 # ================== CONVERSATION HANDLERS ==================
 
 binance_conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('setup_binance', setup_binance)],
+    entry_points=[MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)],
     states={
         WAITING_BINANCE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_key)],
         WAITING_BINANCE_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_secret)],
@@ -5104,7 +5108,7 @@ binance_conv_handler = ConversationHandler(
 )
 
 telegram_conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('setup_telegram', setup_telegram_api)],
+    entry_points=[MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)],
     states={
         WAITING_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_id)],
         WAITING_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_hash)],
@@ -5120,7 +5124,6 @@ async def channels_button_entry(update: Update, context: ContextTypes.DEFAULT_TY
 
 channel_conv_handler = ConversationHandler(
     entry_points=[
-        CommandHandler('setup_channels', setup_channels),
         MessageHandler(filters.Regex(r'^📡 Channels$'), channels_button_entry)
     ],
     states={
@@ -5130,8 +5133,7 @@ channel_conv_handler = ConversationHandler(
         ],
         WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
         WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
-    },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    }
 )
 
 async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5149,7 +5151,6 @@ async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TY
 
 trading_conv_handler = ConversationHandler(
     entry_points=[
-        CommandHandler('setup_trading', setup_trading),
         MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)
     ],
     states={
@@ -5165,13 +5166,12 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_CONFIG: [CallbackQueryHandler(handle_tp_config)],
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
-    },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    }
 )
 
 # Enhanced account conversation handler
 account_conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('add_account', add_account)],
+    entry_points=[MessageHandler(filters.Regex(r'^➕ Add Account$'), add_account)],
     states={
         WAITING_ACCOUNT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_name)],
         WAITING_ACCOUNT_BINGX_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_bingx_key)],
@@ -5179,8 +5179,7 @@ account_conv_handler = ConversationHandler(
         WAITING_ACCOUNT_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_id)],
         WAITING_ACCOUNT_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_hash)],
         WAITING_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_phone)],
-    },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    }
 )
 
 # ================== UTILITY FUNCTIONS ==================
@@ -5282,11 +5281,11 @@ def main():
     
     try:
         application = Application.builder().token(BOT_TOKEN).build()
+        # Register /start only; rest is button-driven
+        application.add_handler(CommandHandler('start', start))
 
-        # Conversation handlers (enable full settings/channel flows) - must be before main menu handler
+        # Conversation handlers (button-driven flows only)
         application.add_handler(account_conv_handler)
-        application.add_handler(binance_conv_handler)
-        application.add_handler(telegram_conv_handler)
         application.add_handler(channel_conv_handler)
         application.add_handler(trading_conv_handler)
 
