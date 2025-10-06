@@ -2526,6 +2526,12 @@ class TradingBot:
                 logger.error(f"❌ Failed to get Telethon client for account {account_id}")
                 return []
 
+            # Check if the client is authorized before attempting to get channels
+            if not await telethon_client.is_user_authorized():
+                logger.error(f"❌ Telethon client not authorized for account {account_id}")
+                logger.info(f"ℹ️ Please authorize the account through the bot interface")
+                return []
+
             channels = []
             async for dialog in telethon_client.iter_dialogs():
                 if isinstance(dialog.entity, Channel):
