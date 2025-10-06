@@ -1139,6 +1139,46 @@ class EnhancedDatabase:
             logger.error(f"❌ Failed to get active trades: {e}")
             return []
 
+    def can_trade_symbol(self, account_id: str, symbol: str, cooldown_hours: int = 24) -> bool:
+        """Check if a symbol can be traded (24-hour cooldown per symbol per account)"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get the most recent trade for this symbol and account
+            cursor.execute('''
+                SELECT entry_time FROM trade_history 
+                WHERE account_id = ? AND symbol = ? 
+                ORDER BY entry_time DESC 
+                LIMIT 1
+            ''', (account_id, symbol))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if not row:
+                # No previous trade, can trade
+                return True
+            
+            # Parse the entry_time and check if cooldown has passed
+            from datetime import datetime, timedelta
+            last_trade_time = datetime.fromisoformat(row[0])
+            current_time = datetime.now()
+            time_diff = current_time - last_trade_time
+            
+            can_trade = time_diff >= timedelta(hours=cooldown_hours)
+            
+            if not can_trade:
+                remaining_hours = cooldown_hours - (time_diff.total_seconds() / 3600)
+                logger.info(f"⏳ Symbol {symbol} is in cooldown. {remaining_hours:.1f} hours remaining.")
+            
+            return can_trade
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to check trade cooldown: {e}")
+            # On error, allow the trade to proceed
+            return True
+    
     def update_trade_status(self, trade_id: str, status: Optional[str] = None,
                              pnl: Optional[float] = None, exit_time: Optional[str] = None) -> bool:
         """Update trade status/PnL/exit_time for an existing trade id."""
@@ -1655,7 +1695,8 @@ class TradingBot:
         # User session management
         self.authenticated_users: Dict[int, bool] = {}
         self.current_accounts: Dict[int, str] = {}  # user_id -> account_id
-        self.monitoring_status: Dict[int, bool] = {}  # Track monitoring status per user
+        self.monitoring_status: Dict[int, bool] = {}  # Track monitoring status per user (deprecated)
+        self.account_monitoring_status: Dict[str, bool] = {}  # Track monitoring status per account_id
         
         # Enhanced main menu
         self.main_menu = ReplyKeyboardMarkup(
@@ -2425,6 +2466,14 @@ class TradingBot:
             current_account = self.get_current_account(config.user_id)
             account_key = current_account.account_id if current_account else None
 
+            # Check 24-hour cooldown for this symbol
+            if account_key and not self.enhanced_db.can_trade_symbol(account_key, signal.symbol, cooldown_hours=24):
+                logger.warning(f"⏳ Trade blocked: {signal.symbol} is in 24-hour cooldown for account {current_account.account_name if current_account else account_key}")
+                return {
+                    'success': False, 
+                    'error': f'Symbol {signal.symbol} is in 24-hour cooldown. Only one trade per symbol per 24 hours is allowed.'
+                }
+
             if account_key and account_key in self.account_exchanges:
                 self.exchange = self.account_exchanges[account_key]
             
@@ -2627,8 +2676,7 @@ class TradingBot:
                                 'stopPrice': rounded_sl,
                                 'triggerPrice': rounded_sl,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE',
-                                'reduceOnly': True
+                                'workingType': 'MARK_PRICE'
                             }
                         )
                         logger.info(f"🛑 Stop Loss order placed: {sl_order}")
@@ -2733,8 +2781,7 @@ class TradingBot:
                                 'stopPrice': rounded_tp,
                                 'triggerPrice': rounded_tp,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE',
-                                'reduceOnly': True
+                                'workingType': 'MARK_PRICE'
                             }
                         )
                         logger.info(f"🎯 Take Profit order placed: {tp_order}")
@@ -2756,8 +2803,7 @@ class TradingBot:
                                 'activationPrice': activation_price,
                                 'priceRate': round(callback_percent, 3),
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE',
-                                'reduceOnly': True
+                                'workingType': 'MARK_PRICE'
                             }
                             trailing_order = self.exchange.create_order(
                                 market_symbol,
@@ -3222,6 +3268,21 @@ class TradingBot:
             
             if signal:
                 logger.info(f"🎯 SIGNAL DETECTED! {signal.symbol} {signal.trade_type}")
+                
+                # Check if the current account is actually monitoring
+                current_account = self.get_current_account(user_id)
+                if current_account and not self.account_monitoring_status.get(current_account.account_id, False):
+                    logger.warning(f"⏸️ Account {current_account.account_name} received signal but monitoring is not active - skipping trade")
+                    if bot_instance:
+                        try:
+                            await bot_instance.send_message(
+                                chat_id=user_id,
+                                text=f"⏸️ <b>Signal Received</b>\n\n💰 {signal.symbol} {signal.trade_type}\n\n⚠️ Account <b>{current_account.account_name}</b> is not monitoring.\nTrade skipped.\n\nUse '🚀 Start' to enable trading for this account.",
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending skip notification: {e}")
+                    return
                 
                 settings_source = "Signal" if config.use_signal_settings else "Bot"
                 if bot_instance:
@@ -4231,11 +4292,13 @@ async def handle_start_trading(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
     
-    # Check if already monitoring
-    if trading_bot.monitoring_status.get(user_id, False):
+    account_id = current_account.account_id
+    
+    # Check if already monitoring THIS account
+    if trading_bot.account_monitoring_status.get(account_id, False):
         await update.message.reply_text(
             "⚠️ <b>Already Monitoring!</b>\n\n"
-            "Trading is already active for this account.\n"
+            f"Trading is already active for account: <b>{current_account.account_name}</b>\n"
             "Use 'Stop Trading' to stop first.",
             parse_mode='HTML'
         )
@@ -4252,18 +4315,21 @@ async def handle_start_trading(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     try:
-        # Start monitoring
+        # Start monitoring (this sets up the Telethon client for the user if needed)
         success = await trading_bot.start_monitoring(user_id, context.bot)
         
         if success:
-            trading_bot.monitoring_status[user_id] = True
+            # Mark THIS account as monitoring
+            trading_bot.account_monitoring_status[account_id] = True
+            trading_bot.monitoring_status[user_id] = True  # Keep for backward compatibility
+            
             await update.message.reply_text(
                 f"🚀 <b>Trading Started Successfully!</b>\n\n"
                 f"Account: <b>{current_account.account_name}</b>\n"
                 f"Channels: <b>{len(current_account.monitored_channels)}</b>\n"
                 f"⚡ Leverage: <b>{current_account.leverage}x</b>\n"
                 f"💰 Trade Amount: <b>{f"{current_account.balance_percentage}%" if current_account.use_percentage_balance else f"${current_account.fixed_usdt_amount}"}</b>\n\n"
-                f"✅ Monitoring active\n"
+                f"✅ Monitoring active for this account only\n"
                 f"🎯 Ready to execute trades",
                 parse_mode='HTML'
             )
@@ -4286,46 +4352,66 @@ async def handle_stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     current_account = trading_bot.get_current_account(user_id)
     
-    # Check if monitoring is active
-    if not trading_bot.monitoring_status.get(user_id, False):
+    if not current_account:
+        await update.message.reply_text(
+            "❌ <b>No Account Selected</b>\n\n"
+            "Please select an account first.",
+            parse_mode='HTML'
+        )
+        return
+    
+    account_id = current_account.account_id
+    
+    # Check if monitoring is active for THIS account
+    if not trading_bot.account_monitoring_status.get(account_id, False):
         await update.message.reply_text(
             "⚠️ <b>Not Currently Monitoring</b>\n\n"
-            "Trading is not active for this account.",
+            f"Trading is not active for account: <b>{current_account.account_name}</b>",
             parse_mode='HTML'
         )
         return
     
     try:
-        # Stop monitoring
-        trading_bot.active_monitoring[user_id] = False
-        trading_bot.monitoring_status[user_id] = False
+        # Stop monitoring for THIS account only
+        trading_bot.account_monitoring_status[account_id] = False
         
-        # Stop any running monitoring tasks
-        if user_id in trading_bot.monitoring_tasks:
-            task = trading_bot.monitoring_tasks[user_id]
-            if not task.done():
-                task.cancel()
-            del trading_bot.monitoring_tasks[user_id]
+        # Check if any other accounts for this user are still monitoring
+        user_accounts = trading_bot.enhanced_db.get_user_accounts(user_id)
+        any_monitoring = False
+        for acc in user_accounts:
+            if acc.account_id != account_id and trading_bot.account_monitoring_status.get(acc.account_id, False):
+                any_monitoring = True
+                break
         
-        # Close telethon client if exists
-        if user_id in trading_bot.user_monitoring_clients:
-            try:
-                client = trading_bot.user_monitoring_clients[user_id]
-                if client.is_connected():
-                    await client.disconnect()
-                del trading_bot.user_monitoring_clients[user_id]
-            except Exception as e:
-                logger.error(f"Error closing telethon client: {e}")
-        
-        account_name = current_account.account_name if current_account else "Unknown"
+        # Only stop Telethon client if NO accounts are monitoring
+        if not any_monitoring:
+            trading_bot.active_monitoring[user_id] = False
+            trading_bot.monitoring_status[user_id] = False
+            
+            # Stop any running monitoring tasks
+            if user_id in trading_bot.monitoring_tasks:
+                task = trading_bot.monitoring_tasks[user_id]
+                if not task.done():
+                    task.cancel()
+                del trading_bot.monitoring_tasks[user_id]
+            
+            # Close telethon client if exists
+            if user_id in trading_bot.user_monitoring_clients:
+                try:
+                    client = trading_bot.user_monitoring_clients[user_id]
+                    if client.is_connected():
+                        await client.disconnect()
+                    del trading_bot.user_monitoring_clients[user_id]
+                except Exception as e:
+                    logger.error(f"Error closing telethon client: {e}")
         
         await update.message.reply_text(
             f"🛑 <b>Trading Stopped Successfully!</b>\n\n"
-            f"Account: <b>{account_name}</b>\n"
-            f"✅ Monitoring stopped\n"
-            f"✅ Channels disconnected\n"
+            f"Account: <b>{current_account.account_name}</b>\n"
+            f"✅ Monitoring stopped for this account\n"
+            f"{'✅ Telegram client still active for other accounts\n' if any_monitoring else '✅ Telegram client disconnected\n'}"
             f"✅ Tasks cancelled\n\n"
-            f"All trading activities have been stopped.",
+            f"Trading stopped for this account.",
             parse_mode='HTML'
         )
         
