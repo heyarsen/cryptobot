@@ -5146,7 +5146,8 @@ channel_conv_handler = ConversationHandler(
         ],
         WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
         WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
-    }
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
 trading_conv_handler = ConversationHandler(
@@ -5166,7 +5167,8 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_CONFIG: [CallbackQueryHandler(handle_tp_config)],
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
-    }
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
 # Enhanced account conversation handler
@@ -5179,7 +5181,8 @@ account_conv_handler = ConversationHandler(
         WAITING_ACCOUNT_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_id)],
         WAITING_ACCOUNT_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_hash)],
         WAITING_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_phone)],
-    }
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
 # ================== UTILITY FUNCTIONS ==================
