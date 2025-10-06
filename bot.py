@@ -6088,36 +6088,34 @@ async def auto_start_monitoring():
                 # Set the current account for this user and bind exchange client
                 trading_bot.set_current_account(account.user_id, account.account_id)
                 trading_bot.enhanced_db.set_app_setting(f'current_account_{account.user_id}', account.account_id)
+                
+                # Get the bot application
+                bot_app = trading_bot.bot_instances.get(account.user_id)
+                if not bot_app:
+                    # Create a bot instance for this user
+                    from telegram import Bot
+                    bot_app = Bot(token="8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4")
+                    trading_bot.bot_instances[account.user_id] = bot_app
+                
+                # Start monitoring
+                success = await trading_bot.start_monitoring(account.user_id, bot_app)
+                
+                if success:
+                    trading_bot.monitoring_status[account.user_id] = True
+                    trading_bot.account_monitoring_status[account.account_id] = True
+                    logger.info(f"✅ Auto-started monitoring for account {account.account_id}")
                     
-                    # Get the bot application
-                    bot_app = trading_bot.bot_instances.get(account.user_id)
-                    if not bot_app:
-                        # Create a bot instance for this user
-                        from telegram import Bot
-                        bot_app = Bot(token="8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4")
-                        trading_bot.bot_instances[account.user_id] = bot_app
-                    
-                    # Start monitoring
-                    success = await trading_bot.start_monitoring(account.user_id, bot_app)
-                    
-                    if success:
-                        trading_bot.monitoring_status[account.user_id] = True
-                        trading_bot.account_monitoring_status[account.account_id] = True
-                        logger.info(f"✅ Auto-started monitoring for account {account.account_id}")
-                        
-                        # Send notification to user
-                        try:
-                            await bot_app.send_message(
-                                chat_id=account.user_id,
-                                text=f"🤖 <b>Bot Started</b>\n\n✅ Auto-started monitoring for account <b>{account.account_name}</b>\n📡 Monitoring {len(account.monitored_channels)} channel(s)\n\n🔍 Ready to detect signals!",
-                                parse_mode='HTML'
-                            )
-                        except Exception as e:
-                            logger.warning(f"⚠️ Could not send start notification to user {account.user_id}: {e}")
-                    else:
-                        logger.error(f"❌ Failed to auto-start monitoring for user {account.user_id}")
+                    # Send notification to user
+                    try:
+                        await bot_app.send_message(
+                            chat_id=account.user_id,
+                            text=f"🤖 <b>Bot Started</b>\n\n✅ Auto-started monitoring for account <b>{account.account_name}</b>\n📡 Monitoring {len(account.monitored_channels)} channel(s)\n\n🔍 Ready to detect signals!",
+                            parse_mode='HTML'
+                        )
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not send start notification to user {account.user_id}: {e}")
                 else:
-                    logger.info(f"⏭️ Skipping user {account.user_id} (no monitored channels configured)")
+                    logger.error(f"❌ Failed to auto-start monitoring for user {account.user_id}")
                     
             except Exception as e:
                 logger.error(f"❌ Error auto-starting monitoring for account {account.account_id}: {e}")
