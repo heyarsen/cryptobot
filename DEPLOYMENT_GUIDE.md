@@ -118,7 +118,13 @@ Check logs for these messages (every 5 seconds during polling):
 **Check:**
 - Are you using a persistent SQLite path? The DB defaults to `enhanced_trading_bot.db` in CWD unless `ENHANCED_DB_PATH` or `DB_PATH` is set, or `/data` exists.
 
-**Fix:**
+**Fix for Railway.com:**
+- Railway uses ephemeral storage by default - all data is lost on redeployment!
+- **You MUST set up a Railway Volume for persistent storage**
+- See [RAILWAY_SETUP.md](./RAILWAY_SETUP.md) for complete Railway configuration guide
+- Quick fix: Add a volume mounted at `/data` and set `ENHANCED_DB_PATH=/data/enhanced_trading_bot.db`
+
+**Fix for other platforms:**
 - Set `ENHANCED_DB_PATH=/data/enhanced_trading_bot.db` (or mount a volume) before starting the bot so accounts persist across deployments.
 
 ### Issue: Messages not being detected
