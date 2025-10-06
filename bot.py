@@ -2533,7 +2533,8 @@ class TradingBot:
                 return []
 
             channels = []
-            async for dialog in telethon_client.iter_dialogs():
+            # Fetch ALL dialogs with limit=None to get all subscribed channels
+            async for dialog in telethon_client.iter_dialogs(limit=None):
                 if isinstance(dialog.entity, Channel):
                     channel_id = str(-abs(dialog.entity.id))
                     channels.append({
@@ -3498,19 +3499,27 @@ class TradingBot:
 trading_bot = TradingBot()
 
 # Helper functions
-def create_channel_selection_text(user_id: int) -> str:
+def create_channel_selection_text(user_id: int, total_channels: int = 0) -> str:
     config = trading_bot.get_user_config(user_id)
+    channels_info = f"\nTotal available: <b>{total_channels}</b> channels" if total_channels > 0 else ""
     return f"""📡 <b>Channel Selection</b>
 
-Currently monitoring: <b>{len(config.monitored_channels)}</b> channels
+Currently monitoring: <b>{len(config.monitored_channels)}</b> channels{channels_info}
 
 Select channels to monitor:"""
 
-def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarkup:
+def create_channel_keyboard(user_id: int, channels: list, page: int = 0) -> InlineKeyboardMarkup:
     config = trading_bot.get_user_config(user_id)
     keyboard = []
 
-    for channel in channels[:15]:
+    # Pagination settings: show 20 channels per page
+    channels_per_page = 20
+    start_idx = page * channels_per_page
+    end_idx = start_idx + channels_per_page
+    total_pages = (len(channels) + channels_per_page - 1) // channels_per_page
+
+    # Display channels for current page
+    for channel in channels[start_idx:end_idx]:
         is_selected = channel['id'] in config.monitored_channels
         emoji = "✅" if is_selected else "⭕"
         title = channel['title'][:25] + "..." if len(channel['title']) > 25 else channel['title']
@@ -3519,6 +3528,16 @@ def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarku
             f"{emoji} {title}", 
             callback_data=f"toggle_channel_{channel['id']}"
         )])
+
+    # Pagination controls
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"channel_page_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="page_info"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"channel_page_{page+1}"))
+        keyboard.append(nav_buttons)
 
     keyboard.append([
         InlineKeyboardButton("➕ Manual ID", callback_data="add_manual_channel"),
@@ -4871,10 +4890,11 @@ async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data['available_channels'] = channels
-    keyboard_markup = create_channel_keyboard(user_id, channels)
+    context.user_data['channel_page'] = 0  # Reset to first page
+    keyboard_markup = create_channel_keyboard(user_id, channels, page=0)
 
     await send_text(
-        create_channel_selection_text(user_id),
+        create_channel_selection_text(user_id, len(channels)),
         reply_markup=keyboard_markup,
         parse_mode='HTML'
     )
@@ -4951,9 +4971,10 @@ Next: open ⚙️ Settings""",
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
         channels = context.user_data.get('available_channels', [])
-        keyboard_markup = create_channel_keyboard(user_id, channels)
+        page = context.user_data.get('channel_page', 0)
+        keyboard_markup = create_channel_keyboard(user_id, channels, page)
         await query.edit_message_text(
-            create_channel_selection_text(user_id),
+            create_channel_selection_text(user_id, len(channels)),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
@@ -4990,6 +5011,23 @@ The bot will automatically extract the channel ID.""",
         )
         return WAITING_CHANNEL_SELECTION  # Stay in same state to handle forwarded messages
 
+    elif query.data.startswith("channel_page_"):
+        # Handle pagination
+        page = int(query.data.replace("channel_page_", ""))
+        context.user_data['channel_page'] = page
+        channels = context.user_data.get('available_channels', [])
+        keyboard_markup = create_channel_keyboard(user_id, channels, page)
+
+        await query.edit_message_text(
+            create_channel_selection_text(user_id, len(channels)),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
+
+    elif query.data == "page_info":
+        # Just answer the callback to dismiss the loading state
+        await query.answer()
+
     elif query.data.startswith("toggle_channel_"):
         channel_id = query.data.replace("toggle_channel_", "")
 
@@ -5006,10 +5044,12 @@ The bot will automatically extract the channel ID.""",
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
 
         channels = context.user_data.get('available_channels', [])
-        keyboard_markup = create_channel_keyboard(user_id, channels)
+        # Preserve the current page
+        page = context.user_data.get('channel_page', 0)
+        keyboard_markup = create_channel_keyboard(user_id, channels, page)
 
         await query.edit_message_text(
-            create_channel_selection_text(user_id),
+            create_channel_selection_text(user_id, len(channels)),
             reply_markup=keyboard_markup,
             parse_mode='HTML'
         )
