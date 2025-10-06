@@ -6003,7 +6003,8 @@ channel_conv_handler = ConversationHandler(
         WAITING_MANUAL_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_channel)],
         WAITING_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
+    per_message=True
 )
 
 trading_conv_handler = ConversationHandler(
@@ -6024,7 +6025,8 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
     },
-    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
+    per_message=True
 )
 
 # Enhanced account conversation handler
@@ -6061,7 +6063,7 @@ def kill_existing_bot_instances():
 
 # ================== MAIN ==================
 
-async def auto_start_monitoring():
+async def auto_start_monitoring(application):
     """Automatically start monitoring for all accounts with configured channels on bot startup"""
     try:
         logger.info("🔄 Auto-start monitoring: Checking for accounts with monitored channels...")
@@ -6089,13 +6091,9 @@ async def auto_start_monitoring():
                 trading_bot.set_current_account(account.user_id, account.account_id)
                 trading_bot.enhanced_db.set_app_setting(f'current_account_{account.user_id}', account.account_id)
                 
-                # Get the bot application
-                bot_app = trading_bot.bot_instances.get(account.user_id)
-                if not bot_app:
-                    # Create a bot instance for this user
-                    from telegram import Bot
-                    bot_app = Bot(token="8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4")
-                    trading_bot.bot_instances[account.user_id] = bot_app
+                # Use the application's bot instance
+                bot_app = application.bot
+                trading_bot.bot_instances[account.user_id] = bot_app
                 
                 # Start monitoring
                 success = await trading_bot.start_monitoring(account.user_id, bot_app)
@@ -6178,7 +6176,7 @@ def main():
         async def post_init(app):
             """Called after the bot starts"""
             logger.info("🚀 Bot initialized, starting auto-monitoring...")
-            await auto_start_monitoring()
+            await auto_start_monitoring(app)
         
         application.post_init = post_init
         
