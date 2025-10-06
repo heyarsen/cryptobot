@@ -4997,11 +4997,6 @@ async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT
         query = update.callback_query
         user_id = update.effective_user.id
         config = trading_bot.get_user_config(user_id)
-
-        try:
-            await query.answer()
-        except:
-            pass
     elif update.message and update.message.forward_from_chat:
         # Handle forwarded message
         user_id = update.effective_user.id
@@ -5034,115 +5029,136 @@ Open 📡 Channels again to continue managing.""",
 
     query = update.callback_query
 
-    if query.data == "channels_done":
-        await query.edit_message_text(
-            f"""✅ <b>Channel selection complete!</b>
+    try:
+        if query.data == "channels_done":
+            await query.answer()
+            await query.edit_message_text(
+                f"""✅ <b>Channel selection complete!</b>
 
 Monitoring: <b>{len(config.monitored_channels)}</b> channels
 
 Next: open ⚙️ Settings""",
-            parse_mode='HTML'
-        )
-        # Persist monitored channels to the current account if available
-        try:
-            acc = trading_bot.get_current_account(user_id)
-            if acc:
-                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
-        return ConversationHandler.END
+                parse_mode='HTML'
+            )
+            # Persist monitored channels to the current account if available
+            try:
+                acc = trading_bot.get_current_account(user_id)
+                if acc:
+                    trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+            return ConversationHandler.END
 
-    elif query.data == "clear_all_channels":
-        config.monitored_channels.clear()
-        try:
-            acc = trading_bot.get_current_account(user_id)
-            if acc:
-                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
-        channels = context.user_data.get('available_channels', [])
-        page = context.user_data.get('channel_page', 0)
-        keyboard_markup = create_channel_keyboard(user_id, channels, page)
-        await query.edit_message_text(
-            create_channel_selection_text(user_id, len(channels)),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
+        elif query.data == "clear_all_channels":
+            await query.answer()
+            config.monitored_channels.clear()
+            try:
+                acc = trading_bot.get_current_account(user_id)
+                if acc:
+                    trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+            channels = context.user_data.get('available_channels', [])
+            page = context.user_data.get('channel_page', 0)
+            keyboard_markup = create_channel_keyboard(user_id, channels, page)
+            await query.edit_message_text(
+                create_channel_selection_text(user_id, len(channels)),
+                reply_markup=keyboard_markup,
+                parse_mode='HTML'
+            )
 
-    elif query.data == "add_manual_channel":
-        await query.edit_message_text(
-            """📝 <b>Manual Channel ID</b>
+        elif query.data == "add_manual_channel":
+            await query.answer()
+            await query.edit_message_text(
+                """📝 <b>Manual Channel ID</b>
 
 Send channel ID: <code>-1001234567890</code>""",
-            parse_mode='HTML'
-        )
-        return WAITING_MANUAL_CHANNEL
-    
-    elif query.data == "add_channel_link":
-        await query.edit_message_text(
-            """🔗 <b>Add Channel via Link</b>
+                parse_mode='HTML'
+            )
+            return WAITING_MANUAL_CHANNEL
+        
+        elif query.data == "add_channel_link":
+            await query.answer()
+            await query.edit_message_text(
+                """🔗 <b>Add Channel via Link</b>
 
 Send channel link:
 • <code>https://t.me/channel_name</code>
 • <code>t.me/channel_name</code>
 • <code>@channel_name</code>
 • <code>channel_name</code>""",
-            parse_mode='HTML'
-        )
-        return WAITING_CHANNEL_LINK
-    
-    elif query.data == "add_forwarded_channel":
-        await query.edit_message_text(
-            """📤 <b>Add Channel via Forward</b>
+                parse_mode='HTML'
+            )
+            return WAITING_CHANNEL_LINK
+        
+        elif query.data == "add_forwarded_channel":
+            await query.answer()
+            await query.edit_message_text(
+                """📤 <b>Add Channel via Forward</b>
 
 Forward any message from the channel you want to monitor.
 The bot will automatically extract the channel ID.""",
-            parse_mode='HTML'
-        )
-        return WAITING_CHANNEL_SELECTION  # Stay in same state to handle forwarded messages
+                parse_mode='HTML'
+            )
+            return WAITING_CHANNEL_SELECTION  # Stay in same state to handle forwarded messages
 
-    elif query.data.startswith("channel_page_"):
-        # Handle pagination
-        page = int(query.data.replace("channel_page_", ""))
-        context.user_data['channel_page'] = page
-        channels = context.user_data.get('available_channels', [])
-        keyboard_markup = create_channel_keyboard(user_id, channels, page)
+        elif query.data.startswith("channel_page_"):
+            await query.answer()
+            # Handle pagination
+            page = int(query.data.replace("channel_page_", ""))
+            context.user_data['channel_page'] = page
+            channels = context.user_data.get('available_channels', [])
+            keyboard_markup = create_channel_keyboard(user_id, channels, page)
 
-        await query.edit_message_text(
-            create_channel_selection_text(user_id, len(channels)),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
+            await query.edit_message_text(
+                create_channel_selection_text(user_id, len(channels)),
+                reply_markup=keyboard_markup,
+                parse_mode='HTML'
+            )
 
-    elif query.data == "page_info":
-        # Just answer the callback to dismiss the loading state
-        await query.answer()
+        elif query.data == "page_info":
+            # Just answer the callback to dismiss the loading state
+            await query.answer()
 
-    elif query.data.startswith("toggle_channel_"):
-        channel_id = query.data.replace("toggle_channel_", "")
+        elif query.data.startswith("toggle_channel_"):
+            await query.answer()
+            channel_id = query.data.replace("toggle_channel_", "")
 
-        if channel_id in config.monitored_channels:
-            config.monitored_channels.remove(channel_id)
+            if channel_id in config.monitored_channels:
+                config.monitored_channels.remove(channel_id)
+            else:
+                config.monitored_channels.append(channel_id)
+
+            try:
+                acc = trading_bot.get_current_account(user_id)
+                if acc:
+                    trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+
+            channels = context.user_data.get('available_channels', [])
+            # Preserve the current page
+            page = context.user_data.get('channel_page', 0)
+            keyboard_markup = create_channel_keyboard(user_id, channels, page)
+
+            await query.edit_message_text(
+                create_channel_selection_text(user_id, len(channels)),
+                reply_markup=keyboard_markup,
+                parse_mode='HTML'
+            )
+        
         else:
-            config.monitored_channels.append(channel_id)
-
+            # Unknown callback data - just answer to prevent timeout
+            await query.answer("Unknown action")
+            logger.warning(f"Unknown callback data in channel selection: {query.data}")
+    
+    except Exception as e:
+        logger.error(f"Error in handle_channel_selection: {e}")
+        logger.error(traceback.format_exc())
         try:
-            acc = trading_bot.get_current_account(user_id)
-            if acc:
-                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
-
-        channels = context.user_data.get('available_channels', [])
-        # Preserve the current page
-        page = context.user_data.get('channel_page', 0)
-        keyboard_markup = create_channel_keyboard(user_id, channels, page)
-
-        await query.edit_message_text(
-            create_channel_selection_text(user_id, len(channels)),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
+            await query.answer("An error occurred. Please try again.")
+        except:
+            pass
 
     return WAITING_CHANNEL_SELECTION
 
