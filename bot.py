@@ -5099,7 +5099,7 @@ Confidence: {signal.confidence:.2f}""")
 # ================== CONVERSATION HANDLERS ==================
 
 binance_conv_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)],
+    entry_points=[CommandHandler('setup_binance', setup_binance)],
     states={
         WAITING_BINANCE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_key)],
         WAITING_BINANCE_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_binance_secret)],
@@ -5108,7 +5108,7 @@ binance_conv_handler = ConversationHandler(
 )
 
 telegram_conv_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_button_entry)],
+    entry_points=[CommandHandler('setup_telegram', setup_telegram_api)],
     states={
         WAITING_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_id)],
         WAITING_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_hash)],
@@ -5288,6 +5288,7 @@ def main():
         application.add_handler(account_conv_handler)
         application.add_handler(channel_conv_handler)
         application.add_handler(trading_conv_handler)
+        # No extra command handlers; only buttons and /start are active
 
         # Enhanced static button handler (catch-all for remaining messages)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
