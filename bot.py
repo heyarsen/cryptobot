@@ -29,6 +29,11 @@ import subprocess
 import signal
 import shutil
 
+# Suppress PTBUserWarning for ConversationHandler CallbackQueryHandler warnings
+import warnings
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*CallbackQueryHandler.*per_message.*")
+
 # Import python-telegram-bot
 from telegram import (
     Update,
@@ -54,6 +59,9 @@ import ccxt
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, PeerChannel
 from telethon.errors import ApiIdInvalidError
+
+# [Rest of your code remains exactly the same...]
+
 
 # Bot Configuration
 BOT_PIN_CODE = "496745"  # PIN code for bot access
