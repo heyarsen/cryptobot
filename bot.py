@@ -5682,8 +5682,16 @@ async def handle_tp_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trading_bot.enhanced_db.update_account_take_profit_levels(acc.account_id, config.custom_take_profits)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist TP clear: {e}")
+        
+        tp_keyboard = [
+            [InlineKeyboardButton("➕ Add Level", callback_data="add_tp_level")],
+            [InlineKeyboardButton("🔄 Reset Default", callback_data="reset_tp_default")],
+            [InlineKeyboardButton("✅ Done", callback_data="tp_config_done")]
+        ]
+        
         await query.edit_message_text(
             "🗑️ <b>All take profit levels cleared!</b>\n\nAdd new levels or reset to default.",
+            reply_markup=InlineKeyboardMarkup(tp_keyboard),
             parse_mode='HTML'
         )
         return WAITING_TP_CONFIG
