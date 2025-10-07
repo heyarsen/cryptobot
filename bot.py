@@ -976,42 +976,6 @@ class EnhancedDatabase:
             logger.error(f"❌ Failed to update user_id for {account_id}: {e}")
             return False
     
-    def update_account_credentials(self, account_id: str, telegram_api_id: str = None, 
-                                   telegram_api_hash: str = None, phone: str = None) -> bool:
-        """Update account's Telegram credentials"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            updates = []
-            values = []
-            
-            if telegram_api_id is not None:
-                updates.append('telegram_api_id = ?')
-                values.append(telegram_api_id)
-            
-            if telegram_api_hash is not None:
-                updates.append('telegram_api_hash = ?')
-                values.append(telegram_api_hash)
-            
-            if phone is not None:
-                updates.append('phone = ?')
-                values.append(phone)
-            
-            if not updates:
-                return True
-            
-            values.append(account_id)
-            query = f"UPDATE accounts SET {', '.join(updates)} WHERE account_id = ?"
-            cursor.execute(query, values)
-            conn.commit()
-            conn.close()
-            logger.info(f"✅ Updated credentials for account {account_id}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to update credentials for {account_id}: {e}")
-            return False
-    
     def get_user_accounts(self, user_id: int) -> List[AccountConfig]:
         """Get all accounts for a specific user"""
         try:
@@ -2510,23 +2474,22 @@ class TradingBot:
             )
 
             # Start with phone parameter to avoid interactive prompt
-            # Always use .start() method which handles authorization properly
+            # If phone is not provided, use lambda that returns empty string to avoid EOF error
             try:
-                # Ensure phone is always provided, even if empty string
-                phone_to_use = phone if (phone and phone.strip()) else ""
-                
-                # Use .start() which will:
-                # 1. Use existing session if authenticated
-                # 2. Request authorization if needed
-                await telethon_client.start(phone=lambda: phone_to_use)
-                
-                # After start, verify authorization
-                if not await telethon_client.is_user_authorized():
-                    logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
-                    logger.info(f"ℹ️ Please authorize the account through the bot interface")
-                    # Still store the client, but it won't be able to monitor until authorized
-                    self.user_monitoring_clients[current_account.account_id] = telethon_client
-                    return False
+                if phone and phone.strip():
+                    await telethon_client.start(phone=lambda: phone)
+                else:
+                    # Try to connect with existing session
+                    # If session file exists and is authenticated, this should work
+                    await telethon_client.connect()
+                    
+                    # Check if authorized
+                    if not await telethon_client.is_user_authorized():
+                        logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
+                        logger.info(f"ℹ️ Please authorize the account through the bot interface")
+                        # Still store the client, but it won't be able to monitor until authorized
+                        self.user_monitoring_clients[current_account.account_id] = telethon_client
+                        return False
             except Exception as start_err:
                 logger.error(f"❌ Error starting Telethon client: {start_err}")
                 logger.error(traceback.format_exc())
@@ -2568,50 +2531,18 @@ class TradingBot:
                 logger.error(f"❌ Telethon client not authorized for account {account_id}")
                 logger.info(f"ℹ️ Please authorize the account through the bot interface")
                 return []
-            
-            # Ensure client is connected
-            if not telethon_client.is_connected():
-                logger.info(f"🔌 Connecting Telethon client for account {account_id}...")
-                try:
-                    await telethon_client.connect()
-                except Exception as conn_error:
-                    logger.error(f"❌ Failed to connect Telethon client: {conn_error}")
-                    return []
 
             channels = []
-            # Fetch ALL dialogs with limit=None to get all subscribed channels
-            try:
-                logger.info(f"🔍 Fetching dialogs for account {account_id}...")
-                
-                # Wrap the iteration in a coroutine with timeout (30 seconds)
-                async def fetch_dialogs():
-                    dialog_channels = []
-                    async for dialog in telethon_client.iter_dialogs(limit=None):
-                        try:
-                            if isinstance(dialog.entity, Channel):
-                                channel_id = str(-abs(dialog.entity.id))
-                                dialog_channels.append({
-                                    'id': channel_id,
-                                    'title': dialog.entity.title or "Unknown Channel",
-                                    'username': getattr(dialog.entity, 'username', 'N/A')
-                                })
-                        except Exception as dialog_error:
-                            logger.warning(f"⚠️ Error processing dialog: {dialog_error}")
-                            continue  # Skip this dialog and continue with the next one
-                    return dialog_channels
-                
-                # Add 30-second timeout to prevent hanging
-                channels = await asyncio.wait_for(fetch_dialogs(), timeout=30.0)
-                logger.info(f"📡 Found {len(channels)} channels for account {account_id}")
-                
-            except asyncio.TimeoutError:
-                logger.error(f"⏱️ Timeout while fetching dialogs for account {account_id}")
-                logger.info(f"ℹ️ This may be due to slow network or too many channels. Try again later.")
-            except Exception as iter_error:
-                logger.error(f"❌ Error iterating dialogs: {iter_error}")
-                logger.error(traceback.format_exc())
-                logger.info(f"ℹ️ Returning {len(channels)} channels fetched before error")
-            
+            async for dialog in telethon_client.iter_dialogs():
+                if isinstance(dialog.entity, Channel):
+                    channel_id = str(-abs(dialog.entity.id))
+                    channels.append({
+                        'id': channel_id,
+                        'title': dialog.entity.title or "Unknown Channel",
+                        'username': getattr(dialog.entity, 'username', 'N/A')
+                    })
+
+            logger.info(f"📡 Found {len(channels)} channels for account {account_id}")
             return channels
 
         except Exception as e:
@@ -3567,27 +3498,19 @@ class TradingBot:
 trading_bot = TradingBot()
 
 # Helper functions
-def create_channel_selection_text(user_id: int, total_channels: int = 0) -> str:
+def create_channel_selection_text(user_id: int) -> str:
     config = trading_bot.get_user_config(user_id)
-    channels_info = f"\nTotal available: <b>{total_channels}</b> channels" if total_channels > 0 else ""
     return f"""📡 <b>Channel Selection</b>
 
-Currently monitoring: <b>{len(config.monitored_channels)}</b> channels{channels_info}
+Currently monitoring: <b>{len(config.monitored_channels)}</b> channels
 
 Select channels to monitor:"""
 
-def create_channel_keyboard(user_id: int, channels: list, page: int = 0) -> InlineKeyboardMarkup:
+def create_channel_keyboard(user_id: int, channels: list) -> InlineKeyboardMarkup:
     config = trading_bot.get_user_config(user_id)
     keyboard = []
 
-    # Pagination settings: show 20 channels per page
-    channels_per_page = 20
-    start_idx = page * channels_per_page
-    end_idx = start_idx + channels_per_page
-    total_pages = (len(channels) + channels_per_page - 1) // channels_per_page
-
-    # Display channels for current page
-    for channel in channels[start_idx:end_idx]:
+    for channel in channels[:15]:
         is_selected = channel['id'] in config.monitored_channels
         emoji = "✅" if is_selected else "⭕"
         title = channel['title'][:25] + "..." if len(channel['title']) > 25 else channel['title']
@@ -3596,16 +3519,6 @@ def create_channel_keyboard(user_id: int, channels: list, page: int = 0) -> Inli
             f"{emoji} {title}", 
             callback_data=f"toggle_channel_{channel['id']}"
         )])
-
-    # Pagination controls
-    if total_pages > 1:
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"channel_page_{page-1}"))
-        nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="page_info"))
-        if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"channel_page_{page+1}"))
-        keyboard.append(nav_buttons)
 
     keyboard.append([
         InlineKeyboardButton("➕ Manual ID", callback_data="add_manual_channel"),
@@ -3647,7 +3560,6 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
                             callback_data="toggle_sl_tp")],
         [InlineKeyboardButton(f"🔗 Make.com Webhook: {'ON' if config.make_webhook_enabled else 'OFF'}", 
                             callback_data="toggle_webhook")],
-        [InlineKeyboardButton("🔐 Update Telegram Credentials", callback_data="update_telegram_creds")],
         [InlineKeyboardButton(f"⚡ Leverage: {config.leverage}x", callback_data="set_leverage")],
         [InlineKeyboardButton(f"🛑 Stop Loss: {config.stop_loss_percent}%", callback_data="set_stop_loss")],
         [InlineKeyboardButton(f"🎯 Custom Take Profits ({len(config.custom_take_profits)} levels)", callback_data="configure_take_profits")],
@@ -4952,39 +4864,17 @@ async def setup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_text("🔍 <b>Loading channels...</b>", parse_mode='HTML')
 
-    try:
-        channels = await trading_bot.get_available_channels(user_id)
-    except Exception as e:
-        logger.error(f"❌ Error in setup_channels: {e}")
-        logger.error(traceback.format_exc())
-        await send_text(
-            "❌ <b>Error loading channels!</b>\n\n"
-            "This may be due to:\n"
-            "• Network connection issues\n"
-            "• Telegram API rate limiting\n"
-            "• Invalid Telegram credentials\n\n"
-            "Please try again in a few moments.",
-            parse_mode='HTML'
-        )
-        return ConversationHandler.END
+    channels = await trading_bot.get_available_channels(user_id)
 
     if not channels:
-        await send_text(
-            "ℹ️ <b>No channels found!</b>\n\n"
-            "Make sure you:\n"
-            "• Have joined Telegram channels\n"
-            "• Configured Telegram API credentials\n"
-            "• Are logged into the correct Telegram account",
-            parse_mode='HTML'
-        )
+        await send_text("❌ <b>No channels!</b> Add an account and configure 📡 Channels from the account page.", parse_mode='HTML')
         return ConversationHandler.END
 
     context.user_data['available_channels'] = channels
-    context.user_data['channel_page'] = 0  # Reset to first page
-    keyboard_markup = create_channel_keyboard(user_id, channels, page=0)
+    keyboard_markup = create_channel_keyboard(user_id, channels)
 
     await send_text(
-        create_channel_selection_text(user_id, len(channels)),
+        create_channel_selection_text(user_id),
         reply_markup=keyboard_markup,
         parse_mode='HTML'
     )
@@ -4997,6 +4887,11 @@ async def handle_channel_selection(update: Update, context: ContextTypes.DEFAULT
         query = update.callback_query
         user_id = update.effective_user.id
         config = trading_bot.get_user_config(user_id)
+
+        try:
+            await query.answer()
+        except:
+            pass
     elif update.message and update.message.forward_from_chat:
         # Handle forwarded message
         user_id = update.effective_user.id
@@ -5029,136 +4924,95 @@ Open 📡 Channels again to continue managing.""",
 
     query = update.callback_query
 
-    try:
-        if query.data == "channels_done":
-            await query.answer()
-            await query.edit_message_text(
-                f"""✅ <b>Channel selection complete!</b>
+    if query.data == "channels_done":
+        await query.edit_message_text(
+            f"""✅ <b>Channel selection complete!</b>
 
 Monitoring: <b>{len(config.monitored_channels)}</b> channels
 
 Next: open ⚙️ Settings""",
-                parse_mode='HTML'
-            )
-            # Persist monitored channels to the current account if available
-            try:
-                acc = trading_bot.get_current_account(user_id)
-                if acc:
-                    trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
-            return ConversationHandler.END
+            parse_mode='HTML'
+        )
+        # Persist monitored channels to the current account if available
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+        return ConversationHandler.END
 
-        elif query.data == "clear_all_channels":
-            await query.answer()
-            config.monitored_channels.clear()
-            try:
-                acc = trading_bot.get_current_account(user_id)
-                if acc:
-                    trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
-            channels = context.user_data.get('available_channels', [])
-            page = context.user_data.get('channel_page', 0)
-            keyboard_markup = create_channel_keyboard(user_id, channels, page)
-            await query.edit_message_text(
-                create_channel_selection_text(user_id, len(channels)),
-                reply_markup=keyboard_markup,
-                parse_mode='HTML'
-            )
+    elif query.data == "clear_all_channels":
+        config.monitored_channels.clear()
+        try:
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+        channels = context.user_data.get('available_channels', [])
+        keyboard_markup = create_channel_keyboard(user_id, channels)
+        await query.edit_message_text(
+            create_channel_selection_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
 
-        elif query.data == "add_manual_channel":
-            await query.answer()
-            await query.edit_message_text(
-                """📝 <b>Manual Channel ID</b>
+    elif query.data == "add_manual_channel":
+        await query.edit_message_text(
+            """📝 <b>Manual Channel ID</b>
 
 Send channel ID: <code>-1001234567890</code>""",
-                parse_mode='HTML'
-            )
-            return WAITING_MANUAL_CHANNEL
-        
-        elif query.data == "add_channel_link":
-            await query.answer()
-            await query.edit_message_text(
-                """🔗 <b>Add Channel via Link</b>
+            parse_mode='HTML'
+        )
+        return WAITING_MANUAL_CHANNEL
+    
+    elif query.data == "add_channel_link":
+        await query.edit_message_text(
+            """🔗 <b>Add Channel via Link</b>
 
 Send channel link:
 • <code>https://t.me/channel_name</code>
 • <code>t.me/channel_name</code>
 • <code>@channel_name</code>
 • <code>channel_name</code>""",
-                parse_mode='HTML'
-            )
-            return WAITING_CHANNEL_LINK
-        
-        elif query.data == "add_forwarded_channel":
-            await query.answer()
-            await query.edit_message_text(
-                """📤 <b>Add Channel via Forward</b>
+            parse_mode='HTML'
+        )
+        return WAITING_CHANNEL_LINK
+    
+    elif query.data == "add_forwarded_channel":
+        await query.edit_message_text(
+            """📤 <b>Add Channel via Forward</b>
 
 Forward any message from the channel you want to monitor.
 The bot will automatically extract the channel ID.""",
-                parse_mode='HTML'
-            )
-            return WAITING_CHANNEL_SELECTION  # Stay in same state to handle forwarded messages
+            parse_mode='HTML'
+        )
+        return WAITING_CHANNEL_SELECTION  # Stay in same state to handle forwarded messages
 
-        elif query.data.startswith("channel_page_"):
-            await query.answer()
-            # Handle pagination
-            page = int(query.data.replace("channel_page_", ""))
-            context.user_data['channel_page'] = page
-            channels = context.user_data.get('available_channels', [])
-            keyboard_markup = create_channel_keyboard(user_id, channels, page)
+    elif query.data.startswith("toggle_channel_"):
+        channel_id = query.data.replace("toggle_channel_", "")
 
-            await query.edit_message_text(
-                create_channel_selection_text(user_id, len(channels)),
-                reply_markup=keyboard_markup,
-                parse_mode='HTML'
-            )
-
-        elif query.data == "page_info":
-            # Just answer the callback to dismiss the loading state
-            await query.answer()
-
-        elif query.data.startswith("toggle_channel_"):
-            await query.answer()
-            channel_id = query.data.replace("toggle_channel_", "")
-
-            if channel_id in config.monitored_channels:
-                config.monitored_channels.remove(channel_id)
-            else:
-                config.monitored_channels.append(channel_id)
-
-            try:
-                acc = trading_bot.get_current_account(user_id)
-                if acc:
-                    trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
-
-            channels = context.user_data.get('available_channels', [])
-            # Preserve the current page
-            page = context.user_data.get('channel_page', 0)
-            keyboard_markup = create_channel_keyboard(user_id, channels, page)
-
-            await query.edit_message_text(
-                create_channel_selection_text(user_id, len(channels)),
-                reply_markup=keyboard_markup,
-                parse_mode='HTML'
-            )
-        
+        if channel_id in config.monitored_channels:
+            config.monitored_channels.remove(channel_id)
         else:
-            # Unknown callback data - just answer to prevent timeout
-            await query.answer("Unknown action")
-            logger.warning(f"Unknown callback data in channel selection: {query.data}")
-    
-    except Exception as e:
-        logger.error(f"Error in handle_channel_selection: {e}")
-        logger.error(traceback.format_exc())
+            config.monitored_channels.append(channel_id)
+
         try:
-            await query.answer("An error occurred. Please try again.")
-        except:
-            pass
+            acc = trading_bot.get_current_account(user_id)
+            if acc:
+                trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
+
+        channels = context.user_data.get('available_channels', [])
+        keyboard_markup = create_channel_keyboard(user_id, channels)
+
+        await query.edit_message_text(
+            create_channel_selection_text(user_id),
+            reply_markup=keyboard_markup,
+            parse_mode='HTML'
+        )
 
     return WAITING_CHANNEL_SELECTION
 
@@ -5403,16 +5257,6 @@ Next: press 🚀 Start on the account page""",
         )
         return WAITING_TRAILING_CALLBACK
 
-    elif query.data == "update_telegram_creds":
-        # Ask user to enter new Telegram API ID
-        await query.edit_message_text(
-            "🔐 <b>Update Telegram Credentials</b>\n\n"
-            "Please send your Telegram API ID:",
-            parse_mode='HTML'
-        )
-        context.user_data['updating_telegram_creds'] = True
-        return WAITING_ACCOUNT_TELEGRAM_ID
-    
     elif query.data == "manage_channels":
         # Exit trading settings conversation and defer to /setup_channels flow
         await query.edit_message_text("📡 <b>Opening channel manager...</b>", parse_mode='HTML')
@@ -6003,7 +5847,7 @@ async def handle_account_bingx_secret(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 async def handle_account_telegram_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Telegram API ID input for new account or credential update"""
+    """Handle Telegram API ID input"""
     api_id = update.message.text.strip()
     context.user_data['telegram_api_id'] = api_id
     
@@ -6015,7 +5859,7 @@ async def handle_account_telegram_id(update: Update, context: ContextTypes.DEFAU
     return WAITING_ACCOUNT_TELEGRAM_HASH
 
 async def handle_account_telegram_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Telegram API hash input for new account or credential update"""
+    """Handle Telegram API hash input"""
     api_hash = update.message.text.strip()
     context.user_data['telegram_api_hash'] = api_hash
     
@@ -6027,88 +5871,42 @@ async def handle_account_telegram_hash(update: Update, context: ContextTypes.DEF
     return WAITING_ACCOUNT_PHONE
 
 async def handle_account_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone number input and create/update account"""
+    """Handle phone number input and create account"""
     phone = update.message.text.strip()
-    user_id = update.effective_user.id
     
-    # Check if we're updating existing account credentials
-    if context.user_data.get('updating_telegram_creds'):
-        current_account = trading_bot.get_current_account(user_id)
-        if current_account:
-            # Update existing account credentials
-            success = trading_bot.enhanced_db.update_account_credentials(
-                current_account.account_id,
-                telegram_api_id=context.user_data['telegram_api_id'],
-                telegram_api_hash=context.user_data['telegram_api_hash'],
-                phone=phone
-            )
-            
-            if success:
-                # Clear any existing Telethon session for this account
-                session_name = f'session_{current_account.account_id}'
-                try:
-                    if os.path.exists(f'{session_name}.session'):
-                        os.remove(f'{session_name}.session')
-                        logger.info(f"🗑️ Removed old session file for account {current_account.account_id}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to remove old session: {e}")
-                
-                # Remove client from monitoring clients to force recreation
-                if current_account.account_id in trading_bot.user_monitoring_clients:
-                    old_client = trading_bot.user_monitoring_clients.pop(current_account.account_id)
-                    try:
-                        await old_client.disconnect()
-                    except:
-                        pass
-                
-                await update.message.reply_text(
-                    f"✅ <b>Telegram Credentials Updated!</b>\n\n"
-                    f"API ID: <code>{context.user_data['telegram_api_id']}</code>\n"
-                    f"Phone: <code>{phone}</code>\n\n"
-                    f"The Telethon client will be re-initialized on next use.",
-                    parse_mode='HTML'
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Failed to update credentials. Please try again.",
-                    parse_mode='HTML'
-                )
-            
-            context.user_data.pop('updating_telegram_creds', None)
-            return WAITING_SETTINGS_SOURCE
-    else:
-        # Create new account configuration
-        account_id = str(uuid.uuid4())
-        account = AccountConfig(
-            account_id=account_id,
-            account_name=context.user_data['account_name'],
-            bingx_api_key=context.user_data['bingx_api_key'],
-            bingx_secret_key=context.user_data['bingx_secret_key'],
-            telegram_api_id=context.user_data['telegram_api_id'],
-            telegram_api_hash=context.user_data['telegram_api_hash'],
-            phone=phone,
-            user_id=user_id
+    # Create account configuration
+    account_id = str(uuid.uuid4())
+    user_id = update.effective_user.id
+    account = AccountConfig(
+        account_id=account_id,
+        account_name=context.user_data['account_name'],
+        bingx_api_key=context.user_data['bingx_api_key'],
+        bingx_secret_key=context.user_data['bingx_secret_key'],
+        telegram_api_id=context.user_data['telegram_api_id'],
+        telegram_api_hash=context.user_data['telegram_api_hash'],
+        phone=phone,
+        user_id=user_id
+    )
+    
+    # Save to database
+    if trading_bot.enhanced_db.create_account(account):
+        await update.message.reply_text(
+            f"🎉 <b>Account Created Successfully!</b>\n\n"
+            f"Account: <b>{account.account_name}</b>\n"
+            f"ID: <code>{account_id}</code>\n\n"
+            f"You can now:\n"
+            f"• Add channels to monitor\n"
+            f"• Configure trading settings\n"
+            f"• Start receiving signals",
+            parse_mode='HTML'
         )
-        
-        # Save to database
-        if trading_bot.enhanced_db.create_account(account):
-            await update.message.reply_text(
-                f"🎉 <b>Account Created Successfully!</b>\n\n"
-                f"Account: <b>{account.account_name}</b>\n"
-                f"ID: <code>{account_id}</code>\n\n"
-                f"You can now:\n"
-                f"• Add channels to monitor\n"
-                f"• Configure trading settings\n"
-                f"• Start receiving signals",
-                parse_mode='HTML'
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Failed to create account. Please try again.",
-                parse_mode='HTML'
-            )
-        
-        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "❌ Failed to create account. Please try again.",
+            parse_mode='HTML'
+        )
+    
+    return ConversationHandler.END
 
 async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all accounts"""
@@ -6257,9 +6055,6 @@ trading_conv_handler = ConversationHandler(
         WAITING_TP_CONFIG: [CallbackQueryHandler(handle_tp_config)],
         WAITING_TP_LEVEL_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_percent)],
         WAITING_TP_LEVEL_CLOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tp_level_close)],
-        WAITING_ACCOUNT_TELEGRAM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_id)],
-        WAITING_ACCOUNT_TELEGRAM_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_telegram_hash)],
-        WAITING_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_account_phone)],
     },
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
     per_user=True,
