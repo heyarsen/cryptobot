@@ -1754,13 +1754,19 @@ class TradingBot:
     
 
     def load_accounts_from_db(self):
-        """Load all accounts from database on startup"""
+        """Load all accounts from database on startup and restore current account selections"""
         try:
             accounts = self.enhanced_db.get_all_accounts()
             logger.info(f"📂 Loaded {len(accounts)} accounts from database")
 
+            # Restore current account selections from database
             for account in accounts:
                 logger.info(f"  ✅ {account.account_name} ({account.account_id[:8]}...)")
+                
+                # If this account has a user_id set, restore it as the current account for that user
+                if account.user_id and account.user_id > 0:
+                    self.current_accounts[account.user_id] = account.account_id
+                    logger.info(f"  🔄 Restored current account for user {account.user_id}: {account.account_name}")
 
             return accounts
         except Exception as e:
@@ -3748,6 +3754,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Invalid PIN (496745):", parse_mode='HTML')
             return
+
+    # Restore current account context from persistent state if not already set
+    if 'current_account_id' not in context.user_data:
+        current_account = trading_bot.get_current_account(user_id)
+        if current_account:
+            context.user_data['current_account_id'] = current_account.account_id
+            context.user_data['current_account_name'] = current_account.account_name
 
     # Account creation states
     if context.user_data.get('state') == 'WAIT_ACC_NAME':
@@ -6211,15 +6224,29 @@ Confidence: {signal.confidence:.2f}""")
 
 async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point for settings button press"""
-    if update.message and update.message.text == "⚙️ Settings" and 'current_account_id' in context.user_data:
-        user_id = update.effective_user.id
-        keyboard_markup = create_settings_keyboard(user_id)
-        await update.message.reply_text(
-            render_trading_config_text(user_id),
-            reply_markup=keyboard_markup,
-            parse_mode='HTML'
-        )
-        return WAITING_SETTINGS_SOURCE
+    user_id = update.effective_user.id
+    
+    # Check if user has a current account (either in context or in bot state)
+    current_account = trading_bot.get_current_account(user_id)
+    if update.message and update.message.text == "⚙️ Settings":
+        if current_account:
+            # Ensure context.user_data has the current account ID for other parts of the code
+            context.user_data['current_account_id'] = current_account.account_id
+            context.user_data['current_account_name'] = current_account.account_name
+            keyboard_markup = create_settings_keyboard(user_id)
+            await update.message.reply_text(
+                render_trading_config_text(user_id),
+                reply_markup=keyboard_markup,
+                parse_mode='HTML'
+            )
+            return WAITING_SETTINGS_SOURCE
+        else:
+            await update.message.reply_text(
+                "❌ <b>No Account Selected</b>\n\n"
+                "Please select an account first from the Accounts menu.",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
     return ConversationHandler.END
 
 binance_conv_handler = ConversationHandler(
@@ -6242,8 +6269,23 @@ telegram_conv_handler = ConversationHandler(
 
 async def channels_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point for channels button press"""
-    if update.message and update.message.text == "📡 Channels" and 'current_account_id' in context.user_data:
-        return await setup_channels(update, context)
+    user_id = update.effective_user.id
+    
+    # Check if user has a current account (either in context or in bot state)
+    current_account = trading_bot.get_current_account(user_id)
+    if update.message and update.message.text == "📡 Channels":
+        if current_account:
+            # Ensure context.user_data has the current account ID for other parts of the code
+            context.user_data['current_account_id'] = current_account.account_id
+            context.user_data['current_account_name'] = current_account.account_name
+            return await setup_channels(update, context)
+        else:
+            await update.message.reply_text(
+                "❌ <b>No Account Selected</b>\n\n"
+                "Please select an account first from the Accounts menu.",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
     return ConversationHandler.END
 
 channel_conv_handler = ConversationHandler(
