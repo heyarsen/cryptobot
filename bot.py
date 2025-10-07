@@ -3188,6 +3188,10 @@ class TradingBot:
             # Set active monitoring BEFORE starting the task
             self.active_monitoring[user_id] = True
             logger.info(f"🔛 Set active_monitoring[{user_id}] = True")
+            
+            # Set account monitoring status - this is critical for message processing
+            self.account_monitoring_status[account_id] = True
+            logger.info(f"🔛 Set account_monitoring_status[{account_id}] = True")
 
             # Start background task to process Telethon events if not already running
             if user_id not in self.monitoring_tasks or self.monitoring_tasks[user_id].done():
@@ -3200,6 +3204,7 @@ class TradingBot:
             logger.info(f"📡 Monitored channels: {config.monitored_channels}")
             logger.info(f"🔔 Client connected: {telethon_client.is_connected()}")
             logger.info(f"🔔 Active monitoring status: {self.active_monitoring.get(user_id, False)}")
+            logger.info(f"🔔 Account monitoring status: {self.account_monitoring_status.get(account_id, False)}")
             return True
 
         except Exception as e:
@@ -3265,13 +3270,23 @@ class TradingBot:
                     
                     # Only monitor channels for accounts that are actively monitoring
                     if current_account and not self.account_monitoring_status.get(current_account.account_id, False):
-                        logger.debug(f"⏸️ Account {current_account.account_name} monitoring is paused, skipping...")
+                        logger.warning(f"⏸️ Account {current_account.account_name} (ID: {current_account.account_id}) monitoring is paused, skipping message processing...")
+                        logger.warning(f"⏸️ Current account_monitoring_status: {dict(self.account_monitoring_status)}")
                         await asyncio.sleep(10)
                         continue
                     
                     # Filter to only the current account's channels
                     account_channels = current_account.monitored_channels if current_account else []
                     channels_to_check = [ch for ch in config.monitored_channels if ch in account_channels]
+                    
+                    logger.debug(f"🔍 Account channels: {account_channels}")
+                    logger.debug(f"🔍 Config monitored channels: {config.monitored_channels}")
+                    logger.debug(f"🔍 Channels to check (intersection): {channels_to_check}")
+                    
+                    if not channels_to_check:
+                        logger.warning(f"⚠️ No channels to check! Account channels: {account_channels}, Config channels: {config.monitored_channels}")
+                        await asyncio.sleep(10)
+                        continue
                     
                     # Check each monitored channel for new messages
                     for channel_id_str in channels_to_check:
