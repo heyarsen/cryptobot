@@ -63,7 +63,7 @@ import ccxt
 # Import Telethon
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, PeerChannel
-from telethon.errors import ApiIdInvalidError
+from telethon.errors import ApiIdInvalidError, SessionPasswordNeededError
 
 # [Rest of your code remains exactly the same...]
 
@@ -90,7 +90,8 @@ DEFAULT_BINANCE_API_SECRET = os.getenv('BINGX_API_SECRET', '')
  WAITING_TP_CONFIG, WAITING_TP_LEVEL_PERCENT, WAITING_TP_LEVEL_CLOSE,
  WAITING_ACCOUNT_NAME, WAITING_ACCOUNT_BINGX_KEY, WAITING_ACCOUNT_BINGX_SECRET,
  WAITING_ACCOUNT_TELEGRAM_ID, WAITING_ACCOUNT_TELEGRAM_HASH, WAITING_ACCOUNT_PHONE,
- WAITING_ACCOUNT_SELECTION, WAITING_ACCOUNT_SETTINGS) = range(34)
+ WAITING_ACCOUNT_SELECTION, WAITING_ACCOUNT_SETTINGS,
+ WAITING_AUTH_CODE, WAITING_AUTH_PASSWORD) = range(36)
 
 # Your NEW Make.com Webhook URL
 DEFAULT_WEBHOOK_URL = "https://hook.eu2.make.com/pnfx5xy1q8caxq4qc2yhmnrkmio1ixqj"
@@ -2450,8 +2451,16 @@ class TradingBot:
             logger.error(f"❌ BingX setup error: {e}")
             return False
 
-    async def setup_telethon_client(self, config: BotConfig) -> bool:
-        """Setup Telethon client"""
+    async def setup_telethon_client(self, config: BotConfig, authorize_if_needed: bool = False) -> bool:
+        """Setup Telethon client
+        
+        Args:
+            config: Bot configuration
+            authorize_if_needed: If True and not authorized, will attempt to send auth code
+        
+        Returns:
+            True if client is setup and authorized, False otherwise
+        """
         try:
             # Get current account to use account-specific credentials
             current_account = self.get_current_account(config.user_id)
@@ -2473,33 +2482,26 @@ class TradingBot:
                 api_hash=api_hash
             )
 
-            # Start with phone parameter to avoid interactive prompt
-            # If phone is not provided, use lambda that returns empty string to avoid EOF error
+            # Connect to Telegram
             try:
-                if phone and phone.strip():
-                    await telethon_client.start(phone=lambda: phone)
-                else:
-                    # Try to connect with existing session
-                    # If session file exists and is authenticated, this should work
-                    await telethon_client.connect()
+                await telethon_client.connect()
+                
+                # Check if already authorized
+                if await telethon_client.is_user_authorized():
+                    logger.info(f"✅ Telethon client already authorized for account {current_account.account_id}")
+                    self.user_monitoring_clients[current_account.account_id] = telethon_client
+                    return True
+                
+                # Not authorized - store the client for later authorization
+                logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
+                logger.info(f"ℹ️ Please authorize the account through the bot interface")
+                self.user_monitoring_clients[current_account.account_id] = telethon_client
+                return False
                     
-                    # Check if authorized
-                    if not await telethon_client.is_user_authorized():
-                        logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
-                        logger.info(f"ℹ️ Please authorize the account through the bot interface")
-                        # Still store the client, but it won't be able to monitor until authorized
-                        self.user_monitoring_clients[current_account.account_id] = telethon_client
-                        return False
             except Exception as start_err:
                 logger.error(f"❌ Error starting Telethon client: {start_err}")
                 logger.error(traceback.format_exc())
                 return False
-            
-            # Store by account_id to support multiple Telegram accounts per user
-            self.user_monitoring_clients[current_account.account_id] = telethon_client
-
-            logger.info(f"✅ Telethon setup successful for account {current_account.account_id}")
-            return True
 
         except Exception as e:
             logger.error(f"❌ Telethon setup error: {e}")
@@ -5939,6 +5941,229 @@ async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
+async def authorize_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the authorization process for a Telegram account"""
+    user_id = update.effective_user.id
+    
+    # Get the current account
+    current_account = trading_bot.get_current_account(user_id)
+    if not current_account:
+        await update.message.reply_text(
+            "❌ <b>No Account Selected</b>\n\n"
+            "Please select an account first from the Accounts menu.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    # Store account info in context
+    context.user_data['auth_account_id'] = current_account.account_id
+    context.user_data['auth_phone'] = current_account.phone
+    
+    # Get or create Telethon client
+    config = trading_bot.get_user_config(user_id)
+    account_id = current_account.account_id
+    
+    # Setup client if not exists
+    if account_id not in trading_bot.user_monitoring_clients:
+        await trading_bot.setup_telethon_client(config)
+    
+    telethon_client = trading_bot.user_monitoring_clients.get(account_id)
+    if not telethon_client:
+        await update.message.reply_text(
+            "❌ <b>Failed to initialize Telegram client</b>\n\n"
+            "Please try again or contact support.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    # Check if already authorized
+    try:
+        if await telethon_client.is_user_authorized():
+            await update.message.reply_text(
+                "✅ <b>Already Authorized</b>\n\n"
+                "This account is already authorized with Telegram.",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error checking authorization: {e}")
+    
+    # Send verification code
+    try:
+        phone = current_account.phone
+        await update.message.reply_text(
+            f"📱 <b>Sending verification code to {phone}...</b>",
+            parse_mode='HTML'
+        )
+        
+        result = await telethon_client.send_code_request(phone)
+        context.user_data['auth_phone_code_hash'] = result.phone_code_hash
+        
+        await update.message.reply_text(
+            "✉️ <b>Verification Code Sent!</b>\n\n"
+            f"A verification code has been sent to <code>{phone}</code>\n\n"
+            "Please enter the code you received:",
+            parse_mode='HTML'
+        )
+        
+        return WAITING_AUTH_CODE
+        
+    except Exception as e:
+        logger.error(f"Error sending code: {e}")
+        logger.error(traceback.format_exc())
+        await update.message.reply_text(
+            f"❌ <b>Error Sending Code</b>\n\n"
+            f"Error: {str(e)}\n\n"
+            "Please check your phone number and try again.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+
+async def handle_auth_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the verification code input"""
+    user_id = update.effective_user.id
+    code = update.message.text.strip()
+    
+    account_id = context.user_data.get('auth_account_id')
+    phone = context.user_data.get('auth_phone')
+    phone_code_hash = context.user_data.get('auth_phone_code_hash')
+    
+    if not all([account_id, phone, phone_code_hash]):
+        await update.message.reply_text(
+            "❌ <b>Session Expired</b>\n\n"
+            "Please start the authorization process again.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    telethon_client = trading_bot.user_monitoring_clients.get(account_id)
+    if not telethon_client:
+        await update.message.reply_text(
+            "❌ <b>Client Not Found</b>\n\n"
+            "Please start the authorization process again.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    try:
+        await update.message.reply_text(
+            "🔄 <b>Verifying code...</b>",
+            parse_mode='HTML'
+        )
+        
+        # Sign in with the code
+        await telethon_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+        
+        # Check if authorized
+        if await telethon_client.is_user_authorized():
+            await update.message.reply_text(
+                "🎉 <b>Authorization Successful!</b>\n\n"
+                "Your Telegram account is now authorized.\n"
+                "You can now access channels and receive signals.\n\n"
+                "Try using 📡 Channels to see your channels!",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text(
+                "❌ <b>Authorization Failed</b>\n\n"
+                "Something went wrong. Please try again.",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
+            
+    except SessionPasswordNeededError:
+        # 2FA is enabled, need password
+        await update.message.reply_text(
+            "🔐 <b>Two-Factor Authentication Enabled</b>\n\n"
+            "Please enter your 2FA password:",
+            parse_mode='HTML'
+        )
+        return WAITING_AUTH_PASSWORD
+        
+    except Exception as e:
+        logger.error(f"Error signing in: {e}")
+        logger.error(traceback.format_exc())
+        error_msg = str(e)
+        
+        if "PHONE_CODE_INVALID" in error_msg:
+            await update.message.reply_text(
+                "❌ <b>Invalid Code</b>\n\n"
+                "The verification code you entered is incorrect.\n"
+                "Please start the authorization process again.",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ <b>Error During Authorization</b>\n\n"
+                f"Error: {error_msg}\n\n"
+                "Please try again or contact support.",
+                parse_mode='HTML'
+            )
+        return ConversationHandler.END
+
+async def handle_auth_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 2FA password input"""
+    user_id = update.effective_user.id
+    password = update.message.text.strip()
+    
+    account_id = context.user_data.get('auth_account_id')
+    
+    if not account_id:
+        await update.message.reply_text(
+            "❌ <b>Session Expired</b>\n\n"
+            "Please start the authorization process again.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    telethon_client = trading_bot.user_monitoring_clients.get(account_id)
+    if not telethon_client:
+        await update.message.reply_text(
+            "❌ <b>Client Not Found</b>\n\n"
+            "Please start the authorization process again.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    try:
+        await update.message.reply_text(
+            "🔄 <b>Verifying password...</b>",
+            parse_mode='HTML'
+        )
+        
+        # Sign in with password
+        await telethon_client.sign_in(password=password)
+        
+        # Check if authorized
+        if await telethon_client.is_user_authorized():
+            await update.message.reply_text(
+                "🎉 <b>Authorization Successful!</b>\n\n"
+                "Your Telegram account is now authorized.\n"
+                "You can now access channels and receive signals.\n\n"
+                "Try using 📡 Channels to see your channels!",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text(
+                "❌ <b>Authorization Failed</b>\n\n"
+                "Something went wrong. Please try again.",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
+            
+    except Exception as e:
+        logger.error(f"Error with 2FA: {e}")
+        logger.error(traceback.format_exc())
+        await update.message.reply_text(
+            f"❌ <b>Error During Authorization</b>\n\n"
+            f"Error: {str(e)}\n\n"
+            "Please try again or contact support.",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+
 async def test_enhanced_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test enhanced signal parser with example signals"""
     test_signals = [
@@ -6072,6 +6297,18 @@ account_conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
 )
 
+# Authorization conversation handler
+auth_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('authorize_account', authorize_account_start)],
+    states={
+        WAITING_AUTH_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth_code)],
+        WAITING_AUTH_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth_password)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
+    per_user=True,
+    per_chat=True,
+)
+
 # ================== UTILITY FUNCTIONS ==================
 
 def kill_existing_bot_instances():
@@ -6180,6 +6417,7 @@ def main():
 
         # Conversation handlers (button-driven flows only)
         application.add_handler(account_conv_handler)
+        application.add_handler(auth_conv_handler)
         application.add_handler(channel_conv_handler)
         application.add_handler(trading_conv_handler)
         # No extra command handlers; only buttons and /start are active

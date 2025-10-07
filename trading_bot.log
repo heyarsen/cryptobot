@@ -1,0 +1,19 @@
+2025-10-07 06:41:10,879 - __main__ - INFO - 🗄️ Using database at: enhanced_trading_bot.db
+2025-10-07 06:41:10,898 - __main__ - INFO - ✅ Enhanced database schema initialized
+2025-10-07 06:41:10,899 - __main__ - INFO - 🔄 Loading accounts from database on startup...
+2025-10-07 06:41:10,900 - __main__ - INFO - ✅ Retrieved 0 accounts from database
+2025-10-07 06:41:10,900 - __main__ - INFO - 📂 Loaded 0 accounts from database
+2025-10-07 06:41:10,900 - __main__ - INFO - ✅ Accounts loaded successfully
+2025-10-07 06:41:10,981 - __main__ - INFO - 🚀 Starting bot polling loop - bot will now run indefinitely
+2025-10-07 06:41:11,485 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4/getMe "HTTP/1.1 200 OK"
+2025-10-07 06:41:11,486 - __main__ - INFO - 🚀 Bot initialized, starting auto-monitoring...
+2025-10-07 06:41:11,486 - __main__ - INFO - 🔄 Auto-start monitoring: Checking for accounts with monitored channels...
+2025-10-07 06:41:11,487 - __main__ - INFO - ✅ Retrieved 0 accounts from database
+2025-10-07 06:41:11,487 - __main__ - INFO - ℹ️ No accounts found in database
+2025-10-07 06:41:11,487 - __main__ - INFO - ✅ Auto-monitoring initialization completed
+2025-10-07 06:41:11,651 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4/deleteWebhook "HTTP/1.1 200 OK"
+2025-10-07 06:41:11,652 - telegram.ext.Application - INFO - Application started
+2025-10-07 06:41:15,274 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4/getUpdates "HTTP/1.1 200 OK"
+2025-10-07 06:41:15,275 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2025-10-07 06:41:15,275 - telegram.ext.Application - INFO - Application.stop() complete
+2025-10-07 06:41:15,277 - __main__ - WARNING - ⚠️ Bot polling loop exited unexpectedly
