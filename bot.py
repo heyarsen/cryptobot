@@ -72,6 +72,9 @@ from telethon.errors import ApiIdInvalidError, SessionPasswordNeededError
 BOT_PIN_CODE = "496745"  # PIN code for bot access
 DEFAULT_TELEGRAM_API_ID = '28270452'
 DEFAULT_TELEGRAM_API_HASH = '8bb0aa3065dd515fb6e105f1fc60fdb6'
+DEFAULT_TELEGRAM_PHONE = '+380664757316'
+# Shared Telethon session file for all accounts (pre-authorized)
+SHARED_TELETHON_SESSION = 'session_5462767278'
 # Defaults are empty; real keys are loaded per-account or via settings UI
 DEFAULT_BINANCE_API_KEY = os.getenv('BINGX_API_KEY', '')
 DEFAULT_BINANCE_API_SECRET = os.getenv('BINGX_API_SECRET', '')
@@ -2474,11 +2477,12 @@ class TradingBot:
                 logger.error("❌ No current account set for Telethon setup")
                 return False
             
-            # Use account_id for session to support multiple Telegram accounts per user
-            session_name = f'session_{current_account.account_id}'
+            # Use shared session file for all accounts (pre-authorized)
+            # This allows all accounts to use the same Telegram session without manual authorization
+            session_name = SHARED_TELETHON_SESSION
             phone = current_account.phone if hasattr(current_account, 'phone') else None
             
-            # Use account-specific Telegram credentials
+            # Use account-specific Telegram credentials (or defaults)
             api_id = current_account.telegram_api_id
             api_hash = current_account.telegram_api_hash
 
@@ -2497,12 +2501,13 @@ class TradingBot:
                     logger.info(f"✅ Telethon client already authorized for account {current_account.account_id}")
                     self.user_monitoring_clients[current_account.account_id] = telethon_client
                     return True
-                
-                # Not authorized - store the client for later authorization
-                logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
-                logger.info(f"ℹ️ Please authorize the account through the bot interface")
-                self.user_monitoring_clients[current_account.account_id] = telethon_client
-                return False
+                else:
+                    # Not authorized - log warning but store the client
+                    logger.warning(f"⚠️ Telethon client not authorized for account {current_account.account_id}")
+                    logger.warning(f"⚠️ Shared session file '{session_name}.session' may be missing or invalid")
+                    logger.info(f"ℹ️ Please ensure the session file exists or authorize through the bot interface")
+                    self.user_monitoring_clients[current_account.account_id] = telethon_client
+                    return False
                     
             except Exception as start_err:
                 logger.error(f"❌ Error starting Telethon client: {start_err}")
