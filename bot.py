@@ -2477,10 +2477,20 @@ class TradingBot:
                 logger.error("❌ No current account set for Telethon setup")
                 return False
             
-            # Use shared session file for all accounts (pre-authorized)
-            # This allows all accounts to use the same Telegram session without manual authorization
-            session_name = SHARED_TELETHON_SESSION
+            # Use account-specific session file to avoid database locks
+            # Each account needs its own session to prevent SQLite concurrency issues
+            session_name = f"session_{current_account.account_id}"
             phone = current_account.phone if hasattr(current_account, 'phone') else None
+            
+            # Migrate from shared session if it exists and account session doesn't
+            shared_session_file = f"{SHARED_TELETHON_SESSION}.session"
+            account_session_file = f"{session_name}.session"
+            if os.path.exists(shared_session_file) and not os.path.exists(account_session_file):
+                try:
+                    shutil.copy2(shared_session_file, account_session_file)
+                    logger.info(f"✅ Migrated shared session to account-specific session: {account_session_file}")
+                except Exception as copy_err:
+                    logger.warning(f"⚠️ Could not migrate shared session: {copy_err}")
             
             # Use account-specific Telegram credentials (or defaults)
             api_id = current_account.telegram_api_id
@@ -3276,12 +3286,15 @@ class TradingBot:
                         continue
                     
                     # Filter to only the current account's channels
-                    account_channels = current_account.monitored_channels if current_account else []
-                    channels_to_check = [ch for ch in config.monitored_channels if ch in account_channels]
+                    # Convert both to strings to ensure proper comparison (channels can be stored as int or str)
+                    account_channels = [str(ch) for ch in (current_account.monitored_channels if current_account else [])]
+                    channels_to_check = [ch for ch in config.monitored_channels if str(ch) in account_channels]
                     
-                    logger.debug(f"🔍 Account channels: {account_channels}")
-                    logger.debug(f"🔍 Config monitored channels: {config.monitored_channels}")
-                    logger.debug(f"🔍 Channels to check (intersection): {channels_to_check}")
+                    logger.info(f"🔍 Account channels (raw): {current_account.monitored_channels if current_account else []}")
+                    logger.info(f"🔍 Account channels (normalized): {account_channels}")
+                    logger.info(f"🔍 Config monitored channels: {config.monitored_channels}")
+                    logger.info(f"🔍 Channels to check (intersection): {channels_to_check}")
+                    logger.info(f"🔍 Channel types - config: {[type(ch).__name__ for ch in config.monitored_channels]}, account: {[type(ch).__name__ for ch in (current_account.monitored_channels if current_account else [])]}")
                     
                     if not channels_to_check:
                         logger.warning(f"⚠️ No channels to check! Account channels: {account_channels}, Config channels: {config.monitored_channels}")
