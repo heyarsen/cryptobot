@@ -69,12 +69,12 @@ from telethon.errors import ApiIdInvalidError, SessionPasswordNeededError
 
 
 # Bot Configuration
-BOT_PIN_CODE = "496745"  # PIN code for bot access
-DEFAULT_TELEGRAM_API_ID = '28270452'
-DEFAULT_TELEGRAM_API_HASH = '8bb0aa3065dd515fb6e105f1fc60fdb6'
-DEFAULT_TELEGRAM_PHONE = '+380664757316'
+BOT_PIN_CODE = os.getenv('BOT_PIN_CODE')  # PIN code for bot access
+DEFAULT_TELEGRAM_API_ID = os.getenv('DEFAULT_TELEGRAM_API_ID')
+DEFAULT_TELEGRAM_API_HASH = os.getenv('DEFAULT_TELEGRAM_API_HASH')
+DEFAULT_TELEGRAM_PHONE = os.getenv('DEFAULT_TELEGRAM_PHONE')
 # Shared Telethon session file for all accounts (pre-authorized)
-SHARED_TELETHON_SESSION = 'session_5462767278'
+SHARED_TELETHON_SESSION = os.getenv('SHARED_TELETHON_SESSION')
 # Defaults are empty; real keys are loaded per-account or via settings UI
 DEFAULT_BINANCE_API_KEY = os.getenv('BINGX_API_KEY', '')
 DEFAULT_BINANCE_API_SECRET = os.getenv('BINGX_API_SECRET', '')
@@ -247,6 +247,8 @@ class AccountConfig:
     trailing_enabled: bool = False
     trailing_activation_percent: float = 2.0
     trailing_callback_percent: float = 0.5
+    cooldown_enabled: bool = False
+    cooldown_hours: int = 24
     
     def __post_init__(self):
         if self.monitored_channels is None:
@@ -581,7 +583,9 @@ class EnhancedDatabase:
                     make_webhook_enabled BOOLEAN DEFAULT FALSE,
                     trailing_enabled BOOLEAN DEFAULT FALSE,
                     trailing_activation_percent REAL DEFAULT 2.0,
-                    trailing_callback_percent REAL DEFAULT 0.5
+                    trailing_callback_percent REAL DEFAULT 0.5,
+                    cooldown_enabled BOOLEAN DEFAULT FALSE,
+                    cooldown_hours INTEGER DEFAULT 24
                 )
             ''')
             
@@ -592,6 +596,14 @@ class EnhancedDatabase:
                 pass
             try:
                 cursor.execute("ALTER TABLE accounts ADD COLUMN use_signal_settings BOOLEAN DEFAULT FALSE")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN cooldown_enabled BOOLEAN DEFAULT FALSE")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN cooldown_hours INTEGER DEFAULT 24")
             except:
                 pass
             try:
@@ -723,8 +735,9 @@ class EnhancedDatabase:
                     take_profit_levels, stop_loss_levels,
                     monitored_channels, signal_channels,
                     use_signal_settings, create_sl_tp, make_webhook_enabled,
-                    trailing_enabled, trailing_activation_percent, trailing_callback_percent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trailing_enabled, trailing_activation_percent, trailing_callback_percent,
+                    cooldown_enabled, cooldown_hours
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
@@ -739,7 +752,8 @@ class EnhancedDatabase:
                 json.dumps(account.monitored_channels),
                 json.dumps(account.signal_channels),
                 account.use_signal_settings, account.create_sl_tp, account.make_webhook_enabled,
-                account.trailing_enabled, account.trailing_activation_percent, account.trailing_callback_percent
+                account.trailing_enabled, account.trailing_activation_percent, account.trailing_callback_percent,
+                account.cooldown_enabled, account.cooldown_hours
             ))
 
             conn.commit()
@@ -805,7 +819,9 @@ class EnhancedDatabase:
                         make_webhook_enabled=bool(row[24]) if len(row) > 24 else False,
                         trailing_enabled=bool(row[25]) if len(row) > 25 else False,
                         trailing_activation_percent=float(row[26]) if len(row) > 26 else 2.0,
-                        trailing_callback_percent=float(row[27]) if len(row) > 27 else 0.5
+                        trailing_callback_percent=float(row[27]) if len(row) > 27 else 0.5,
+                        cooldown_enabled=bool(row[28]) if len(row) > 28 else False,
+                        cooldown_hours=int(row[29]) if len(row) > 29 and row[29] is not None else 24
                     )
                     accounts.append(account)
                 except Exception as e:
@@ -904,7 +920,8 @@ class EnhancedDatabase:
         allowed = {
             'leverage', 'risk_percentage', 'use_percentage_balance', 'balance_percentage', 'fixed_usdt_amount',
             'use_signal_settings', 'create_sl_tp', 'make_webhook_enabled', 'trailing_enabled',
-            'trailing_activation_percent', 'trailing_callback_percent'
+            'trailing_activation_percent', 'trailing_callback_percent',
+            'cooldown_enabled', 'cooldown_hours'
         }
         set_clauses = []
         values: List[Any] = []
@@ -1391,6 +1408,7 @@ class EnhancedSignalParser:
     
     # Symbol patterns
     SYMBOL_PATTERNS = [
+        r'\b(LONG|SHORT)\s*#?\s*([A-Z0-9]{1,10})(?:/USDT|USDT)?',  # LONG BTCUSDT or SHORT BTC
         r'#([A-Z0-9]{1,10})(?:/USDT|USDT)?',  # #BTCUSDT, #BTC/USDT
         r'([A-Z0-9]{1,10})(?:/USDT|USDT)?',   # BTCUSDT, BTC/USDT
         r'([A-Z0-9]{1,10})\s*—',              # BTC —
@@ -1553,7 +1571,11 @@ class EnhancedSignalParser:
         for pattern in EnhancedSignalParser.SYMBOL_PATTERNS:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                symbol = match.group(1).upper()
+                # Handle leading LONG/SHORT pattern first
+                if len(match.groups()) >= 2 and re.match(r"LONG|SHORT", match.group(1), re.IGNORECASE):
+                    symbol = match.group(2).upper()
+                else:
+                    symbol = match.group(1).upper()
                 
                 # Normalize symbol
                 if not symbol.endswith('USDT'):
@@ -1570,13 +1592,19 @@ class EnhancedSignalParser:
     @staticmethod
     def _extract_side(text: str) -> Optional[str]:
         """Extract trade side (LONG/SHORT) from text"""
-        # Check for LONG patterns
-        for pattern in EnhancedSignalParser.LONG_PATTERNS:
+        # Prefer explicit word at start: "LONG SYMBOL" / "SHORT SYMBOL"
+        if re.search(r'^\s*LONG\b', text, re.IGNORECASE):
+            return 'LONG'
+        if re.search(r'^\s*SHORT\b', text, re.IGNORECASE):
+            return 'SHORT'
+
+        # Check for LONG patterns (explicit words prioritized)
+        for pattern in [r'\b(LONG|ЛОНГ|Long|long)\b'] + EnhancedSignalParser.LONG_PATTERNS[1:]:
             if re.search(pattern, text, re.IGNORECASE):
                 return 'LONG'
         
-        # Check for SHORT patterns
-        for pattern in EnhancedSignalParser.SHORT_PATTERNS:
+        # Check for SHORT patterns (explicit words prioritized)
+        for pattern in [r'\b(SHORT|ШОРТ|Short|short)\b'] + EnhancedSignalParser.SHORT_PATTERNS[1:]:
             if re.search(pattern, text, re.IGNORECASE):
                 return 'SHORT'
         
@@ -2186,7 +2214,15 @@ class TradingBot:
             rounded = float(rounded_decimal)
             
             if rounded < step_size:
-                rounded = step_size
+                # allow tiny decimals if precision allows, otherwise bump to step_size
+                try:
+                    if isinstance(qty_precision, int) and qty_precision > 0:
+                        min_allowed = float(Decimal('1').scaleb(-qty_precision))
+                        rounded = max(rounded, min_allowed)
+                    else:
+                        rounded = step_size
+                except Exception:
+                    rounded = step_size
             
             return rounded
             
@@ -2592,12 +2628,18 @@ class TradingBot:
             current_account = self.get_current_account(config.user_id)
             account_key = current_account.account_id if current_account else None
 
-            # Check 24-hour cooldown for this symbol
-            if account_key and not self.enhanced_db.can_trade_symbol(account_key, signal.symbol, cooldown_hours=24):
+            # Check symbol cooldown if enabled on the account
+            cooldown_hours = 0
+            if current_account and getattr(current_account, 'cooldown_enabled', False):
+                try:
+                    cooldown_hours = int(getattr(current_account, 'cooldown_hours', 24) or 24)
+                except Exception:
+                    cooldown_hours = 24
+            if cooldown_hours and account_key and not self.enhanced_db.can_trade_symbol(account_key, signal.symbol, cooldown_hours=cooldown_hours):
                 logger.warning(f"⏳ Trade blocked: {signal.symbol} is in 24-hour cooldown for account {current_account.account_name if current_account else account_key}")
                 return {
                     'success': False, 
-                    'error': f'Symbol {signal.symbol} is in 24-hour cooldown. Only one trade per symbol per 24 hours is allowed.'
+                    'error': f'Symbol {signal.symbol} is in cooldown for {cooldown_hours}h.'
                 }
 
             if account_key and account_key in self.account_exchanges:
@@ -2706,7 +2748,19 @@ class TradingBot:
 
             # Include positionSide param for hedge mode for entry
             order_params = {'positionSide': 'LONG' if side == 'BUY' else 'SHORT'}
-            order = self.exchange.create_order(self.to_bingx_symbol(signal.symbol), 'market', side.lower(), quantity, None, order_params)
+            # Create order with simple retry if exchange is transiently busy
+            attempt = 0
+            last_err = None
+            while attempt < 2:
+                try:
+                    order = self.exchange.create_order(self.to_bingx_symbol(signal.symbol), 'market', side.lower(), quantity, None, order_params)
+                    break
+                except Exception as e:
+                    last_err = e
+                    await asyncio.sleep(0.5)
+                    attempt += 1
+            if 'order' not in locals():
+                return {'success': False, 'error': f'Order creation failed: {last_err}'}
 
             logger.info(f"✅ Main order executed: {order.get('id')}")
 
@@ -3145,6 +3199,21 @@ class TradingBot:
                         result = await self.execute_trade(signal, user_config)
 
                         if result['success']:
+                            # Try to include source channel name if available
+                            source_info = ""
+                            try:
+                                ch_name = None
+                                if hasattr(event, 'chat') and event.chat:
+                                    ch_name = getattr(event.chat, 'title', None)
+                                if hasattr(event.message, 'forward') and event.message.forward and getattr(event.message.forward, 'chat', None):
+                                    ch_name = getattr(event.message.forward.chat, 'title', ch_name)
+                                if ch_name:
+                                    source_info = f"\n📡 Source: {ch_name}"
+                                elif matching_channels:
+                                    source_info = f"\n📡 Source ID: {list(matching_channels)[0]}"
+                            except Exception:
+                                pass
+
                             notification = f"""✅ <b>TRADE EXECUTED!</b>
 
 💰 Symbol: {result['symbol']}
@@ -3153,7 +3222,7 @@ class TradingBot:
 📦 Quantity: {result['quantity']}
 💲 Entry: {result['price']}
 ⚡ Leverage: {result['leverage']}x
-💵 Order Value: ${result['order_value']:.2f}"""
+💵 Order Value: ${result['order_value']:.2f}{source_info}"""
 
                             if 'sl_price' in result and result['sl_price']:
                                 notification += f"\n🛑 Stop Loss: {result['sl_price']:.6f}"
@@ -3785,7 +3854,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ <b>Authenticated!</b>", parse_mode='HTML', reply_markup=build_main_menu())
             return
         else:
-            await update.message.reply_text("❌ Invalid PIN (496745):", parse_mode='HTML')
+            await update.message.reply_text("❌ Invalid PIN:", parse_mode='HTML')
             return
 
     # Restore current account context from persistent state if not already set
@@ -4194,15 +4263,42 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=build_account_page()
             )
         else:
+            # Aggregate per-channel stats
+            channel_stats = {}
+            total_trades = len(trade_history)
+            wins = 0
+            for t in trade_history:
+                ch = t.channel_id or 'unknown'
+                cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
+                cs['count'] += 1
+                try:
+                    cs['pnl'] += float(t.pnl or 0)
+                    if float(t.pnl or 0) > 0:
+                        cs['wins'] += 1
+                        wins += 1
+                except Exception:
+                    pass
+
             text = f"📋 <b>Trade History - {acc_name}</b>\n\n"
             text += f"Recent trades ({len(trade_history)}):\n\n"
-            
             for trade in trade_history:
                 status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
-                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
+                ch = trade.channel_id or ''
+                ch_line = f" | Ch: {ch}" if ch else ""
+                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
                 text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
                 text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
-            
+
+            # Append per-channel analytics
+            if channel_stats:
+                text += "📡 <b>Per-Channel Analytics</b>\n"
+                for ch, cs in channel_stats.items():
+                    wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
+                    text += f"- {ch}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
+                if total_trades:
+                    overall_wr = wins/total_trades*100
+                    text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
+
             await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "📈 Trades" and 'current_account_id' in context.user_data:
@@ -6488,12 +6584,7 @@ async def auto_start_monitoring(application):
 
 def main():
     """Start the enhanced bot with static button interface"""
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is not set in environment variables")
-
-    application = Application.builder().token(BOT_TOKEN).build()
+    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
     
     # Kill any existing bot instances to prevent conflicts
     kill_existing_bot_instances()
@@ -6515,7 +6606,7 @@ def main():
 
         print("🤖 Enhanced Multi-Account Trading Bot v5.0 Starting...")
         print(f"🔗 Webhook: {DEFAULT_WEBHOOK_URL}")
-        print("🔐 PIN Protection: ENABLED (496745)")
+        print("🔐 PIN Protection: ENABLED")
         print("✅ NEW: Individual account settings")
         print("✅ NEW: Advanced TP/SL management")
         print("✅ NEW: Trade history tracking")
@@ -6529,7 +6620,7 @@ def main():
         print("✅ FIXED: Bot instance conflicts")
         print("✅ FIXED: Auto-start monitoring on startup")
         print("✅ FIXED: Enhanced message detection logging")
-        print("📊 Ready! Use PIN code 496745 to access")
+        print("📊 Ready! Use PIN code to access")
         
         # Add error handler for conflicts
         async def error_handler(update, context):
