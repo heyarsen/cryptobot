@@ -1592,21 +1592,34 @@ class EnhancedSignalParser:
     @staticmethod
     def _extract_side(text: str) -> Optional[str]:
         """Extract trade side (LONG/SHORT) from text"""
-        # Prefer explicit word at start: "LONG SYMBOL" / "SHORT SYMBOL"
-        if re.search(r'^\s*LONG\b', text, re.IGNORECASE):
-            return 'LONG'
-        if re.search(r'^\s*SHORT\b', text, re.IGNORECASE):
+        # First, check for explicit SHORT/LONG words anywhere in text (highest priority)
+        if re.search(r'\bSHORT\b', text, re.IGNORECASE):
             return 'SHORT'
-
-        # Check for LONG patterns (explicit words prioritized)
-        for pattern in [r'\b(LONG|ЛОНГ|Long|long)\b'] + EnhancedSignalParser.LONG_PATTERNS[1:]:
-            if re.search(pattern, text, re.IGNORECASE):
-                return 'LONG'
+        if re.search(r'\bLONG\b', text, re.IGNORECASE):
+            return 'LONG'
         
-        # Check for SHORT patterns (explicit words prioritized)
-        for pattern in [r'\b(SHORT|ШОРТ|Short|short)\b'] + EnhancedSignalParser.SHORT_PATTERNS[1:]:
+        # Check for Russian equivalents
+        if re.search(r'\bШОРТ\b', text, re.IGNORECASE):
+            return 'SHORT'
+        if re.search(r'\bЛОНГ\b', text, re.IGNORECASE):
+            return 'LONG'
+        
+        # Check for BUY/SELL
+        if re.search(r'\bSELL\b', text, re.IGNORECASE):
+            return 'SHORT'
+        if re.search(r'\bBUY\b', text, re.IGNORECASE):
+            return 'LONG'
+        
+        # Only check emojis if no explicit words found
+        # Check for SHORT patterns (emojis and other indicators)
+        for pattern in EnhancedSignalParser.SHORT_PATTERNS:
             if re.search(pattern, text, re.IGNORECASE):
                 return 'SHORT'
+        
+        # Check for LONG patterns (emojis and other indicators)
+        for pattern in EnhancedSignalParser.LONG_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return 'LONG'
         
         return None
     
@@ -2314,7 +2327,51 @@ class TradingBot:
             # Update history on closure
             if filled_order_type == "STOP_LOSS" or (filled_order_type == "TAKE_PROFIT" and not remaining_tps):
                 try:
-                    self.enhanced_db.update_trade_status(getattr(position, 'trade_id', ''), status="CLOSED", exit_time=datetime.now().isoformat())
+                    # Calculate PnL for the closed trade
+                    pnl = 0.0
+                    try:
+                        if hasattr(position, 'entry_price') and position.entry_price:
+                            # Get current price for PnL calculation
+                            ticker = self.exchange.fetch_ticker(self.to_bingx_symbol(symbol))
+                            current_price = ticker.get('last', position.entry_price)
+                            
+                            # Calculate PnL based on position side
+                            if position.side == 'LONG':
+                                pnl = (current_price - position.entry_price) * position.quantity
+                            else:  # SHORT
+                                pnl = (position.entry_price - current_price) * position.quantity
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not calculate PnL: {e}")
+                    
+                    self.enhanced_db.update_trade_status(getattr(position, 'trade_id', ''), status="CLOSED", exit_time=datetime.now().isoformat(), pnl=pnl)
+                    
+                    # Send PnL notification to user
+                    try:
+                        user_id = getattr(position, 'user_id', None)
+                        if user_id and user_id in self.bot_instances:
+                            bot_instance = self.bot_instances[user_id]
+                            
+                            # Get account stats for win rate
+                            account_id = getattr(position, 'account_id', None)
+                            if account_id:
+                                trade_history = self.enhanced_db.get_trade_history(account_id, limit=100)
+                                total_trades = len([t for t in trade_history if t.status == "CLOSED"])
+                                winning_trades = len([t for t in trade_history if t.status == "CLOSED" and t.pnl and float(t.pnl) > 0])
+                                win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+                                
+                                pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
+                                await bot_instance.send_message(
+                                    chat_id=user_id,
+                                    text=f"{pnl_emoji} <b>TRADE CLOSED</b>\n\n"
+                                         f"💰 {symbol} {position.side}\n"
+                                         f"💵 PnL: {pnl:.2f} USDT\n"
+                                         f"📊 Win Rate: {win_rate:.1f}%\n"
+                                         f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                                    parse_mode='HTML'
+                                )
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to send PnL notification: {e}")
+                        
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to close trade in history: {e}")
             # Remove position from active positions only when all orders are handled
@@ -2363,11 +2420,53 @@ class TradingBot:
                                 if not position_exists:
                                     logger.info(f"📭 Position {symbol} closed manually on exchange")
                                     try:
+                                        # Calculate PnL for manually closed trade
+                                        pnl = 0.0
+                                        try:
+                                            if hasattr(position, 'entry_price') and position.entry_price:
+                                                ticker = self.exchange.fetch_ticker(self.to_bingx_symbol(symbol))
+                                                current_price = ticker.get('last', position.entry_price)
+                                                
+                                                if position.side == 'LONG':
+                                                    pnl = (current_price - position.entry_price) * position.quantity
+                                                else:  # SHORT
+                                                    pnl = (position.entry_price - current_price) * position.quantity
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ Could not calculate PnL for manual close: {e}")
+                                        
                                         self.enhanced_db.update_trade_status(
                                             getattr(position, 'trade_id', ''), 
                                             status="CLOSED", 
-                                            exit_time=datetime.now().isoformat()
+                                            exit_time=datetime.now().isoformat(),
+                                            pnl=pnl
                                         )
+                                        
+                                        # Send PnL notification for manual close
+                                        try:
+                                            user_id = getattr(position, 'user_id', None)
+                                            if user_id and user_id in self.bot_instances:
+                                                bot_instance = self.bot_instances[user_id]
+                                                
+                                                account_id = getattr(position, 'account_id', None)
+                                                if account_id:
+                                                    trade_history = self.enhanced_db.get_trade_history(account_id, limit=100)
+                                                    total_trades = len([t for t in trade_history if t.status == "CLOSED"])
+                                                    winning_trades = len([t for t in trade_history if t.status == "CLOSED" and t.pnl and float(t.pnl) > 0])
+                                                    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+                                                    
+                                                    pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
+                                                    await bot_instance.send_message(
+                                                        chat_id=user_id,
+                                                        text=f"{pnl_emoji} <b>TRADE CLOSED (Manual)</b>\n\n"
+                                                             f"💰 {symbol} {position.side}\n"
+                                                             f"💵 PnL: {pnl:.2f} USDT\n"
+                                                             f"📊 Win Rate: {win_rate:.1f}%\n"
+                                                             f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                                                        parse_mode='HTML'
+                                                    )
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ Failed to send manual close PnL notification: {e}")
+                                            
                                     except Exception as e:
                                         logger.warning(f"⚠️ Failed to close trade in history: {e}")
                                     
@@ -4225,7 +4324,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"✅ <b>Features:</b>\n"
             msg += f"  Signal Settings: <b>{'ON' if acc.use_signal_settings else 'OFF'}</b>\n"
             msg += f"  Create SL/TP: <b>{'ON' if acc.create_sl_tp else 'OFF'}</b>\n"
-            msg += f"  Make Webhook: <b>{'ON' if acc.make_webhook_enabled else 'OFF'}</b>\n\n"
+            msg += f"  Make Webhook: <b>{'ON' if acc.make_webhook_enabled else 'OFF'}</b>\n"
+            
+            # Cooldown Settings
+            cooldown_status = "🟢 ON" if getattr(acc, 'cooldown_enabled', False) else "🔴 OFF"
+            cooldown_hours = getattr(acc, 'cooldown_hours', 24)
+            msg += f"  Cooldown: <b>{cooldown_status}</b>"
+            if getattr(acc, 'cooldown_enabled', False):
+                msg += f" ({cooldown_hours}h)"
+            msg += "\n\n"
             
             msg += "Use the buttons below to manage this account."
             await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
@@ -4424,6 +4531,44 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "📉 Trailing":
         await update.message.reply_text("📉 Trailing stop settings", parse_mode='HTML')
+
+    # Cooldown commands
+    elif text.startswith("cooldown on") and 'current_account_id' in context.user_data:
+        acc_id = context.user_data.get('current_account_id')
+        parts = text.split()
+        hours = 24  # default
+        if len(parts) > 2:
+            try:
+                hours = int(parts[2])
+                if hours < 1 or hours > 168:  # max 1 week
+                    hours = 24
+            except ValueError:
+                hours = 24
+        
+        success = trading_bot.enhanced_db.update_account_settings(acc_id, cooldown_enabled=True, cooldown_hours=hours)
+        if success:
+            await update.message.reply_text(f"✅ Cooldown enabled: {hours} hours", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Failed to update cooldown settings", parse_mode='HTML')
+
+    elif text == "cooldown off" and 'current_account_id' in context.user_data:
+        acc_id = context.user_data.get('current_account_id')
+        success = trading_bot.enhanced_db.update_account_settings(acc_id, cooldown_enabled=False)
+        if success:
+            await update.message.reply_text("✅ Cooldown disabled", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Failed to update cooldown settings", parse_mode='HTML')
+
+    elif text == "cooldown status" and 'current_account_id' in context.user_data:
+        acc_id = context.user_data.get('current_account_id')
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        acc = next((a for a in accs if a.account_id == acc_id), None)
+        if acc:
+            status = "ON" if getattr(acc, 'cooldown_enabled', False) else "OFF"
+            hours = getattr(acc, 'cooldown_hours', 24)
+            await update.message.reply_text(f"📊 Cooldown: {status} ({hours}h)", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Account not found", parse_mode='HTML')
 
 async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle accounts menu"""
