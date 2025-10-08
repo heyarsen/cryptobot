@@ -1406,14 +1406,20 @@ class SignalDetector:
 class EnhancedSignalParser:
     """Enhanced signal parser with support for multiple formats"""
     
-    # Symbol patterns
+    # Symbol patterns - prioritize crypto symbols over numbers
     SYMBOL_PATTERNS = [
-        r'\b(LONG|SHORT)\s*#?\s*([A-Z0-9]{1,10})(?:/USDT|USDT)?',  # LONG BTCUSDT or SHORT BTC
-        r'#([A-Z0-9]{1,10})(?:/USDT|USDT)?',  # #BTCUSDT, #BTC/USDT
-        r'([A-Z0-9]{1,10})(?:/USDT|USDT)?',   # BTCUSDT, BTC/USDT
-        r'([A-Z0-9]{1,10})\s*—',              # BTC —
-        r'([A-Z0-9]{1,10})\s*Long',           # BTC Long
-        r'([A-Z0-9]{1,10})\s*Short',          # BTC Short
+        # Handle #SYMBOL SHORT/LONG format first
+        r'#([A-Z]{2,10})\s+(SHORT|LONG)',  # #SOL SHORT, #BTC LONG
+        r'#([A-Z]{2,10})(?:/USDT|USDT)?',  # #BTCUSDT, #BTC/USDT (letters only)
+        r'\b(LONG|SHORT)\s*#?\s*([A-Z]{2,10})(?:/USDT|USDT)?',  # LONG BTCUSDT or SHORT BTC (letters only)
+        r'([A-Z]{2,10})(?:/USDT|USDT)?',   # BTCUSDT, BTC/USDT (letters only)
+        r'([A-Z]{2,10})\s*—',              # BTC —
+        r'([A-Z]{2,10})\s*Long',           # BTC Long
+        r'([A-Z]{2,10})\s*Short',          # BTC Short
+        # Fallback for mixed alphanumeric (but avoid pure numbers)
+        r'\b(LONG|SHORT)\s*#?\s*([A-Z0-9]{2,10})(?:/USDT|USDT)?',  # LONG BTCUSDT or SHORT BTC
+        r'#([A-Z0-9]{2,10})(?:/USDT|USDT)?',  # #BTCUSDT, #BTC/USDT
+        r'([A-Z0-9]{2,10})(?:/USDT|USDT)?',   # BTCUSDT, BTC/USDT
     ]
     
     # Side patterns (LONG/SHORT)
@@ -1571,11 +1577,26 @@ class EnhancedSignalParser:
         for pattern in EnhancedSignalParser.SYMBOL_PATTERNS:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                # Handle leading LONG/SHORT pattern first
-                if len(match.groups()) >= 2 and re.match(r"LONG|SHORT", match.group(1), re.IGNORECASE):
-                    symbol = match.group(2).upper()
+                # Handle different pattern formats
+                if len(match.groups()) >= 2:
+                    # Check if first group is LONG/SHORT
+                    if re.match(r"LONG|SHORT", match.group(1), re.IGNORECASE):
+                        symbol = match.group(2).upper()
+                    # Check if second group is LONG/SHORT (for #SYMBOL SHORT format)
+                    elif re.match(r"LONG|SHORT", match.group(2), re.IGNORECASE):
+                        symbol = match.group(1).upper()
+                    else:
+                        symbol = match.group(1).upper()
                 else:
                     symbol = match.group(1).upper()
+                
+                # Skip if symbol is just numbers (like "25x" -> "25")
+                if symbol.isdigit():
+                    continue
+                    
+                # Skip if symbol is too short or looks like leverage
+                if len(symbol) < 2 or symbol in ['X', 'XX', 'XXX']:
+                    continue
                 
                 # Normalize symbol
                 if not symbol.endswith('USDT'):
