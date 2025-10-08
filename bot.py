@@ -6488,7 +6488,12 @@ async def auto_start_monitoring(application):
 
 def main():
     """Start the enhanced bot with static button interface"""
-    
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN is not set in environment variables")
+
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Kill any existing bot instances to prevent conflicts
     kill_existing_bot_instances()
