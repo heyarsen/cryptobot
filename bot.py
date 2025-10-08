@@ -6584,7 +6584,7 @@ async def auto_start_monitoring(application):
 
 def main():
     """Start the enhanced bot with static button interface"""
-    BOT_TOKEN = "8463413059:AAG9qxXPLXrLmXZDHGF_vTPYWURAKZyUoU4"
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
     
     # Kill any existing bot instances to prevent conflicts
     kill_existing_bot_instances()
