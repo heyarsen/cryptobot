@@ -2837,6 +2837,11 @@ class TradingBot:
                 logger.info(f"💰 Using percentage of balance: ${trade_amount:.2f} ({config.balance_percent}%)")
             
             position_value = trade_amount * leverage
+            
+            # Check for valid entry price to avoid division by zero
+            if not entry_price or entry_price <= 0:
+                return {'success': False, 'error': f'Invalid entry price: {entry_price}. Cannot calculate quantity.'}
+            
             raw_quantity = (trade_amount * leverage) / entry_price
 
             logger.info(f"🧮 Trade calculation:")
@@ -3310,9 +3315,19 @@ class TradingBot:
 
                     if signal:
                         settings_source = "Signal" if user_config.use_signal_settings else "Bot"
+                        # Try to get channel name
+                        channel_info = ""
+                        try:
+                            if hasattr(event, 'chat') and event.chat:
+                                channel_name = getattr(event.chat, 'title', None)
+                                if channel_name:
+                                    channel_info = f"\n📡 Source: {channel_name}"
+                        except Exception:
+                            pass
+                        
                         await bot_instance.send_message(
                             chat_id=user_id,
-                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n⚙️ Using: {settings_source} settings\n🚀 Executing...",
+                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n⚙️ Using: {settings_source} settings{channel_info}\n🚀 Executing...",
                             parse_mode='HTML'
                         )
 
@@ -3654,9 +3669,20 @@ class TradingBot:
                 settings_source = "Signal" if config.use_signal_settings else "Bot"
                 if bot_instance:
                     try:
+                        # Try to get channel name
+                        channel_info = ""
+                        try:
+                            # Get channel name from the message context
+                            if hasattr(message, 'chat') and message.chat:
+                                channel_name = getattr(message.chat, 'title', None)
+                                if channel_name:
+                                    channel_info = f"\n📡 Source: {channel_name}"
+                        except Exception:
+                            pass
+                        
                         await bot_instance.send_message(
                             chat_id=user_id,
-                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n⚙️ Using: {settings_source} settings\n🚀 Executing...",
+                            text=f"🎯 <b>SIGNAL DETECTED!</b>\n\n💰 {signal.symbol} {signal.trade_type}\n⚙️ Using: {settings_source} settings{channel_info}\n🚀 Executing...",
                             parse_mode='HTML'
                         )
                     except Exception as e:
@@ -4241,26 +4267,34 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "⚙️ Default Settings":
-        # Show editable defaults and instructions (matching account settings style)
+        # Show editable defaults matching account settings format
         current = trading_bot.enhanced_db.get_default_settings()
         
         msg = "⚙️ <b>Default Settings for New Accounts</b>\n\n"
         msg += "These settings will be applied to newly created accounts:\n\n"
         
-        msg += "<b>Trading Configuration:</b>\n"
+        # Trading Settings
+        msg += f"📊 <b>Trading Settings:</b>\n"
         msg += f"⚡ Leverage: <b>{current['leverage']}x</b>\n"
-        msg += f"💰 Risk Percentage: <b>{current['risk_percentage']}%</b>\n"
-        msg += f"🎯 TP Levels: <b>{current['tp_levels']}</b>\n"
-        msg += f"🛡️ Stop Loss: <b>{current['sl_level']}%</b>\n\n"
+        msg += f"💰 Risk %: <b>{current['risk_percentage']}%</b>\n"
+        msg += f"💵 Balance Mode: <b>Percentage</b>\n"
+        msg += f"💵 Trade Amount: <b>2.0%</b>\n\n"
         
-        msg += "<b>How to Update:</b>\n"
-        msg += "Send commands in this format:\n\n"
-        msg += "• <code>default leverage 10</code>\n"
-        msg += "• <code>default risk 2.0</code>\n"
-        msg += "• <code>default sl -10</code>\n"
-        msg += "• <code>default tp 2.0,3.5,5.0</code>\n\n"
+        # Cooldown Settings
+        msg += f"⏰ <b>Cooldown Settings:</b>\n"
+        msg += f"Status: <b>🔴 OFF</b> (Default)\n"
+        msg += f"Hours: <b>24h</b> (When enabled)\n\n"
         
-        msg += "💡 <i>Tip: These settings only affect new accounts. Existing accounts keep their current settings.</i>"
+        # Commands
+        msg += f"📝 <b>Commands:</b>\n"
+        msg += f"• <code>default leverage [1-125]</code> - Set default leverage\n"
+        msg += f"• <code>default risk [%]</code> - Set default risk\n"
+        msg += f"• <code>default balance [%]</code> - Set default balance %\n"
+        msg += f"• <code>default amount [USDT]</code> - Set default fixed amount\n"
+        msg += f"• <code>default cooldown [hours]</code> - Set default cooldown\n"
+        msg += f"• <code>default cooldown off</code> - Disable default cooldown\n\n"
+        
+        msg += f"💡 <i>Tip: These settings only affect new accounts. Existing accounts keep their current settings.</i>"
         
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
@@ -4525,8 +4559,49 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "⚙️ Settings" and 'current_account_id' in context.user_data:
-        # This will be handled by the conversation handler
-        pass
+        # Show account settings with cooldown options
+        acc_id = context.user_data.get('current_account_id')
+        acc_name = context.user_data.get('current_account_name', 'Account')
+        
+        # Get account from database
+        accs = trading_bot.enhanced_db.get_all_accounts()
+        acc = next((a for a in accs if a.account_id == acc_id), None)
+        
+        if not acc:
+            await update.message.reply_text("❌ Account not found", parse_mode='HTML', reply_markup=build_account_page())
+            return
+        
+        # Build settings message
+        msg = f"⚙️ <b>Account Settings - {acc_name}</b>\n\n"
+        
+        # Trading Settings
+        msg += f"📊 <b>Trading Settings:</b>\n"
+        msg += f"⚡ Leverage: <b>{acc.leverage}x</b>\n"
+        msg += f"💰 Risk %: <b>{acc.risk_percentage}%</b>\n"
+        balance_mode = "Percentage" if acc.use_percentage_balance else "Fixed USDT"
+        balance_value = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
+        msg += f"💵 Trade Amount: <b>{balance_value}</b>\n\n"
+        
+        # Cooldown Settings
+        cooldown_status = "🟢 ON" if getattr(acc, 'cooldown_enabled', False) else "🔴 OFF"
+        cooldown_hours = getattr(acc, 'cooldown_hours', 24)
+        msg += f"⏰ <b>Cooldown Settings:</b>\n"
+        msg += f"Status: <b>{cooldown_status}</b>\n"
+        if getattr(acc, 'cooldown_enabled', False):
+            msg += f"Hours: <b>{cooldown_hours}h</b>\n"
+        msg += "\n"
+        
+        # Commands
+        msg += f"📝 <b>Commands:</b>\n"
+        msg += f"• <code>cooldown on [hours]</code> - Enable cooldown\n"
+        msg += f"• <code>cooldown off</code> - Disable cooldown\n"
+        msg += f"• <code>cooldown status</code> - Check settings\n"
+        msg += f"• <code>leverage [1-125]</code> - Set leverage\n"
+        msg += f"• <code>risk [%]</code> - Set risk percentage\n"
+        msg += f"• <code>balance [%]</code> - Set balance percentage\n"
+        msg += f"• <code>amount [USDT]</code> - Set fixed amount\n"
+        
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "📡 Channels" and 'current_account_id' in context.user_data:
         # This will be handled by the conversation handler
@@ -4590,6 +4665,67 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📊 Cooldown: {status} ({hours}h)", parse_mode='HTML')
         else:
             await update.message.reply_text("❌ Account not found", parse_mode='HTML')
+
+    # Additional settings commands
+    elif text.startswith("leverage ") and 'current_account_id' in context.user_data:
+        try:
+            leverage = int(text.split()[1])
+            if 1 <= leverage <= 125:
+                acc_id = context.user_data.get('current_account_id')
+                success = trading_bot.enhanced_db.update_account_settings(acc_id, leverage=leverage)
+                if success:
+                    await update.message.reply_text(f"✅ Leverage set to {leverage}x", parse_mode='HTML')
+                else:
+                    await update.message.reply_text("❌ Failed to update leverage", parse_mode='HTML')
+            else:
+                await update.message.reply_text("❌ Leverage must be between 1-125", parse_mode='HTML')
+        except (ValueError, IndexError):
+            await update.message.reply_text("❌ Invalid leverage format. Use: leverage [1-125]", parse_mode='HTML')
+
+    elif text.startswith("risk ") and 'current_account_id' in context.user_data:
+        try:
+            risk = float(text.split()[1])
+            if 0 < risk <= 100:
+                acc_id = context.user_data.get('current_account_id')
+                success = trading_bot.enhanced_db.update_account_settings(acc_id, risk_percentage=risk)
+                if success:
+                    await update.message.reply_text(f"✅ Risk percentage set to {risk}%", parse_mode='HTML')
+                else:
+                    await update.message.reply_text("❌ Failed to update risk percentage", parse_mode='HTML')
+            else:
+                await update.message.reply_text("❌ Risk must be between 0-100%", parse_mode='HTML')
+        except (ValueError, IndexError):
+            await update.message.reply_text("❌ Invalid risk format. Use: risk [%]", parse_mode='HTML')
+
+    elif text.startswith("balance ") and 'current_account_id' in context.user_data:
+        try:
+            balance = float(text.split()[1])
+            if 0 < balance <= 100:
+                acc_id = context.user_data.get('current_account_id')
+                success = trading_bot.enhanced_db.update_account_settings(acc_id, balance_percentage=balance, use_percentage_balance=True)
+                if success:
+                    await update.message.reply_text(f"✅ Balance percentage set to {balance}%", parse_mode='HTML')
+                else:
+                    await update.message.reply_text("❌ Failed to update balance percentage", parse_mode='HTML')
+            else:
+                await update.message.reply_text("❌ Balance must be between 0-100%", parse_mode='HTML')
+        except (ValueError, IndexError):
+            await update.message.reply_text("❌ Invalid balance format. Use: balance [%]", parse_mode='HTML')
+
+    elif text.startswith("amount ") and 'current_account_id' in context.user_data:
+        try:
+            amount = float(text.split()[1])
+            if amount > 0:
+                acc_id = context.user_data.get('current_account_id')
+                success = trading_bot.enhanced_db.update_account_settings(acc_id, fixed_usdt_amount=amount, use_percentage_balance=False)
+                if success:
+                    await update.message.reply_text(f"✅ Fixed amount set to ${amount} USDT", parse_mode='HTML')
+                else:
+                    await update.message.reply_text("❌ Failed to update fixed amount", parse_mode='HTML')
+            else:
+                await update.message.reply_text("❌ Amount must be greater than 0", parse_mode='HTML')
+        except (ValueError, IndexError):
+            await update.message.reply_text("❌ Invalid amount format. Use: amount [USDT]", parse_mode='HTML')
 
 async def handle_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle accounts menu"""
