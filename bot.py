@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Any, Union
 from datetime import datetime
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 import os
 import sys
 import traceback
@@ -1599,7 +1599,7 @@ class EnhancedSignalParser:
                     continue
                 
                 # Normalize symbol
-                if not symbol.endswith('USDT'):
+                if not symbol.endswith('USDT'): 
                     symbol = symbol + 'USDT'
                 
                 # Fix double USDT
@@ -2238,24 +2238,38 @@ class TradingBot:
             qty_decimal = Decimal(str(quantity))
             step_decimal = Decimal(str(step_size))
             
-            # First, floor to the nearest step multiple to avoid oversizing
-            rounded_decimal = (qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_decimal
+            # First, round to the nearest step multiple (not floor)
+            rounded_decimal = (qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * step_decimal
 
-            # Then, floor to declared precision (never round up here)
+            # Then, round to declared precision (use HALF_UP for better precision)
             if isinstance(qty_precision, int) and qty_precision >= 0:
                 precision_quant = Decimal('1').scaleb(-qty_precision)
-                rounded_decimal = Decimal(rounded_decimal).quantize(precision_quant, rounding=ROUND_DOWN)
+                rounded_decimal = Decimal(rounded_decimal).quantize(precision_quant, rounding=ROUND_HALF_UP)
             rounded = float(rounded_decimal)
             
+            # Ensure we don't go below step_size unless precision allows smaller values
             if rounded < step_size:
-                # allow tiny decimals if precision allows, otherwise bump to step_size
                 try:
                     if isinstance(qty_precision, int) and qty_precision > 0:
                         min_allowed = float(Decimal('1').scaleb(-qty_precision))
-                        rounded = max(rounded, min_allowed)
+                        # Allow very small values if precision supports it
+                        if min_allowed < step_size:
+                            rounded = max(rounded, min_allowed)
+                        else:
+                            rounded = step_size
                     else:
                         rounded = step_size
                 except Exception:
+                    rounded = step_size
+            
+            # Additional check: if the original quantity was very small but non-zero,
+            # ensure we don't round it to zero
+            if quantity > 0 and rounded == 0:
+                # Use the minimum allowed precision
+                if isinstance(qty_precision, int) and qty_precision > 0:
+                    min_allowed = float(Decimal('1').scaleb(-qty_precision))
+                    rounded = min_allowed
+                else:
                     rounded = step_size
             
             return rounded
@@ -2824,9 +2838,44 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"⚠️ Leverage setting warning: {e}")
 
-            logger.info(f"💲 Current {signal.symbol} price: {current_price}")
-
+            # Determine entry price with fallback logic
             entry_price = signal.entry_price or current_price
+            
+            # If we still don't have a valid price, try to fetch it again with different methods
+            if not entry_price or entry_price <= 0:
+                logger.warning(f"⚠️ No valid entry price found, attempting alternative price fetch...")
+                try:
+                    # Try different ticker fields
+                    ticker = self.exchange.fetch_ticker(bingx_symbol)
+                    alternative_prices = [
+                        ticker.get('last'),
+                        ticker.get('close'),
+                        ticker.get('bid'),
+                        ticker.get('ask'),
+                        ticker.get('info', {}).get('price'),
+                        ticker.get('info', {}).get('lastPrice')
+                    ]
+                    
+                    for price in alternative_prices:
+                        if price and float(price) > 0:
+                            entry_price = float(price)
+                            logger.info(f"✅ Found alternative price: {entry_price}")
+                            break
+                    
+                    # If still no price, try orderbook
+                    if not entry_price or entry_price <= 0:
+                        orderbook = self.exchange.fetch_order_book(bingx_symbol, limit=1)
+                        if orderbook.get('bids') and orderbook['bids'][0][0] > 0:
+                            entry_price = orderbook['bids'][0][0]
+                            logger.info(f"✅ Found price from orderbook: {entry_price}")
+                        elif orderbook.get('asks') and orderbook['asks'][0][0] > 0:
+                            entry_price = orderbook['asks'][0][0]
+                            logger.info(f"✅ Found price from orderbook asks: {entry_price}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Failed to fetch alternative price: {e}")
+
+            logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price}")
             
             # Calculate trade amount based on user preference
             if config.use_fixed_usdt_amount:
@@ -3629,12 +3678,23 @@ class TradingBot:
             logger.info(f"📨 [_handle_new_message] Processing message from channel {channel_id}")
             logger.info(f"📨 [_handle_new_message] Message text: {message_text[:200]}")
             
+            # Get channel name for display
+            channel_name = "Unknown Channel"
+            try:
+                telethon_client = self.user_monitoring_clients.get(user_id)
+                if telethon_client and channel_id:
+                    entity = await telethon_client.get_entity(int(channel_id))
+                    channel_name = getattr(entity, 'title', f'Channel {channel_id}')
+            except Exception as e:
+                logger.debug(f"Could not get channel name for {channel_id}: {e}")
+                channel_name = f"Channel {channel_id}" if channel_id else "Unknown Channel"
+            
             # Send notification about received message
             if bot_instance:
                 try:
                     await bot_instance.send_message(
                         chat_id=user_id,
-                        text=f"📨 <b>New Message Received</b>\n\n<pre>{message_text[:300]}</pre>\n\n🔍 Processing...",
+                        text=f"📨 <b>New Message Received</b>\n\n<b>From:</b> {channel_name}\n\n<pre>{message_text[:300]}</pre>\n\n🔍 Processing...",
                         parse_mode='HTML'
                     )
                     logger.info(f"✅ [_handle_new_message] Sent notification to user {user_id}")
@@ -3942,10 +4002,32 @@ def build_account_page():
 
 def build_settings_menu():
     return ReplyKeyboardMarkup([
-        ["📊 Leverage", "💰 Risk %"],
-        ["🎯 Take Profits", "🛡️ Stop Loss"],
-        ["📉 Trailing"],
+        ["⚡ Leverage", "💰 Risk %", "💵 Trade Amount"],
+        ["🎯 Take Profits", "🛡️ Stop Loss", "📉 Trailing"],
+        ["⏰ Cooldown", "📡 Channels", "🔧 Advanced"],
+        ["🗑️ Delete Account", "✏️ Rename Account"],
         ["🔙 Account"]
+    ], resize_keyboard=True)
+
+def build_advanced_settings_menu():
+    return ReplyKeyboardMarkup([
+        ["🎯 Signal Settings", "🛡️ SL/TP Orders"],
+        ["🔗 Webhook", "📊 Balance Mode"],
+        ["🔙 Settings"]
+    ], resize_keyboard=True)
+
+def build_take_profit_levels_menu():
+    return ReplyKeyboardMarkup([
+        ["➕ Add Level", "✏️ Edit Level"],
+        ["🗑️ Remove Level", "📋 View Levels"],
+        ["🔙 Settings"]
+    ], resize_keyboard=True)
+
+def build_cooldown_menu():
+    return ReplyKeyboardMarkup([
+        ["🟢 Enable", "🔴 Disable"],
+        ["⏰ Set Hours", "📊 Status"],
+        ["🔙 Settings"]
     ], resize_keyboard=True)
 
 async def handle_pin_authentication(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4107,8 +4189,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active_trades = trading_bot.enhanced_db.get_active_trades(acc.account_id)
             trade_history = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=100)
             
-            # Calculate PnL
+            # Calculate PnL and win rate
             total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+            
+            # Calculate win rate from closed trades only
+            closed_trades = [t for t in trade_history if t.status == "CLOSED"]
+            winning_trades = [t for t in closed_trades if float(t.pnl or 0) > 0]
+            win_rate = (len(winning_trades) / len(closed_trades) * 100) if closed_trades else 0
             
             # Get balance from exchange
             balance = 0.0
@@ -4130,6 +4217,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"  💵 Trade Amount: {balance_mode}\n"
             msg += f"  📈 Active Trades: {len(active_trades)}\n"
             msg += f"  📊 Total Trades: {len(trade_history)}\n"
+            msg += f"  🎯 Win Rate: {win_rate:.1f}% ({len(winning_trades)}/{len(closed_trades)})\n"
             msg += f"  💵 Total PnL: {total_pnl:.2f} USDT\n"
             msg += f"  📡 Channels: {len(acc.monitored_channels)}\n\n"
         
@@ -4409,17 +4497,25 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Delegate to stop trading handler to actually stop monitoring
         await handle_stop_trading(update, context)
 
-    elif text == "📋 History" and 'current_account_id' in context.user_data:
+    elif text == "📋 History":
         # Show trade history for current account only
-        acc_id = context.user_data.get('current_account_id')
-        acc_name = context.user_data.get('current_account_name', 'Account')
+        current_account = trading_bot.get_current_account(user_id)
         
-        trade_history = trading_bot.enhanced_db.get_trade_history(acc_id, limit=20)
+        if not current_account:
+            await update.message.reply_text(
+                "❌ <b>No Account Selected</b>\n\n"
+                "Please select an account first from the Accounts menu.",
+                parse_mode='HTML',
+                reply_markup=build_main_menu()
+            )
+            return
+        
+        trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
         
         if not trade_history:
             await update.message.reply_text(
                 f"📋 <b>No Trade History</b>\n\n"
-                f"Account: {acc_name}\n\n"
+                f"Account: {current_account.account_name}\n\n"
                 f"You haven't made any trades yet on this account.",
                 parse_mode='HTML',
                 reply_markup=build_account_page()
@@ -4441,7 +4537,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-            text = f"📋 <b>Trade History - {acc_name}</b>\n\n"
+            text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
             text += f"Recent trades ({len(trade_history)}):\n\n"
             for trade in trade_history:
                 status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
@@ -4627,6 +4723,37 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "📉 Trailing":
         await update.message.reply_text("📉 Trailing stop settings", parse_mode='HTML')
+    
+    # New comprehensive settings handlers
+    elif text == "⚡ Leverage":
+        await handle_leverage_setting(update, context)
+    
+    elif text == "💰 Risk %":
+        await handle_risk_setting(update, context)
+    
+    elif text == "💵 Trade Amount":
+        await handle_trade_amount_setting(update, context)
+    
+    elif text == "🎯 Take Profits":
+        await handle_take_profits_setting(update, context)
+    
+    elif text == "🛡️ Stop Loss":
+        await handle_stop_loss_setting(update, context)
+    
+    elif text == "⏰ Cooldown":
+        await handle_cooldown_setting(update, context)
+    
+    elif text == "📡 Channels":
+        await handle_channels_setting(update, context)
+    
+    elif text == "🔧 Advanced":
+        await handle_advanced_settings(update, context)
+    
+    elif text == "🗑️ Delete Account":
+        await handle_delete_account(update, context)
+    
+    elif text == "✏️ Rename Account":
+        await handle_rename_account(update, context)
 
     # Cooldown commands
     elif text.startswith("cooldown on") and 'current_account_id' in context.user_data:
@@ -4891,13 +5018,76 @@ async def handle_trade_history(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(text, parse_mode='HTML')
 
 async def handle_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle settings menu"""
-    await update.message.reply_text(
-        "⚙️ <b>Account Settings</b>\n\n"
-        "Configure your trading parameters:",
-        parse_mode='HTML',
-        reply_markup=trading_bot.settings_menu
-    )
+    """Handle comprehensive settings menu"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text(
+            "❌ <b>No Account Selected</b>\n\n"
+            "Please select an account first from the Accounts menu.",
+            parse_mode='HTML',
+            reply_markup=build_main_menu()
+        )
+        return
+    
+    # Build comprehensive settings display
+    msg = f"⚙️ <b>Account Settings - {current_account.account_name}</b>\n\n"
+    
+    # Trading Configuration
+    msg += f"📊 <b>Trading Configuration:</b>\n"
+    msg += f"  ⚡ Leverage: <b>{current_account.leverage}x</b>\n"
+    msg += f"  💰 Risk: <b>{current_account.risk_percentage}%</b>\n"
+    
+    # Balance Configuration
+    balance_mode = "Percentage" if current_account.use_percentage_balance else "Fixed USDT"
+    balance_value = f"{current_account.balance_percentage}%" if current_account.use_percentage_balance else f"${current_account.fixed_usdt_amount}"
+    msg += f"  💵 Trade Amount: <b>{balance_value}</b> ({balance_mode})\n\n"
+    
+    # Take Profit Levels
+    msg += f"🎯 <b>Take Profit Levels:</b>\n"
+    if current_account.take_profit_levels:
+        for i, tp in enumerate(current_account.take_profit_levels, 1):
+            msg += f"  {i}. <b>{tp.percentage}%</b> - Close <b>{tp.close_percentage}%</b>\n"
+    else:
+        msg += f"  No levels configured\n"
+    
+    # Stop Loss Levels
+    msg += f"\n🛡️ <b>Stop Loss Levels:</b>\n"
+    if current_account.stop_loss_levels:
+        for i, sl in enumerate(current_account.stop_loss_levels, 1):
+            msg += f"  {i}. <b>{sl.percentage}%</b> - Close <b>{sl.close_percentage}%</b>\n"
+    else:
+        msg += f"  No levels configured\n"
+    
+    # Trailing Stop
+    msg += f"\n📉 <b>Trailing Stop:</b>\n"
+    trailing_status = "🟢 ON" if current_account.trailing_enabled else "🔴 OFF"
+    msg += f"  Status: <b>{trailing_status}</b>\n"
+    if current_account.trailing_enabled:
+        msg += f"  Activation: <b>{current_account.trailing_activation_percent}%</b>\n"
+        msg += f"  Callback: <b>{current_account.trailing_callback_percent}%</b>\n"
+    
+    # Cooldown
+    msg += f"\n⏰ <b>Cooldown:</b>\n"
+    cooldown_status = "🟢 ON" if getattr(current_account, 'cooldown_enabled', False) else "🔴 OFF"
+    cooldown_hours = getattr(current_account, 'cooldown_hours', 24)
+    msg += f"  Status: <b>{cooldown_status}</b>\n"
+    if getattr(current_account, 'cooldown_enabled', False):
+        msg += f"  Duration: <b>{cooldown_hours} hours</b>\n"
+    
+    # Advanced Features
+    msg += f"\n🔧 <b>Advanced Features:</b>\n"
+    msg += f"  Signal Settings: <b>{'ON' if current_account.use_signal_settings else 'OFF'}</b>\n"
+    msg += f"  Create SL/TP: <b>{'ON' if current_account.create_sl_tp else 'OFF'}</b>\n"
+    msg += f"  Webhook: <b>{'ON' if current_account.make_webhook_enabled else 'OFF'}</b>\n"
+    
+    # Channels
+    msg += f"\n📡 <b>Monitored Channels:</b> <b>{len(current_account.monitored_channels)}</b>\n"
+    
+    msg += f"\nUse the buttons below to modify settings:"
+    
+    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_settings_menu())
 
 async def handle_start_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle start trading with duplicate prevention"""
@@ -6659,6 +6849,459 @@ Confidence: {signal.confidence:.2f}""")
     
     await update.message.reply_text("🧪 <b>Enhanced Parser Test</b>\n\n" + "\n\n".join(results), parse_mode='HTML')
 
+# ================== COMPREHENSIVE SETTINGS HANDLERS ==================
+
+async def handle_leverage_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle leverage setting"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    await update.message.reply_text(
+        f"⚡ <b>Leverage Setting</b>\n\n"
+        f"Current: <b>{current_account.leverage}x</b>\n\n"
+        f"Enter new leverage (1-125):",
+        parse_mode='HTML'
+    )
+    context.user_data['state'] = 'WAIT_LEVERAGE'
+
+async def handle_risk_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle risk percentage setting"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    await update.message.reply_text(
+        f"💰 <b>Risk Percentage</b>\n\n"
+        f"Current: <b>{current_account.risk_percentage}%</b>\n\n"
+        f"Enter new risk percentage (0.1-100):",
+        parse_mode='HTML'
+    )
+    context.user_data['state'] = 'WAIT_RISK'
+
+async def handle_trade_amount_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle trade amount setting with inline buttons"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Percentage", callback_data="trade_amount_percentage")],
+        [InlineKeyboardButton("💵 Fixed USDT", callback_data="trade_amount_fixed")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_settings")]
+    ])
+    
+    balance_mode = "Percentage" if current_account.use_percentage_balance else "Fixed USDT"
+    balance_value = f"{current_account.balance_percentage}%" if current_account.use_percentage_balance else f"${current_account.fixed_usdt_amount}"
+    
+    await update.message.reply_text(
+        f"💵 <b>Trade Amount Setting</b>\n\n"
+        f"Current: <b>{balance_value}</b> ({balance_mode})\n\n"
+        f"Choose mode:",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
+async def handle_take_profits_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle take profits levels setting"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    msg = f"🎯 <b>Take Profit Levels</b>\n\n"
+    
+    if current_account.take_profit_levels:
+        for i, tp in enumerate(current_account.take_profit_levels, 1):
+            msg += f"{i}. <b>{tp.percentage}%</b> - Close <b>{tp.close_percentage}%</b>\n"
+    else:
+        msg += "No levels configured\n"
+    
+    msg += f"\nCommands:\n"
+    msg += f"• <code>tp add 2.0 50</code> - Add 2% level, close 50%\n"
+    msg += f"• <code>tp edit 1 3.0 75</code> - Edit level 1 to 3%, close 75%\n"
+    msg += f"• <code>tp remove 1</code> - Remove level 1\n"
+    msg += f"• <code>tp clear</code> - Clear all levels"
+    
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+async def handle_stop_loss_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle stop loss levels setting"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    msg = f"🛡️ <b>Stop Loss Levels</b>\n\n"
+    
+    if current_account.stop_loss_levels:
+        for i, sl in enumerate(current_account.stop_loss_levels, 1):
+            msg += f"{i}. <b>{sl.percentage}%</b> - Close <b>{sl.close_percentage}%</b>\n"
+    else:
+        msg += "No levels configured\n"
+    
+    msg += f"\nCommands:\n"
+    msg += f"• <code>sl add -5.0 100</code> - Add -5% level, close 100%\n"
+    msg += f"• <code>sl edit 1 -3.0 100</code> - Edit level 1 to -3%, close 100%\n"
+    msg += f"• <code>sl remove 1</code> - Remove level 1\n"
+    msg += f"• <code>sl clear</code> - Clear all levels"
+    
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+async def handle_cooldown_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle cooldown setting"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    cooldown_enabled = getattr(current_account, 'cooldown_enabled', False)
+    cooldown_hours = getattr(current_account, 'cooldown_hours', 24)
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Enable", callback_data="cooldown_enable")],
+        [InlineKeyboardButton("🔴 Disable", callback_data="cooldown_disable")],
+        [InlineKeyboardButton("⏰ Set Hours", callback_data="cooldown_hours")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_settings")]
+    ])
+    
+    status = "🟢 ON" if cooldown_enabled else "🔴 OFF"
+    
+    await update.message.reply_text(
+        f"⏰ <b>Cooldown Setting</b>\n\n"
+        f"Status: <b>{status}</b>\n"
+        f"Duration: <b>{cooldown_hours} hours</b>\n\n"
+        f"Cooldown prevents multiple trades on the same symbol within the specified time period.",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
+async def handle_channels_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle channels setting"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    msg = f"📡 <b>Monitored Channels</b>\n\n"
+    msg += f"Total: <b>{len(current_account.monitored_channels)}</b>\n\n"
+    
+    if current_account.monitored_channels:
+        msg += "Current channels:\n"
+        for i, channel_id in enumerate(current_account.monitored_channels, 1):
+            msg += f"{i}. <code>{channel_id}</code>\n"
+    else:
+        msg += "No channels configured\n"
+    
+    msg += f"\nUse 📡 Channels button to manage channels."
+    
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+async def handle_advanced_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle advanced settings"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎯 Signal Settings: {'ON' if current_account.use_signal_settings else 'OFF'}", callback_data="toggle_signal_settings")],
+        [InlineKeyboardButton(f"🛡️ SL/TP Orders: {'ON' if current_account.create_sl_tp else 'OFF'}", callback_data="toggle_sl_tp")],
+        [InlineKeyboardButton(f"🔗 Webhook: {'ON' if current_account.make_webhook_enabled else 'OFF'}", callback_data="toggle_webhook")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_settings")]
+    ])
+    
+    await update.message.reply_text(
+        f"🔧 <b>Advanced Settings</b>\n\n"
+        f"Configure advanced trading features:",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
+async def handle_delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle account deletion"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Confirm Delete", callback_data=f"delete_account_confirm_{current_account.account_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="back_to_settings")]
+    ])
+    
+    await update.message.reply_text(
+        f"🗑️ <b>Delete Account</b>\n\n"
+        f"⚠️ <b>WARNING:</b> This will permanently delete:\n"
+        f"• Account: <b>{current_account.account_name}</b>\n"
+        f"• All trading history\n"
+        f"• All settings\n"
+        f"• All monitored channels\n\n"
+        f"This action cannot be undone!",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
+async def handle_rename_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle account renaming"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    await update.message.reply_text(
+        f"✏️ <b>Rename Account</b>\n\n"
+        f"Current name: <b>{current_account.account_name}</b>\n\n"
+        f"Enter new account name:",
+        parse_mode='HTML'
+    )
+    context.user_data['state'] = 'WAIT_ACCOUNT_RENAME'
+
+# ================== CALLBACK QUERY HANDLERS ==================
+
+async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback queries from settings"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await query.edit_message_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    data = query.data
+    
+    if data == "back_to_settings":
+        await handle_settings_menu(update, context)
+    
+    elif data == "trade_amount_percentage":
+        await query.edit_message_text(
+            f"💰 <b>Percentage Mode</b>\n\n"
+            f"Enter percentage (1-100):",
+            parse_mode='HTML'
+        )
+        context.user_data['state'] = 'WAIT_TRADE_AMOUNT_PERCENTAGE'
+    
+    elif data == "trade_amount_fixed":
+        await query.edit_message_text(
+            f"💵 <b>Fixed USDT Mode</b>\n\n"
+            f"Enter USDT amount:",
+            parse_mode='HTML'
+        )
+        context.user_data['state'] = 'WAIT_TRADE_AMOUNT_FIXED'
+    
+    elif data == "cooldown_enable":
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, cooldown_enabled=True)
+        await query.edit_message_text(
+            f"✅ <b>Cooldown Enabled</b>\n\n"
+            f"Cooldown is now active for this account.",
+            parse_mode='HTML'
+        )
+    
+    elif data == "cooldown_disable":
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, cooldown_enabled=False)
+        await query.edit_message_text(
+            f"✅ <b>Cooldown Disabled</b>\n\n"
+            f"Cooldown is now inactive for this account.",
+            parse_mode='HTML'
+        )
+    
+    elif data == "cooldown_hours":
+        await query.edit_message_text(
+            f"⏰ <b>Set Cooldown Hours</b>\n\n"
+            f"Enter hours (1-168):",
+            parse_mode='HTML'
+        )
+        context.user_data['state'] = 'WAIT_COOLDOWN_HOURS'
+    
+    elif data == "toggle_signal_settings":
+        new_value = not current_account.use_signal_settings
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_signal_settings=new_value)
+        await query.edit_message_text(
+            f"✅ <b>Signal Settings {'Enabled' if new_value else 'Disabled'}</b>",
+            parse_mode='HTML'
+        )
+    
+    elif data == "toggle_sl_tp":
+        new_value = not current_account.create_sl_tp
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, create_sl_tp=new_value)
+        await query.edit_message_text(
+            f"✅ <b>SL/TP Orders {'Enabled' if new_value else 'Disabled'}</b>",
+            parse_mode='HTML'
+        )
+    
+    elif data == "toggle_webhook":
+        new_value = not current_account.make_webhook_enabled
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, make_webhook_enabled=new_value)
+        await query.edit_message_text(
+            f"✅ <b>Webhook {'Enabled' if new_value else 'Disabled'}</b>",
+            parse_mode='HTML'
+        )
+    
+    elif data.startswith("delete_account_confirm_"):
+        account_id = data.split("_")[-1]
+        if account_id == current_account.account_id:
+            # Perform actual deletion
+            success = trading_bot.enhanced_db.soft_delete_account(account_id)
+            if success:
+                await query.edit_message_text(
+                    f"✅ <b>Account Deleted</b>\n\n"
+                    f"Account '{current_account.account_name}' has been deleted.",
+                    parse_mode='HTML'
+                )
+                # Clear current account
+                trading_bot.current_accounts[user_id] = None
+            else:
+                await query.edit_message_text(
+                    f"❌ <b>Deletion Failed</b>\n\n"
+                    f"Could not delete account. Please try again.",
+                    parse_mode='HTML'
+                )
+
+# ================== TEXT INPUT HANDLERS ==================
+
+async def handle_text_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text inputs for settings"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    state = context.user_data.get('state')
+    
+    current_account = trading_bot.get_current_account(user_id)
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    if state == 'WAIT_LEVERAGE':
+        try:
+            leverage = int(text)
+            if 1 <= leverage <= 125:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, leverage=leverage)
+                await update.message.reply_text(
+                    f"✅ <b>Leverage Updated</b>\n\n"
+                    f"New leverage: <b>{leverage}x</b>",
+                    parse_mode='HTML',
+                    reply_markup=build_settings_menu()
+                )
+            else:
+                await update.message.reply_text("❌ Leverage must be between 1 and 125", parse_mode='HTML')
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number", parse_mode='HTML')
+    
+    elif state == 'WAIT_RISK':
+        try:
+            risk = float(text)
+            if 0.1 <= risk <= 100:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, risk_percentage=risk)
+                await update.message.reply_text(
+                    f"✅ <b>Risk Updated</b>\n\n"
+                    f"New risk: <b>{risk}%</b>",
+                    parse_mode='HTML',
+                    reply_markup=build_settings_menu()
+                )
+            else:
+                await update.message.reply_text("❌ Risk must be between 0.1 and 100", parse_mode='HTML')
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number", parse_mode='HTML')
+    
+    elif state == 'WAIT_TRADE_AMOUNT_PERCENTAGE':
+        try:
+            percentage = float(text)
+            if 1 <= percentage <= 100:
+                trading_bot.enhanced_db.update_account_settings(
+                    current_account.account_id, 
+                    use_percentage_balance=True,
+                    balance_percentage=percentage
+                )
+                await update.message.reply_text(
+                    f"✅ <b>Trade Amount Updated</b>\n\n"
+                    f"New amount: <b>{percentage}%</b> of balance",
+                    parse_mode='HTML',
+                    reply_markup=build_settings_menu()
+                )
+            else:
+                await update.message.reply_text("❌ Percentage must be between 1 and 100", parse_mode='HTML')
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number", parse_mode='HTML')
+    
+    elif state == 'WAIT_TRADE_AMOUNT_FIXED':
+        try:
+            amount = float(text)
+            if amount > 0:
+                trading_bot.enhanced_db.update_account_settings(
+                    current_account.account_id, 
+                    use_percentage_balance=False,
+                    fixed_usdt_amount=amount
+                )
+                await update.message.reply_text(
+                    f"✅ <b>Trade Amount Updated</b>\n\n"
+                    f"New amount: <b>${amount}</b> USDT",
+                    parse_mode='HTML',
+                    reply_markup=build_settings_menu()
+                )
+            else:
+                await update.message.reply_text("❌ Amount must be greater than 0", parse_mode='HTML')
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number", parse_mode='HTML')
+    
+    elif state == 'WAIT_COOLDOWN_HOURS':
+        try:
+            hours = int(text)
+            if 1 <= hours <= 168:
+                trading_bot.enhanced_db.update_account_settings(current_account.account_id, cooldown_hours=hours)
+                await update.message.reply_text(
+                    f"✅ <b>Cooldown Hours Updated</b>\n\n"
+                    f"New duration: <b>{hours} hours</b>",
+                    parse_mode='HTML',
+                    reply_markup=build_settings_menu()
+                )
+            else:
+                await update.message.reply_text("❌ Hours must be between 1 and 168", parse_mode='HTML')
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number", parse_mode='HTML')
+    
+    elif state == 'WAIT_ACCOUNT_RENAME':
+        if len(text) > 0 and len(text) <= 50:
+            success = trading_bot.enhanced_db.update_account_name(current_account.account_id, text)
+            if success:
+                await update.message.reply_text(
+                    f"✅ <b>Account Renamed</b>\n\n"
+                    f"New name: <b>{text}</b>",
+                    parse_mode='HTML',
+                    reply_markup=build_settings_menu()
+                )
+            else:
+                await update.message.reply_text("❌ Failed to rename account", parse_mode='HTML')
+        else:
+            await update.message.reply_text("❌ Name must be 1-50 characters", parse_mode='HTML')
+    
+    # Clear state
+    context.user_data.pop('state', None)
+
 # ================== CONVERSATION HANDLERS ==================
 
 async def settings_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6901,6 +7544,11 @@ def main():
         application.add_handler(auth_conv_handler)
         application.add_handler(channel_conv_handler)
         application.add_handler(trading_conv_handler)
+        
+        # New comprehensive settings handlers
+        application.add_handler(CallbackQueryHandler(handle_settings_callbacks))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_inputs))
+        
         # No extra command handlers; only buttons and /start are active
 
         # Enhanced static button handler (catch-all for remaining messages)
