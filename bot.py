@@ -7190,11 +7190,7 @@ async def handle_text_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     text = update.message.text.strip()
     state = context.user_data.get('state')
-
-    # If we're not in any settings/editing state, ignore and let main menu handler process
-    if not state:
-        return
-
+    
     current_account = trading_bot.get_current_account(user_id)
     if not current_account:
         await update.message.reply_text("❌ No account selected", parse_mode='HTML')
