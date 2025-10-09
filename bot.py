@@ -7191,6 +7191,13 @@ async def handle_text_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.strip()
     state = context.user_data.get('state')
     
+    # If we are not in a specific input state, delegate to the main menu handler
+    # so normal navigation buttons work without requiring a selected account
+    if not state:
+        await handle_main_menu(update, context)
+        return
+    
+    # From here on, we are in a settings input flow which requires a current account
     current_account = trading_bot.get_current_account(user_id)
     if not current_account:
         await update.message.reply_text("❌ No account selected", parse_mode='HTML')
