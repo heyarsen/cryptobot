@@ -2823,12 +2823,17 @@ class TradingBot:
             side = 'BUY' if signal.trade_type == 'LONG' else 'SELL'
 
             bingx_symbol = self.to_bingx_symbol(signal.symbol)
-            # Ensure we always have current price
+            # Ensure we always have current price with proper precision handling
             try:
                 ticker = self.exchange.fetch_ticker(bingx_symbol)
-                current_price = float(ticker.get('last') or ticker.get('info', {}).get('price') or 0)
-            except Exception:
-                current_price = float(signal.entry_price or 0) or 0.0
+                # Use Decimal for precision-sensitive prices
+                price_str = str(ticker.get('last') or ticker.get('info', {}).get('price') or '0')
+                current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
+                logger.info(f"📊 Fetched current price for {bingx_symbol}: {current_price}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error fetching ticker: {e}")
+                price_str = str(signal.entry_price or '0')
+                current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
 
             # Attempt to set leverage, but proceed if it fails
             try:
@@ -2838,8 +2843,11 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"⚠️ Leverage setting warning: {e}")
 
-            # Determine entry price with fallback logic
-            entry_price = signal.entry_price or current_price
+            # Determine entry price with fallback logic and precision handling
+            if signal.entry_price:
+                entry_price = float(Decimal(str(signal.entry_price)))
+            else:
+                entry_price = current_price
             
             # If we still don't have a valid price, try to fetch it again with different methods
             if not entry_price or entry_price <= 0:
@@ -2857,10 +2865,17 @@ class TradingBot:
                     ]
                     
                     for price in alternative_prices:
-                        if price and float(price) > 0:
-                            entry_price = float(price)
-                            logger.info(f"✅ Found alternative price: {entry_price}")
-                            break
+                        if price:
+                            try:
+                                # Use Decimal to preserve precision for very small numbers
+                                price_decimal = Decimal(str(price))
+                                price_float = float(price_decimal)
+                                if price_float > 0:
+                                    entry_price = price_float
+                                    logger.info(f"✅ Found alternative price: {entry_price}")
+                                    break
+                            except Exception:
+                                continue
                     
                     # If still no price, try orderbook
                     if not entry_price or entry_price <= 0:
@@ -2876,6 +2891,15 @@ class TradingBot:
                     logger.error(f"❌ Failed to fetch alternative price: {e}")
 
             logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price}")
+            
+            # Additional validation for very small prices (meme coins with many zeros)
+            if entry_price > 0 and entry_price < 0.00000001:
+                logger.warning(f"⚠️ Detected very small price ({entry_price}) for {signal.symbol}")
+                logger.info(f"📊 This appears to be a meme coin with many decimal places")
+                # Ensure we maintain precision by verifying the price is still valid
+                if entry_price <= 0:
+                    logger.error(f"❌ Price became invalid after conversion: {entry_price}")
+                    return {'success': False, 'error': f'Price precision lost for {signal.symbol}. Original price too small to process safely.'}
             
             # Calculate trade amount based on user preference
             if config.use_fixed_usdt_amount:
@@ -3715,11 +3739,13 @@ class TradingBot:
                 current_account = self.get_current_account(user_id)
                 if current_account and not self.account_monitoring_status.get(current_account.account_id, False):
                     logger.warning(f"⏸️ Account {current_account.account_name} received signal but monitoring is not active - skipping trade")
+                    logger.warning(f"⏸️ Current monitoring status: {dict(self.account_monitoring_status)}")
+                    logger.info(f"ℹ️ Note: Trades execute in background regardless of user's current menu location")
                     if bot_instance:
                         try:
                             await bot_instance.send_message(
                                 chat_id=user_id,
-                                text=f"⏸️ <b>Signal Received</b>\n\n💰 {signal.symbol} {signal.trade_type}\n\n⚠️ Account <b>{current_account.account_name}</b> is not monitoring.\nTrade skipped.\n\nUse '🚀 Start' to enable trading for this account.",
+                                text=f"⏸️ <b>Signal Received</b>\n\n💰 {signal.symbol} {signal.trade_type}\n\n⚠️ Account <b>{current_account.account_name}</b> is not monitoring.\nTrade skipped.\n\nUse '🚀 Start' to enable trading for this account.\n\n💡 Tip: Once started, trades execute automatically from anywhere in the bot!",
                                 parse_mode='HTML'
                             )
                         except Exception as e:
@@ -5013,6 +5039,24 @@ async def handle_trade_history(update: Update, context: ContextTypes.DEFAULT_TYP
             status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
             text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
             text += f"Entry: {trade.entry_price} | PnL: {trade.pnl}\n"
+            
+            # Get and display channel name
+            if trade.channel_id:
+                try:
+                    telethon_client = trading_bot.user_monitoring_clients.get(user_id)
+                    if telethon_client:
+                        try:
+                            entity = await telethon_client.get_entity(int(trade.channel_id))
+                            channel_name = getattr(entity, 'title', f'Channel {trade.channel_id}')
+                            text += f"📡 Channel: {channel_name}\n"
+                        except Exception:
+                            text += f"📡 Channel: {trade.channel_id}\n"
+                    else:
+                        text += f"📡 Channel: {trade.channel_id}\n"
+                except Exception as e:
+                    logger.debug(f"Could not get channel name for {trade.channel_id}: {e}")
+                    text += f"📡 Channel: {trade.channel_id}\n"
+            
             text += f"Time: {trade.entry_time[:16]}\n\n"
         
         await update.message.reply_text(text, parse_mode='HTML')
