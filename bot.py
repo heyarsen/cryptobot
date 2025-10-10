@@ -2715,7 +2715,9 @@ class TradingBot:
                 if account_key:
                     self.account_exchanges[account_key] = self.exchange
 
-            bal = self.exchange.fetch_balance()
+            # Explicitly use 'swap' type for futures trading
+            current_trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
+            bal = self.exchange.fetch_balance({'type': current_trading_type})
             usdt = bal.get('USDT', {}) if isinstance(bal, dict) else {}
             usdt_info = {
                 'balance': float(usdt.get('total', 0) or usdt.get('free', 0) or 0),
@@ -2759,9 +2761,10 @@ class TradingBot:
                 if current_account:
                     self.account_exchanges[current_account.account_id] = self.exchange
 
-            bal = self.exchange.fetch_balance()
+            # Explicitly use 'swap' type for futures trading
+            bal = self.exchange.fetch_balance({'type': trading_type})
             usdt_total = bal.get('USDT', {}).get('total', 'N/A') if isinstance(bal, dict) else 'N/A'
-            logger.info(f"✅ BingX connected. Balance: {usdt_total} USDT")
+            logger.info(f"✅ BingX connected. Balance: {usdt_total} USDT (type: {trading_type})")
             return True
 
         except Exception as e:
@@ -2947,7 +2950,7 @@ class TradingBot:
                     })
                     self.exchange = self.account_exchanges[account_key]
 
-                bal = self.exchange.fetch_balance()
+                bal = self.exchange.fetch_balance({'type': trading_type})
                 usdt_balance = 0
                 if isinstance(bal, dict) and 'USDT' in bal:
                     asset = bal['USDT']
@@ -3136,8 +3139,14 @@ class TradingBot:
 
             order_value = quantity * entry_price
 
-            # Include positionSide param for hedge mode for entry
-            order_params = {'positionSide': 'LONG' if side == 'BUY' else 'SHORT'}
+            # Get trading type for this account (futures/swap vs spot)
+            current_trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
+            
+            # Include positionSide param for hedge mode for entry + explicit type for BingX futures
+            # Note: positionSide is only valid for futures/swap trading, not spot
+            order_params = {'type': current_trading_type}  # Explicitly specify swap (futures) or spot
+            if current_trading_type == 'swap':
+                order_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
             # Create order with simple retry if exchange is transiently busy
             attempt = 0
             last_err = None
@@ -3246,7 +3255,8 @@ class TradingBot:
                                 'stopPrice': rounded_sl,
                                 'triggerPrice': rounded_sl,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'type': current_trading_type  # Explicitly specify swap (futures) or spot
                             }
                         )
                         logger.info(f"🛑 Stop Loss order placed: {sl_order}")
@@ -3383,7 +3393,8 @@ class TradingBot:
                                 'stopPrice': rounded_tp,
                                 'triggerPrice': rounded_tp,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'type': current_trading_type  # Explicitly specify swap (futures) or spot
                             }
                         )
                         logger.info(f"🎯 Take Profit order placed: {tp_order}")
@@ -3407,6 +3418,7 @@ class TradingBot:
                                 'positionSide': position_side,
                                 'workingType': 'MARK_PRICE'
                             }
+                            trailing_params['type'] = current_trading_type  # Explicitly specify swap (futures) or spot
                             trailing_order = self.exchange.create_order(
                                 market_symbol,
                                 'TRAILING_STOP_MARKET',
@@ -4456,7 +4468,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if acc.account_id in trading_bot.account_exchanges:
                     exchange = trading_bot.account_exchanges[acc.account_id]
-                    bal = exchange.fetch_balance()
+                    acc_trading_type = getattr(acc, 'trading_type', 'swap')
+                    bal = exchange.fetch_balance({'type': acc_trading_type})
                     balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
             except Exception as e:
                 logger.debug(f"Could not fetch balance for {acc.account_name}: {e}")
@@ -4671,7 +4684,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if acc.account_id in trading_bot.account_exchanges:
                     exchange = trading_bot.account_exchanges[acc.account_id]
-                    bal = exchange.fetch_balance()
+                    acc_trading_type = getattr(acc, 'trading_type', 'swap')
+                    bal = exchange.fetch_balance({'type': acc_trading_type})
                     balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
             except Exception as e:
                 logger.warning(f"⚠️ Failed to fetch balance for account {acc.account_name}: {e}")
