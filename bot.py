@@ -1786,6 +1786,7 @@ class TradingBot:
         self.current_accounts: Dict[int, str] = {}  # user_id -> account_id
         self.monitoring_status: Dict[int, bool] = {}  # Track monitoring status per user (deprecated)
         self.account_monitoring_status: Dict[str, bool] = {}  # Track monitoring status per account_id
+        self.channel_name_cache: Dict[str, str] = {}  # channel_id -> channel_name for display
         
         # Enhanced main menu
         self.main_menu = ReplyKeyboardMarkup(
@@ -1885,6 +1886,29 @@ class TradingBot:
                     logger.warning(f"⚠️ Failed to bind exchange for account {account.account_name}: {e}")
                 return True
         return False
+
+    async def get_channel_display_name(self, channel_id: str, user_id: int) -> str:
+        """Get channel display name with caching for better UX"""
+        # Check cache first
+        if channel_id in self.channel_name_cache:
+            return self.channel_name_cache[channel_id]
+        
+        # Try to resolve from Telethon client
+        try:
+            telethon_client = self.user_monitoring_clients.get(user_id)
+            if telethon_client and channel_id:
+                entity = await telethon_client.get_entity(int(channel_id))
+                display_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or f'Channel {channel_id}'
+                # Cache the result
+                self.channel_name_cache[channel_id] = display_name
+                return display_name
+        except Exception as e:
+            logger.debug(f"Could not resolve channel name for {channel_id}: {e}")
+        
+        # Fallback to channel ID
+        fallback_name = f"Channel {channel_id}" if channel_id else "Unknown Channel"
+        self.channel_name_cache[channel_id] = fallback_name
+        return fallback_name
 
     async def extract_channel_id_from_link(self, link: str, user_id: int) -> Optional[str]:
         """Extract channel ID from t.me link"""
@@ -2754,11 +2778,18 @@ class TradingBot:
             return {'stop_loss': None, 'take_profits': []}
 
     async def execute_trade(self, signal: TradingSignal, config: BotConfig) -> Dict[str, Any]:
-        """Enhanced trade execution with FIXED PRECISION"""
+        """
+        Enhanced trade execution with FIXED PRECISION
+        
+        NOTE: This method is independent of user's current menu location.
+        Trades are executed automatically when signals are detected from monitored channels,
+        regardless of where the user is navigating in the bot interface.
+        """
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
             # Ensure we are using the exchange client tied to the current account (originating user)
+            # Account is determined by user_id and channel mapping, not by menu state
             current_account = self.get_current_account(config.user_id)
             account_key = current_account.account_id if current_account else None
 
@@ -2826,14 +2857,23 @@ class TradingBot:
             # Ensure we always have current price with proper precision handling
             try:
                 ticker = self.exchange.fetch_ticker(bingx_symbol)
-                # Use Decimal for precision-sensitive prices
+                logger.info(f"📊 Raw ticker response for {bingx_symbol}: last={ticker.get('last')}, price={ticker.get('info', {}).get('price')}")
+                
+                # Use Decimal for precision-sensitive prices to avoid float precision loss
                 price_str = str(ticker.get('last') or ticker.get('info', {}).get('price') or '0')
                 current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
-                logger.info(f"📊 Fetched current price for {bingx_symbol}: {current_price}")
+                
+                # Log with full precision for debugging small decimals
+                logger.info(f"📊 Fetched current price for {bingx_symbol}: {current_price} (precision preserved: {price_str})")
+                
+                # Validate extremely small but valid prices
+                if 0 < current_price < 0.00001:
+                    logger.warning(f"⚠️ Very small price detected for {bingx_symbol}: {current_price:.12f} - verify this is correct")
             except Exception as e:
-                logger.warning(f"⚠️ Error fetching ticker: {e}")
+                logger.error(f"❌ Error fetching ticker for {bingx_symbol}: {e}")
                 price_str = str(signal.entry_price or '0')
                 current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
+                logger.info(f"📊 Using signal entry price as fallback: {current_price}")
 
             # Attempt to set leverage, but proceed if it fails
             try:
@@ -2846,8 +2886,14 @@ class TradingBot:
             # Determine entry price with fallback logic and precision handling
             if signal.entry_price:
                 entry_price = float(Decimal(str(signal.entry_price)))
+                logger.info(f"💲 Using signal entry price: {entry_price} (original: {signal.entry_price})")
             else:
                 entry_price = current_price
+                logger.info(f"💲 No signal entry price, using current price: {entry_price}")
+            
+            # Validate extremely small but valid entry prices
+            if 0 < entry_price < 0.00001:
+                logger.warning(f"⚠️ Very small entry price for {signal.symbol}: {entry_price:.12f}")
             
             # If we still don't have a valid price, try to fetch it again with different methods
             if not entry_price or entry_price <= 0:
@@ -2890,13 +2936,25 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"❌ Failed to fetch alternative price: {e}")
 
-            logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price}")
+            logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price} (full precision: {entry_price:.12f})")
+            
+            # Final price validation with detailed error messages
+            if not entry_price or entry_price <= 0:
+                error_msg = (
+                    f"❌ Unable to determine valid price for {signal.symbol} ({bingx_symbol}). "
+                    f"Please verify:\n"
+                    f"1. Symbol is valid and actively trading on BingX\n"
+                    f"2. Symbol format is correct (e.g., BTC/USDT for spot, BTC-USDT for perpetuals)\n"
+                    f"3. Exchange ticker data is available for this pair"
+                )
+                logger.error(error_msg)
+                return {'success': False, 'error': f'Invalid or zero price for {signal.symbol}. Symbol may not be supported or not trading.'}
             
             # Additional validation for very small prices (meme coins with many zeros)
             if entry_price > 0 and entry_price < 0.00000001:
-                logger.warning(f"⚠️ Detected very small price ({entry_price}) for {signal.symbol}")
+                logger.warning(f"⚠️ Detected very small price ({entry_price:.12f}) for {signal.symbol}")
                 logger.info(f"📊 This appears to be a meme coin with many decimal places")
-                # Ensure we maintain precision by verifying the price is still valid
+                # Verify precision was maintained
                 if entry_price <= 0:
                     logger.error(f"❌ Price became invalid after conversion: {entry_price}")
                     return {'success': False, 'error': f'Price precision lost for {signal.symbol}. Original price too small to process safely.'}
@@ -3702,16 +3760,8 @@ class TradingBot:
             logger.info(f"📨 [_handle_new_message] Processing message from channel {channel_id}")
             logger.info(f"📨 [_handle_new_message] Message text: {message_text[:200]}")
             
-            # Get channel name for display
-            channel_name = "Unknown Channel"
-            try:
-                telethon_client = self.user_monitoring_clients.get(user_id)
-                if telethon_client and channel_id:
-                    entity = await telethon_client.get_entity(int(channel_id))
-                    channel_name = getattr(entity, 'title', f'Channel {channel_id}')
-            except Exception as e:
-                logger.debug(f"Could not get channel name for {channel_id}: {e}")
-                channel_name = f"Channel {channel_id}" if channel_id else "Unknown Channel"
+            # Get channel name for display using cached helper method
+            channel_name = await self.get_channel_display_name(channel_id, user_id)
             
             # Send notification about received message
             if bot_instance:
@@ -4527,6 +4577,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Show trade history for current account only
         current_account = trading_bot.get_current_account(user_id)
         
+        # Fallback: check context.user_data if get_current_account returns None
+        if not current_account and 'current_account_id' in context.user_data:
+            account_id = context.user_data['current_account_id']
+            accounts = trading_bot.enhanced_db.get_all_accounts()
+            current_account = next((a for a in accounts if a.account_id == account_id), None)
+            if current_account:
+                # Sync the current_accounts dict
+                trading_bot.set_current_account(user_id, account_id)
+        
         if not current_account:
             await update.message.reply_text(
                 "❌ <b>No Account Selected</b>\n\n"
@@ -4547,6 +4606,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=build_account_page()
             )
         else:
+            # Resolve channel names for all channels first
+            channel_name_map = {}
+            unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
+            for ch_id in unique_channels:
+                channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
+            
             # Aggregate per-channel stats
             channel_stats = {}
             total_trades = len(trade_history)
@@ -4568,17 +4633,19 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for trade in trade_history:
                 status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
                 ch = trade.channel_id or ''
-                ch_line = f" | Ch: {ch}" if ch else ""
+                ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
+                ch_line = f" | Ch: {ch_name}" if ch_name else ""
                 text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
                 text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
                 text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
 
-            # Append per-channel analytics
+            # Append per-channel analytics with resolved names
             if channel_stats:
                 text += "📡 <b>Per-Channel Analytics</b>\n"
                 for ch, cs in channel_stats.items():
+                    ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
                     wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
-                    text += f"- {ch}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
+                    text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
                 if total_trades:
                     overall_wr = wins/total_trades*100
                     text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
