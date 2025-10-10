@@ -241,6 +241,7 @@ class AccountConfig:
     trailing_callback_percent: float = 0.5
     cooldown_enabled: bool = False
     cooldown_hours: int = 24
+    trading_type: str = "swap"  # 'spot' or 'swap' (futures/perpetual)
     
     def __post_init__(self):
         if self.monitored_channels is None:
@@ -577,7 +578,8 @@ class EnhancedDatabase:
                     trailing_activation_percent REAL DEFAULT 2.0,
                     trailing_callback_percent REAL DEFAULT 0.5,
                     cooldown_enabled BOOLEAN DEFAULT FALSE,
-                    cooldown_hours INTEGER DEFAULT 24
+                    cooldown_hours INTEGER DEFAULT 24,
+                    trading_type TEXT DEFAULT 'swap'
                 )
             ''')
             
@@ -616,6 +618,10 @@ class EnhancedDatabase:
                 pass
             try:
                 cursor.execute("ALTER TABLE accounts ADD COLUMN trailing_callback_percent REAL DEFAULT 0.5")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN trading_type TEXT DEFAULT 'swap'")
             except:
                 pass
             
@@ -728,8 +734,8 @@ class EnhancedDatabase:
                     monitored_channels, signal_channels,
                     use_signal_settings, create_sl_tp, make_webhook_enabled,
                     trailing_enabled, trailing_activation_percent, trailing_callback_percent,
-                    cooldown_enabled, cooldown_hours
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cooldown_enabled, cooldown_hours, trading_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
@@ -745,7 +751,7 @@ class EnhancedDatabase:
                 json.dumps(account.signal_channels),
                 account.use_signal_settings, account.create_sl_tp, account.make_webhook_enabled,
                 account.trailing_enabled, account.trailing_activation_percent, account.trailing_callback_percent,
-                account.cooldown_enabled, account.cooldown_hours
+                account.cooldown_enabled, account.cooldown_hours, account.trading_type
             ))
 
             conn.commit()
@@ -813,7 +819,8 @@ class EnhancedDatabase:
                         trailing_activation_percent=float(row[26]) if len(row) > 26 else 2.0,
                         trailing_callback_percent=float(row[27]) if len(row) > 27 else 0.5,
                         cooldown_enabled=bool(row[28]) if len(row) > 28 else False,
-                        cooldown_hours=int(row[29]) if len(row) > 29 and row[29] is not None else 24
+                        cooldown_hours=int(row[29]) if len(row) > 29 and row[29] is not None else 24,
+                        trading_type=str(row[30]) if len(row) > 30 and row[30] else 'swap'
                     )
                     accounts.append(account)
                 except Exception as e:
@@ -907,13 +914,13 @@ class EnhancedDatabase:
         """Update basic scalar settings on an account row.
         Allowed keys: leverage, risk_percentage, use_percentage_balance, balance_percentage, fixed_usdt_amount,
         use_signal_settings, create_sl_tp, make_webhook_enabled, trailing_enabled, 
-        trailing_activation_percent, trailing_callback_percent
+        trailing_activation_percent, trailing_callback_percent, trading_type
         """
         allowed = {
             'leverage', 'risk_percentage', 'use_percentage_balance', 'balance_percentage', 'fixed_usdt_amount',
             'use_signal_settings', 'create_sl_tp', 'make_webhook_enabled', 'trailing_enabled',
             'trailing_activation_percent', 'trailing_callback_percent',
-            'cooldown_enabled', 'cooldown_hours'
+            'cooldown_enabled', 'cooldown_hours', 'trading_type'
         }
         set_clauses = []
         values: List[Any] = []
@@ -1880,14 +1887,15 @@ class TradingBot:
                 # Prepare a dedicated ccxt client for this account using its BingX keys
                 try:
                     if account.bingx_api_key and account.bingx_secret_key:
+                        trading_type = getattr(account, 'trading_type', 'swap')  # Default to swap for backwards compatibility
                         self.account_exchanges[account.account_id] = ccxt.bingx({
                             'apiKey': account.bingx_api_key,
                             'secret': account.bingx_secret_key,
-                            'options': {'defaultType': 'swap'},
+                            'options': {'defaultType': trading_type},
                             'enableRateLimit': True,
                             'timeout': 60000
                         })
-                        logger.info(f"✅ Bound BingX client to account {account.account_name}")
+                        logger.info(f"✅ Bound BingX client to account {account.account_name} (type: {trading_type})")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to bind exchange for account {account.account_name}: {e}")
                 return True
@@ -2738,11 +2746,12 @@ class TradingBot:
             if current_account and current_account.account_id in self.account_exchanges:
                 self.exchange = self.account_exchanges[current_account.account_id]
             else:
+                trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
                 self.exchange = ccxt.bingx({
                     'apiKey': config.binance_api_key,
                     'secret': config.binance_api_secret,
                     'options': {
-                        'defaultType': 'swap'
+                        'defaultType': trading_type
                     },
                     'enableRateLimit': True,
                     'timeout': 60000
@@ -2928,10 +2937,11 @@ class TradingBot:
                 # If per-account API keys are configured, switch keys before fetching balance
                 if current_account and current_account.bingx_api_key and current_account.bingx_secret_key:
                     # Build a per-account client (ccxt is lightweight for this usage)
+                    trading_type = getattr(current_account, 'trading_type', 'swap')
                     self.account_exchanges[account_key] = ccxt.bingx({
                         'apiKey': current_account.bingx_api_key,
                         'secret': current_account.bingx_secret_key,
-                        'options': {'defaultType': 'swap'},
+                        'options': {'defaultType': trading_type},
                         'enableRateLimit': True,
                         'timeout': 60000
                     })
@@ -4246,10 +4256,10 @@ def build_account_page():
 
 def build_settings_menu():
     return ReplyKeyboardMarkup([
-        ["⚡ Leverage", "💰 Risk %", "💵 Trade Amount"],
-        ["🎯 Take Profits", "🛡️ Stop Loss", "📉 Trailing"],
-        ["⏰ Cooldown", "📡 Channels", "🔧 Advanced"],
-        ["🗑️ Delete Account", "✏️ Rename Account"],
+        ["🔮 Trading Type", "⚡ Leverage", "💰 Risk %"],
+        ["💵 Trade Amount", "🎯 Take Profits", "🛡️ Stop Loss"],
+        ["📉 Trailing", "⏰ Cooldown", "📡 Channels"],
+        ["🔧 Advanced", "✏️ Rename Account", "🗑️ Delete Account"],
         ["🔙 Account"]
     ], resize_keyboard=True)
 
@@ -5001,6 +5011,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📉 Trailing stop settings", parse_mode='HTML')
     
     # New comprehensive settings handlers
+    elif text == "🔮 Trading Type":
+        await handle_trading_type_setting(update, context)
+    
     elif text == "⚡ Leverage":
         await handle_leverage_setting(update, context)
     
@@ -5330,6 +5343,8 @@ async def handle_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Trading Configuration
     msg += f"📊 <b>Trading Configuration:</b>\n"
+    trading_type_display = "🔮 Futures/Swap" if getattr(current_account, 'trading_type', 'swap') == 'swap' else "💱 Spot"
+    msg += f"  {trading_type_display}\n"
     msg += f"  ⚡ Leverage: <b>{current_account.leverage}x</b>\n"
     msg += f"  💰 Risk: <b>{current_account.risk_percentage}%</b>\n"
     
@@ -7145,6 +7160,35 @@ Confidence: {signal.confidence:.2f}""")
 
 # ================== COMPREHENSIVE SETTINGS HANDLERS ==================
 
+async def handle_trading_type_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle trading type setting (spot vs futures)"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    current_type = getattr(current_account, 'trading_type', 'swap')
+    current_display = "🔮 Futures/Swap" if current_type == 'swap' else "💱 Spot"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔮 Futures/Swap", callback_data="set_trading_type_swap")],
+        [InlineKeyboardButton("💱 Spot", callback_data="set_trading_type_spot")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_settings")]
+    ])
+    
+    await update.message.reply_text(
+        f"🔮 <b>Trading Type</b>\n\n"
+        f"Current: <b>{current_display}</b>\n\n"
+        f"⚠️ <b>Important:</b> Make sure your BingX API key has the correct permissions:\n"
+        f"• Futures/Swap: Requires <b>Futures Trading</b> permission\n"
+        f"• Spot: Requires <b>Spot Trading</b> permission\n\n"
+        f"Select trading type:",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
 async def handle_leverage_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle leverage setting"""
     user_id = update.effective_user.id
@@ -7432,6 +7476,30 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
             parse_mode='HTML'
         )
         context.user_data['state'] = 'WAIT_COOLDOWN_HOURS'
+    
+    elif data == "set_trading_type_swap":
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, trading_type='swap')
+        # Clear cached exchange to force recreation with new type
+        if current_account.account_id in trading_bot.account_exchanges:
+            del trading_bot.account_exchanges[current_account.account_id]
+        await query.edit_message_text(
+            f"✅ <b>Trading Type Updated</b>\n\n"
+            f"Now using: <b>🔮 Futures/Swap</b>\n\n"
+            f"⚠️ Make sure your BingX API key has <b>Futures Trading</b> permission enabled.",
+            parse_mode='HTML'
+        )
+    
+    elif data == "set_trading_type_spot":
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, trading_type='spot')
+        # Clear cached exchange to force recreation with new type
+        if current_account.account_id in trading_bot.account_exchanges:
+            del trading_bot.account_exchanges[current_account.account_id]
+        await query.edit_message_text(
+            f"✅ <b>Trading Type Updated</b>\n\n"
+            f"Now using: <b>💱 Spot</b>\n\n"
+            f"⚠️ Make sure your BingX API key has <b>Spot Trading</b> permission enabled.",
+            parse_mode='HTML'
+        )
     
     elif data == "toggle_signal_settings":
         new_value = not current_account.use_signal_settings
