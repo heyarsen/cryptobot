@@ -18,14 +18,12 @@ import sqlite3
 import uuid
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any, Union
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 import os
 import sys
 import traceback
 import requests
-import subprocess
 import signal
 import shutil
 
@@ -34,18 +32,12 @@ import warnings
 from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*CallbackQueryHandler.*per_message.*")
 
-# Now continue with your existing imports
-import asyncio
-import re
-import json
-
 # Import python-telegram-bot
 from telegram import (
     Update,
     InlineKeyboardButton, 
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton
 )
 from telegram.ext import (
@@ -249,6 +241,7 @@ class AccountConfig:
     trailing_callback_percent: float = 0.5
     cooldown_enabled: bool = False
     cooldown_hours: int = 24
+    trading_type: str = "swap"  # 'spot' or 'swap' (futures/perpetual)
     
     def __post_init__(self):
         if self.monitored_channels is None:
@@ -585,7 +578,8 @@ class EnhancedDatabase:
                     trailing_activation_percent REAL DEFAULT 2.0,
                     trailing_callback_percent REAL DEFAULT 0.5,
                     cooldown_enabled BOOLEAN DEFAULT FALSE,
-                    cooldown_hours INTEGER DEFAULT 24
+                    cooldown_hours INTEGER DEFAULT 24,
+                    trading_type TEXT DEFAULT 'swap'
                 )
             ''')
             
@@ -624,6 +618,10 @@ class EnhancedDatabase:
                 pass
             try:
                 cursor.execute("ALTER TABLE accounts ADD COLUMN trailing_callback_percent REAL DEFAULT 0.5")
+            except:
+                pass
+            try:
+                cursor.execute("ALTER TABLE accounts ADD COLUMN trading_type TEXT DEFAULT 'swap'")
             except:
                 pass
             
@@ -736,8 +734,8 @@ class EnhancedDatabase:
                     monitored_channels, signal_channels,
                     use_signal_settings, create_sl_tp, make_webhook_enabled,
                     trailing_enabled, trailing_activation_percent, trailing_callback_percent,
-                    cooldown_enabled, cooldown_hours
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cooldown_enabled, cooldown_hours, trading_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 account.account_id, account.account_name, account.bingx_api_key,
                 account.bingx_secret_key, account.telegram_api_id, account.telegram_api_hash,
@@ -753,7 +751,7 @@ class EnhancedDatabase:
                 json.dumps(account.signal_channels),
                 account.use_signal_settings, account.create_sl_tp, account.make_webhook_enabled,
                 account.trailing_enabled, account.trailing_activation_percent, account.trailing_callback_percent,
-                account.cooldown_enabled, account.cooldown_hours
+                account.cooldown_enabled, account.cooldown_hours, account.trading_type
             ))
 
             conn.commit()
@@ -821,7 +819,8 @@ class EnhancedDatabase:
                         trailing_activation_percent=float(row[26]) if len(row) > 26 else 2.0,
                         trailing_callback_percent=float(row[27]) if len(row) > 27 else 0.5,
                         cooldown_enabled=bool(row[28]) if len(row) > 28 else False,
-                        cooldown_hours=int(row[29]) if len(row) > 29 and row[29] is not None else 24
+                        cooldown_hours=int(row[29]) if len(row) > 29 and row[29] is not None else 24,
+                        trading_type=str(row[30]) if len(row) > 30 and row[30] else 'swap'
                     )
                     accounts.append(account)
                 except Exception as e:
@@ -915,13 +914,13 @@ class EnhancedDatabase:
         """Update basic scalar settings on an account row.
         Allowed keys: leverage, risk_percentage, use_percentage_balance, balance_percentage, fixed_usdt_amount,
         use_signal_settings, create_sl_tp, make_webhook_enabled, trailing_enabled, 
-        trailing_activation_percent, trailing_callback_percent
+        trailing_activation_percent, trailing_callback_percent, trading_type
         """
         allowed = {
             'leverage', 'risk_percentage', 'use_percentage_balance', 'balance_percentage', 'fixed_usdt_amount',
             'use_signal_settings', 'create_sl_tp', 'make_webhook_enabled', 'trailing_enabled',
             'trailing_activation_percent', 'trailing_callback_percent',
-            'cooldown_enabled', 'cooldown_hours'
+            'cooldown_enabled', 'cooldown_hours', 'trading_type'
         }
         set_clauses = []
         values: List[Any] = []
@@ -1102,18 +1101,32 @@ class EnhancedDatabase:
             logger.error(f"❌ Failed to save trade history: {e}")
             return False
     
-    def get_trade_history(self, account_id: str, limit: int = 50) -> List[TradeHistory]:
-        """Get trade history for an account"""
+    def get_trade_history(self, account_id: str, limit: int = 50, only_closed: bool = False) -> List[TradeHistory]:
+        """Get trade history for an account
+        
+        Args:
+            account_id: The account ID to filter trades
+            limit: Maximum number of trades to return
+            only_closed: If True, only return closed/inactive trades (not OPEN)
+        """
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            cursor.execute('''
-                SELECT * FROM trade_history 
-                WHERE account_id = ? 
-                ORDER BY entry_time DESC 
-                LIMIT ?
-            ''', (account_id, limit))
+            if only_closed:
+                cursor.execute('''
+                    SELECT * FROM trade_history 
+                    WHERE account_id = ? AND status != 'OPEN'
+                    ORDER BY entry_time DESC 
+                    LIMIT ?
+                ''', (account_id, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM trade_history 
+                    WHERE account_id = ? 
+                    ORDER BY entry_time DESC 
+                    LIMIT ?
+                ''', (account_id, limit))
             
             rows = cursor.fetchall()
             conn.close()
@@ -1786,6 +1799,7 @@ class TradingBot:
         self.current_accounts: Dict[int, str] = {}  # user_id -> account_id
         self.monitoring_status: Dict[int, bool] = {}  # Track monitoring status per user (deprecated)
         self.account_monitoring_status: Dict[str, bool] = {}  # Track monitoring status per account_id
+        self.channel_name_cache: Dict[str, str] = {}  # channel_id -> channel_name for display
         
         # Enhanced main menu
         self.main_menu = ReplyKeyboardMarkup(
@@ -1873,18 +1887,91 @@ class TradingBot:
                 # Prepare a dedicated ccxt client for this account using its BingX keys
                 try:
                     if account.bingx_api_key and account.bingx_secret_key:
+                        trading_type = getattr(account, 'trading_type', 'swap')  # Default to swap for backwards compatibility
                         self.account_exchanges[account.account_id] = ccxt.bingx({
                             'apiKey': account.bingx_api_key,
                             'secret': account.bingx_secret_key,
-                            'options': {'defaultType': 'swap'},
+                            'options': {'defaultType': trading_type},
                             'enableRateLimit': True,
                             'timeout': 60000
                         })
-                        logger.info(f"✅ Bound BingX client to account {account.account_name}")
+                        logger.info(f"✅ Bound BingX client to account {account.account_name} (type: {trading_type})")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to bind exchange for account {account.account_name}: {e}")
                 return True
         return False
+
+    async def get_channel_display_name(self, channel_id: str, user_id: int) -> str:
+        """Get channel display name with caching for better UX"""
+        # Check cache first
+        if channel_id in self.channel_name_cache:
+            return self.channel_name_cache[channel_id]
+        
+        # Try to resolve from Telethon client
+        try:
+            # First try to get the current account's telethon client
+            current_account = self.get_current_account(user_id)
+            telethon_client = None
+            
+            if current_account:
+                telethon_client = self.user_monitoring_clients.get(current_account.account_id)
+            
+            # If no client found for current account, try any account for this user
+            if not telethon_client:
+                accounts = self.enhanced_db.get_all_accounts()
+                for acc in accounts:
+                    if int(acc.user_id or 0) == int(user_id):
+                        telethon_client = self.user_monitoring_clients.get(acc.account_id)
+                        if telethon_client:
+                            break
+            
+            if telethon_client and channel_id:
+                try:
+                    # Handle special case for "Test Private" - saved messages or private chats
+                    channel_id_int = int(channel_id)
+                    
+                    # Check if it's a saved messages ID (user's own ID)
+                    if channel_id_int == user_id:
+                        display_name = "Test Private"
+                        self.channel_name_cache[channel_id] = display_name
+                        return display_name
+                    
+                    # Try to get entity normally
+                    entity = await telethon_client.get_entity(channel_id_int)
+                    
+                    # Check different entity types
+                    if hasattr(entity, 'title') and entity.title:
+                        display_name = entity.title
+                    elif hasattr(entity, 'first_name') and entity.first_name:
+                        # For private chats/users
+                        display_name = "Test Private"
+                    elif hasattr(entity, 'username') and entity.username:
+                        display_name = entity.username
+                    else:
+                        display_name = f'Channel {channel_id}'
+                    
+                    # Cache the result
+                    self.channel_name_cache[channel_id] = display_name
+                    return display_name
+                except ValueError:
+                    # Invalid channel ID format, might be a test message
+                    logger.debug(f"Invalid channel ID format: {channel_id}")
+                except Exception as e:
+                    logger.debug(f"Could not resolve channel name for {channel_id}: {e}")
+        except Exception as e:
+            logger.debug(f"Error in get_channel_display_name: {e}")
+        
+        # Fallback: check if this looks like a test/private message ID
+        try:
+            if channel_id and int(channel_id) == user_id:
+                return "Test Private"
+        except:
+            pass
+        
+        # Final fallback to channel ID
+        fallback_name = f"Channel {channel_id}" if channel_id else "Unknown Channel"
+        self.channel_name_cache[channel_id] = fallback_name
+        return fallback_name
 
     async def extract_channel_id_from_link(self, link: str, user_id: int) -> Optional[str]:
         """Extract channel ID from t.me link"""
@@ -1950,13 +2037,17 @@ class TradingBot:
         return None
 
     def to_bingx_symbol(self, symbol: str) -> str:
+        """Convert symbol to BingX perpetual swap format (e.g., BTC-USDT)"""
         try:
-            # Convert like BTCUSDT -> BTC/USDT:USDT (perpetual swap)
-            if '/' in symbol:
-                return symbol
+            # BingX uses hyphen format for perpetual swaps: BTC-USDT
+            # Remove any existing separators and reconstruct
+            if '/' in symbol or ':' in symbol or '-' in symbol:
+                # Clean up to base-USDT format
+                base = symbol.split('/')[0].split('-')[0].split(':')[0]
+                return f"{base}-USDT"
             if symbol.endswith('USDT'):
                 base = symbol[:-4]
-                return f"{base}/USDT:USDT"
+                return f"{base}-USDT"
             return symbol
         except Exception:
             return symbol
@@ -2104,10 +2195,56 @@ class TradingBot:
 
             bingx_symbol = self.to_bingx_symbol(symbol)
             markets = self.exchange.load_markets()
-            if bingx_symbol not in markets:
-                return {'error': f'Symbol {symbol} not found'}
-
-            market = markets[bingx_symbol]
+            
+            # Try multiple symbol formats to find the market
+            market = None
+            tried_symbols = [bingx_symbol]
+            
+            # Try the primary format first
+            if bingx_symbol in markets:
+                market = markets[bingx_symbol]
+                logger.info(f"✅ Found market for {bingx_symbol}")
+            else:
+                # Try alternative formats
+                # Extract base symbol (e.g., COAI from COAI-USDT)
+                base = symbol.replace('-USDT', '').replace('/USDT', '').replace('USDT', '').replace(':', '').replace('/', '')
+                
+                alternative_formats = [
+                    f"{base}/USDT",      # Slash format
+                    f"{base}-USDT",      # Hyphen format (already tried)
+                    f"{base}USDT",       # No separator
+                    f"{base}/USDT:USDT", # Perpetual format
+                    symbol               # Original symbol as-is
+                ]
+                
+                for alt_symbol in alternative_formats:
+                    if alt_symbol in tried_symbols:
+                        continue
+                    tried_symbols.append(alt_symbol)
+                    if alt_symbol in markets:
+                        market = markets[alt_symbol]
+                        bingx_symbol = alt_symbol  # Update to the working format
+                        logger.info(f"✅ Found market using alternative format: {alt_symbol}")
+                        break
+                
+                if not market:
+                    # Symbol not found in any format - log warning and use safe defaults
+                    logger.warning(f"⚠️ Symbol {symbol} not found in markets (tried: {', '.join(tried_symbols)})")
+                    logger.warning(f"⚠️ Using safe default precision values for {symbol}")
+                    # Return safe defaults instead of error - this allows trade to proceed
+                    default_precision = {
+                        'step_size': 1.0,
+                        'min_qty': 1.0,
+                        'tick_size': 0.00001,
+                        'min_price': 0.00001,
+                        'max_price': 1000000.0,
+                        'qty_precision': 0,
+                        'price_precision': 5
+                    }
+                    self.symbol_info_cache[symbol] = default_precision
+                    return default_precision
+            
+            # If we found the market, continue with precision extraction
             # Derive precision and limits
             raw_price_precision = market.get('precision', {}).get('price', None)
             raw_amount_precision = market.get('precision', {}).get('amount', None)
@@ -2578,7 +2715,9 @@ class TradingBot:
                 if account_key:
                     self.account_exchanges[account_key] = self.exchange
 
-            bal = self.exchange.fetch_balance()
+            # Explicitly use 'swap' type for futures trading
+            current_trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
+            bal = self.exchange.fetch_balance({'type': current_trading_type})
             usdt = bal.get('USDT', {}) if isinstance(bal, dict) else {}
             usdt_info = {
                 'balance': float(usdt.get('total', 0) or usdt.get('free', 0) or 0),
@@ -2609,11 +2748,12 @@ class TradingBot:
             if current_account and current_account.account_id in self.account_exchanges:
                 self.exchange = self.account_exchanges[current_account.account_id]
             else:
+                trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
                 self.exchange = ccxt.bingx({
                     'apiKey': config.binance_api_key,
                     'secret': config.binance_api_secret,
                     'options': {
-                        'defaultType': 'swap'
+                        'defaultType': trading_type
                     },
                     'enableRateLimit': True,
                     'timeout': 60000
@@ -2621,9 +2761,10 @@ class TradingBot:
                 if current_account:
                     self.account_exchanges[current_account.account_id] = self.exchange
 
-            bal = self.exchange.fetch_balance()
+            # Explicitly use 'swap' type for futures trading
+            bal = self.exchange.fetch_balance({'type': trading_type})
             usdt_total = bal.get('USDT', {}).get('total', 'N/A') if isinstance(bal, dict) else 'N/A'
-            logger.info(f"✅ BingX connected. Balance: {usdt_total} USDT")
+            logger.info(f"✅ BingX connected. Balance: {usdt_total} USDT (type: {trading_type})")
             return True
 
         except Exception as e:
@@ -2754,11 +2895,18 @@ class TradingBot:
             return {'stop_loss': None, 'take_profits': []}
 
     async def execute_trade(self, signal: TradingSignal, config: BotConfig) -> Dict[str, Any]:
-        """Enhanced trade execution with FIXED PRECISION"""
+        """
+        Enhanced trade execution with FIXED PRECISION
+        
+        NOTE: This method is independent of user's current menu location.
+        Trades are executed automatically when signals are detected from monitored channels,
+        regardless of where the user is navigating in the bot interface.
+        """
         try:
             logger.info(f"🚀 EXECUTING TRADE: {signal.symbol} {signal.trade_type}")
 
             # Ensure we are using the exchange client tied to the current account (originating user)
+            # Account is determined by user_id and channel mapping, not by menu state
             current_account = self.get_current_account(config.user_id)
             account_key = current_account.account_id if current_account else None
 
@@ -2792,16 +2940,17 @@ class TradingBot:
                 # If per-account API keys are configured, switch keys before fetching balance
                 if current_account and current_account.bingx_api_key and current_account.bingx_secret_key:
                     # Build a per-account client (ccxt is lightweight for this usage)
+                    trading_type = getattr(current_account, 'trading_type', 'swap')
                     self.account_exchanges[account_key] = ccxt.bingx({
                         'apiKey': current_account.bingx_api_key,
                         'secret': current_account.bingx_secret_key,
-                        'options': {'defaultType': 'swap'},
+                        'options': {'defaultType': trading_type},
                         'enableRateLimit': True,
                         'timeout': 60000
                     })
                     self.exchange = self.account_exchanges[account_key]
 
-                bal = self.exchange.fetch_balance()
+                bal = self.exchange.fetch_balance({'type': trading_type})
                 usdt_balance = 0
                 if isinstance(bal, dict) and 'USDT' in bal:
                     asset = bal['USDT']
@@ -2823,12 +2972,45 @@ class TradingBot:
             side = 'BUY' if signal.trade_type == 'LONG' else 'SELL'
 
             bingx_symbol = self.to_bingx_symbol(signal.symbol)
-            # Ensure we always have current price
+            # Ensure we always have current price with proper precision handling
+            current_price = 0.0
             try:
                 ticker = self.exchange.fetch_ticker(bingx_symbol)
-                current_price = float(ticker.get('last') or ticker.get('info', {}).get('price') or 0)
-            except Exception:
-                current_price = float(signal.entry_price or 0) or 0.0
+                logger.info(f"📊 Raw ticker response for {bingx_symbol}: last={ticker.get('last')}, price={ticker.get('info', {}).get('price')}")
+                
+                # Use Decimal for precision-sensitive prices to avoid float precision loss
+                price_str = str(ticker.get('last') or ticker.get('info', {}).get('price') or '0')
+                current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
+                
+                # Log with full precision for debugging small decimals
+                logger.info(f"📊 Fetched current price for {bingx_symbol}: {current_price} (precision preserved: {price_str})")
+                
+                # Validate extremely small but valid prices
+                if 0 < current_price < 0.00001:
+                    logger.info(f"✅ Very small price detected for {bingx_symbol}: {current_price:.12f} - meme coin trading enabled")
+            except Exception as e:
+                logger.warning(f"⚠️ Error fetching ticker for {bingx_symbol}: {e}")
+                # Try alternative symbol format as fallback
+                try:
+                    # If hyphen format failed, the symbol might already be in a different format
+                    alt_symbol = signal.symbol if '/' not in signal.symbol else signal.symbol.replace('/', '-').split(':')[0]
+                    logger.info(f"🔄 Trying alternative symbol format: {alt_symbol}")
+                    ticker = self.exchange.fetch_ticker(alt_symbol)
+                    price_str = str(ticker.get('last') or ticker.get('info', {}).get('price') or '0')
+                    current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
+                    logger.info(f"✅ Found price with alternative format: {current_price}")
+                    bingx_symbol = alt_symbol  # Update to working symbol
+                except Exception as e2:
+                    logger.warning(f"⚠️ Alternative ticker fetch also failed: {e2}")
+                    # Last resort: use signal entry price or minimal fallback
+                    if signal.entry_price and signal.entry_price > 0:
+                        price_str = str(signal.entry_price)
+                        current_price = float(Decimal(price_str))
+                        logger.info(f"📊 Using signal entry price as fallback: {current_price}")
+                    else:
+                        # For very small meme coins, use a minimal non-zero fallback
+                        current_price = 0.00000001
+                        logger.warning(f"⚠️ Using minimal fallback price: {current_price} - trade will proceed with caution")
 
             # Attempt to set leverage, but proceed if it fails
             try:
@@ -2838,8 +3020,17 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"⚠️ Leverage setting warning: {e}")
 
-            # Determine entry price with fallback logic
-            entry_price = signal.entry_price or current_price
+            # Determine entry price with fallback logic and precision handling
+            if signal.entry_price:
+                entry_price = float(Decimal(str(signal.entry_price)))
+                logger.info(f"💲 Using signal entry price: {entry_price} (original: {signal.entry_price})")
+            else:
+                entry_price = current_price
+                logger.info(f"💲 No signal entry price, using current price: {entry_price}")
+            
+            # Validate extremely small but valid entry prices
+            if 0 < entry_price < 0.00001:
+                logger.info(f"✅ Very small entry price for {signal.symbol}: {entry_price:.12f} - meme coin trading")
             
             # If we still don't have a valid price, try to fetch it again with different methods
             if not entry_price or entry_price <= 0:
@@ -2857,10 +3048,17 @@ class TradingBot:
                     ]
                     
                     for price in alternative_prices:
-                        if price and float(price) > 0:
-                            entry_price = float(price)
-                            logger.info(f"✅ Found alternative price: {entry_price}")
-                            break
+                        if price:
+                            try:
+                                # Use Decimal to preserve precision for very small numbers
+                                price_decimal = Decimal(str(price))
+                                price_float = float(price_decimal)
+                                if price_float > 0:
+                                    entry_price = price_float
+                                    logger.info(f"✅ Found alternative price: {entry_price}")
+                                    break
+                            except Exception:
+                                continue
                     
                     # If still no price, try orderbook
                     if not entry_price or entry_price <= 0:
@@ -2874,8 +3072,29 @@ class TradingBot:
                             
                 except Exception as e:
                     logger.error(f"❌ Failed to fetch alternative price: {e}")
+                    logger.error(f"❌ Alternative price fetch error: {traceback.format_exc()}")
 
-            logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price}")
+            logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price} (full precision: {entry_price:.12f})")
+            
+            # Additional validation for very small prices (meme coins with many zeros)
+            if entry_price > 0 and entry_price < 0.00000001:
+                logger.info(f"✅ Detected very small price ({entry_price:.12f}) for {signal.symbol}")
+                logger.info(f"📊 This appears to be a meme coin with many decimal places - proceeding with trade")
+                # Allow trading even with very small prices - DO NOT reject
+            
+            # Final price validation - only reject if truly zero, None, or invalid
+            # IMPORTANT: Allow very small prices like 0.0000004 (meme coins)
+            # Use a more robust check that handles float precision issues
+            if entry_price is None or (isinstance(entry_price, (int, float)) and entry_price <= 0):
+                error_msg = (
+                    f"❌ Unable to determine valid price for {signal.symbol} ({bingx_symbol}). "
+                    f"Please verify:\n"
+                    f"1. Symbol is valid and actively trading on BingX\n"
+                    f"2. Symbol format is correct (e.g., BTC/USDT for spot, BTC-USDT for perpetuals)\n"
+                    f"3. Exchange ticker data is available for this pair"
+                )
+                logger.error(error_msg)
+                return {'success': False, 'error': f'Invalid or zero price for {signal.symbol}. Symbol may not be supported or not trading.'}
             
             # Calculate trade amount based on user preference
             if config.use_fixed_usdt_amount:
@@ -2920,8 +3139,14 @@ class TradingBot:
 
             order_value = quantity * entry_price
 
-            # Include positionSide param for hedge mode for entry
-            order_params = {'positionSide': 'LONG' if side == 'BUY' else 'SHORT'}
+            # Get trading type for this account (futures/swap vs spot)
+            current_trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
+            
+            # Include positionSide param for hedge mode for entry + explicit type for BingX futures
+            # Note: positionSide is only valid for futures/swap trading, not spot
+            order_params = {'type': current_trading_type}  # Explicitly specify swap (futures) or spot
+            if current_trading_type == 'swap':
+                order_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
             # Create order with simple retry if exchange is transiently busy
             attempt = 0
             last_err = None
@@ -3030,7 +3255,8 @@ class TradingBot:
                                 'stopPrice': rounded_sl,
                                 'triggerPrice': rounded_sl,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'type': current_trading_type  # Explicitly specify swap (futures) or spot
                             }
                         )
                         logger.info(f"🛑 Stop Loss order placed: {sl_order}")
@@ -3083,6 +3309,9 @@ class TradingBot:
                     cumulative_assigned = 0.0
                     total_levels = len(requested_quantities)
                     step_size = precision_info['step_size']
+                    
+                    # IMPROVED: Ensure ALL configured TP levels are created
+                    # First pass: try to distribute according to percentages
                     for i, requested in enumerate(requested_quantities):
                         remaining_levels = total_levels - i
                         remaining_capacity = max(quantity - cumulative_assigned, 0.0)
@@ -3090,23 +3319,52 @@ class TradingBot:
                         min_reserved_for_rest = step_size * max(remaining_levels - 1, 0)
                         alloc = min(requested, max(remaining_capacity - min_reserved_for_rest, 0.0))
                         each_qty = self.round_quantity(alloc, step_size, precision_info['qty_precision'])
+                        
+                        # If quantity is too small but we still have levels to create, use minimum
                         if each_qty < step_size:
-                            # Skip this level unless it's the last one
-                            if i != total_levels - 1:
-                                continue
-                            # Last level gets the remainder
-                            each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
+                            if i == total_levels - 1:
+                                # Last level gets all remaining
+                                each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
+                            else:
+                                # Use minimum step_size to ensure this level is created
+                                each_qty = step_size
+                        
                         if cumulative_assigned + each_qty > quantity:
                             each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
-                        if each_qty < step_size:
+                        
+                        # Only skip if quantity is truly 0 or negative
+                        if each_qty <= 0:
                             continue
+                            
                         rounded_quantities.append(each_qty)
                         cumulative_assigned += each_qty
                         if cumulative_assigned >= quantity - (step_size * 1e-9):
                             break
+                    
+                    # If we don't have enough TPs, redistribute more evenly
+                    if len(rounded_quantities) < len(tp_targets):
+                        logger.warning(f"⚠️ Only {len(rounded_quantities)} TPs created, but {len(tp_targets)} configured. Redistributing...")
+                        # Redistribute quantity evenly across all TP levels
+                        rounded_quantities = []
+                        qty_per_level = quantity / len(tp_targets)
+                        cumulative_assigned = 0.0
+                        for i in range(len(tp_targets)):
+                            if i == len(tp_targets) - 1:
+                                # Last TP gets remainder
+                                each_qty = self.round_quantity(quantity - cumulative_assigned, step_size, precision_info['qty_precision'])
+                            else:
+                                each_qty = self.round_quantity(qty_per_level, step_size, precision_info['qty_precision'])
+                                # Ensure minimum quantity
+                                if each_qty < step_size:
+                                    each_qty = step_size
+                            
+                            if each_qty > 0:
+                                rounded_quantities.append(each_qty)
+                                cumulative_assigned += each_qty
 
                     # Align number of TP targets with actual rounded quantities
                     effective_tp_pairs = list(zip(tp_targets[:len(rounded_quantities)], rounded_quantities))
+                    logger.info(f"🎯 Creating {len(effective_tp_pairs)} take profit orders")
 
                     for tp, each_qty in effective_tp_pairs:
                         rounded_tp = self.round_price(tp, precision_info['tick_size'], precision_info['price_precision'])
@@ -3135,7 +3393,8 @@ class TradingBot:
                                 'stopPrice': rounded_tp,
                                 'triggerPrice': rounded_tp,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE'
+                                'workingType': 'MARK_PRICE',
+                                'type': current_trading_type  # Explicitly specify swap (futures) or spot
                             }
                         )
                         logger.info(f"🎯 Take Profit order placed: {tp_order}")
@@ -3159,6 +3418,7 @@ class TradingBot:
                                 'positionSide': position_side,
                                 'workingType': 'MARK_PRICE'
                             }
+                            trailing_params['type'] = current_trading_type  # Explicitly specify swap (futures) or spot
                             trailing_order = self.exchange.create_order(
                                 market_symbol,
                                 'TRAILING_STOP_MARKET',
@@ -3364,13 +3624,12 @@ class TradingBot:
 
                     if signal:
                         settings_source = "Signal" if user_config.use_signal_settings else "Bot"
-                        # Try to get channel name
+                        # Get consistent channel name using the cache
                         channel_info = ""
                         try:
-                            if hasattr(event, 'chat') and event.chat:
-                                channel_name = getattr(event.chat, 'title', None)
-                                if channel_name:
-                                    channel_info = f"\n📡 Source: {channel_name}"
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else None
+                            if channel_display:
+                                channel_info = f"\n📡 Source: {channel_display}"
                         except Exception:
                             pass
                         
@@ -3383,18 +3642,12 @@ class TradingBot:
                         result = await self.execute_trade(signal, user_config)
 
                         if result['success']:
-                            # Try to include source channel name if available
+                            # Use consistent channel name for success notification
                             source_info = ""
                             try:
-                                ch_name = None
-                                if hasattr(event, 'chat') and event.chat:
-                                    ch_name = getattr(event.chat, 'title', None)
-                                if hasattr(event.message, 'forward') and event.message.forward and getattr(event.message.forward, 'chat', None):
-                                    ch_name = getattr(event.message.forward.chat, 'title', ch_name)
-                                if ch_name:
-                                    source_info = f"\n📡 Source: {ch_name}"
-                                elif matching_channels:
-                                    source_info = f"\n📡 Source ID: {list(matching_channels)[0]}"
+                                channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else None
+                                if channel_display:
+                                    source_info = f"\n📡 From: {channel_display}"
                             except Exception:
                                 pass
 
@@ -3424,10 +3677,13 @@ class TradingBot:
                             notification += f"\n\n🎉 Position is LIVE!"
 
                         else:
+                            # Get channel name for failed trade notification
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else "Unknown"
                             notification = f"""❌ <b>TRADE EXECUTION FAILED</b>
 
 💰 Symbol: {signal.symbol}
 📈 Direction: {signal.trade_type}
+📡 From: {channel_display}
 🚨 Error: {result['error']}
 ⏰ Time: {datetime.now().strftime('%H:%M:%S')}"""
 
@@ -3441,8 +3697,8 @@ class TradingBot:
                         )
 
                 except Exception as e:
-                    logger.error(f"Message handler error: {e}")
-                    logger.error(traceback.format_exc())
+                    logger.error(f"❌ Message handler error: {e}")
+                    logger.error(f"❌ Message handler error details: {traceback.format_exc()}")
 
             if not telethon_client.is_connected():
                 await telethon_client.connect()
@@ -3471,7 +3727,8 @@ class TradingBot:
             return True
 
         except Exception as e:
-            logger.error(f"Start monitoring error: {e}")
+            logger.error(f"❌ Start monitoring error: {e}")
+            logger.error(f"❌ Start monitoring error details: {traceback.format_exc()}")
             return False
     
     async def _run_telethon_client(self, user_id: int):
@@ -3563,11 +3820,19 @@ class TradingBot:
                             logger.debug(f"🔎 Checking channel {channel_id_str} for new messages...")
                             
                             # Get entity first to avoid ChatIdInvalidError
+                            # Use PeerChannel for proper channel/megagroup handling
                             try:
-                                entity = await telethon_client.get_entity(channel_id)
+                                from telethon.tl.types import PeerChannel
+                                # For channels/megagroups, use PeerChannel with positive ID
+                                peer = PeerChannel(abs(channel_id))
+                                entity = await telethon_client.get_entity(peer)
                             except Exception as entity_error:
-                                logger.warning(f"⚠️ Could not get entity for channel {channel_id_str}: {entity_error}")
-                                continue
+                                # Fallback to direct int if PeerChannel fails
+                                try:
+                                    entity = await telethon_client.get_entity(channel_id)
+                                except Exception as e2:
+                                    logger.warning(f"⚠️ Could not get entity for channel {channel_id_str}: {entity_error}, fallback also failed: {e2}")
+                                    continue
                             
                             # Get the latest message from this channel
                             messages = await telethon_client.get_messages(entity, limit=1)
@@ -3583,10 +3848,13 @@ class TradingBot:
                             
                             # Initialize last_message_ids for this channel if needed
                             if channel_id_str not in last_message_ids:
+                                # Initialize with current msg_id to skip existing messages
+                                # Only process NEW messages that arrive AFTER bot startup
                                 last_message_ids[channel_id_str] = msg_id
-                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, last ID: {msg_id}")
+                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, starting from message ID: {msg_id}")
                                 logger.info(f"📝 Latest message preview: {latest_msg.message[:100] if latest_msg.message else '(no text)'}")
-                                continue
+                                logger.info(f"⏭️ Skipping existing messages, will only process new messages from now on")
+                                continue  # Skip to next channel, don't process existing messages
                             
                             # Check if this is a new message
                             if msg_id > last_message_ids[channel_id_str]:
@@ -3625,15 +3893,15 @@ class TradingBot:
                     await asyncio.sleep(5)
                     
                 except Exception as e:
-                    logger.error(f"Error in message polling loop for user {user_id}: {e}")
-                    logger.error(traceback.format_exc())
+                    logger.error(f"❌ Error in message polling loop for user {user_id}: {e}")
+                    logger.error(f"❌ Message polling loop error: {traceback.format_exc()}")
                     await asyncio.sleep(10)
             
             logger.info(f"🛑 Message polling stopped for user {user_id}")
             
         except Exception as e:
-            logger.error(f"Fatal error in message polling: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Fatal error in message polling: {e}")
+            logger.error(f"❌ Message polling fatal error: {traceback.format_exc()}")
     
     async def _handle_new_message(self, message, channel_id: str, user_id: int):
         """Handle a new message from a monitored channel"""
@@ -3678,16 +3946,8 @@ class TradingBot:
             logger.info(f"📨 [_handle_new_message] Processing message from channel {channel_id}")
             logger.info(f"📨 [_handle_new_message] Message text: {message_text[:200]}")
             
-            # Get channel name for display
-            channel_name = "Unknown Channel"
-            try:
-                telethon_client = self.user_monitoring_clients.get(user_id)
-                if telethon_client and channel_id:
-                    entity = await telethon_client.get_entity(int(channel_id))
-                    channel_name = getattr(entity, 'title', f'Channel {channel_id}')
-            except Exception as e:
-                logger.debug(f"Could not get channel name for {channel_id}: {e}")
-                channel_name = f"Channel {channel_id}" if channel_id else "Unknown Channel"
+            # Get channel name for display using cached helper method
+            channel_name = await self.get_channel_display_name(channel_id, user_id)
             
             # Send notification about received message
             if bot_instance:
@@ -3715,11 +3975,13 @@ class TradingBot:
                 current_account = self.get_current_account(user_id)
                 if current_account and not self.account_monitoring_status.get(current_account.account_id, False):
                     logger.warning(f"⏸️ Account {current_account.account_name} received signal but monitoring is not active - skipping trade")
+                    logger.warning(f"⏸️ Current monitoring status: {dict(self.account_monitoring_status)}")
+                    logger.info(f"ℹ️ Note: Trades execute in background regardless of user's current menu location")
                     if bot_instance:
                         try:
                             await bot_instance.send_message(
                                 chat_id=user_id,
-                                text=f"⏸️ <b>Signal Received</b>\n\n💰 {signal.symbol} {signal.trade_type}\n\n⚠️ Account <b>{current_account.account_name}</b> is not monitoring.\nTrade skipped.\n\nUse '🚀 Start' to enable trading for this account.",
+                                text=f"⏸️ <b>Signal Received</b>\n\n💰 {signal.symbol} {signal.trade_type}\n\n⚠️ Account <b>{current_account.account_name}</b> is not monitoring.\nTrade skipped.\n\nUse '🚀 Start' to enable trading for this account.\n\n💡 Tip: Once started, trades execute automatically from anywhere in the bot!",
                                 parse_mode='HTML'
                             )
                         except Exception as e:
@@ -3729,14 +3991,12 @@ class TradingBot:
                 settings_source = "Signal" if config.use_signal_settings else "Bot"
                 if bot_instance:
                     try:
-                        # Try to get channel name
+                        # Get consistent channel name using the cache
                         channel_info = ""
                         try:
-                            # Get channel name from the message context
-                            if hasattr(message, 'chat') and message.chat:
-                                channel_name = getattr(message.chat, 'title', None)
-                                if channel_name:
-                                    channel_info = f"\n📡 Source: {channel_name}"
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else None
+                            if channel_display:
+                                channel_info = f"\n📡 Source: {channel_display}"
                         except Exception:
                             pass
                         
@@ -3757,10 +4017,13 @@ class TradingBot:
                 if bot_instance:
                     try:
                         if result.get('success'):
+                            # Get channel name for success notification
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else "Unknown"
                             notification = f"""✅ <b>TRADE EXECUTED!</b>
 
 💰 Symbol: {result['symbol']}
 📈 Direction: {signal.trade_type}
+📡 From: {channel_display}
 🆔 Order ID: {result['order_id']}
 📦 Quantity: {result['quantity']}
 💲 Entry: {result['price']}
@@ -3783,10 +4046,13 @@ class TradingBot:
                             notification += f"\n\n🎉 Position is LIVE!"
 
                         else:
+                            # Get channel name for failed trade notification
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else "Unknown"
                             notification = f"""❌ <b>TRADE EXECUTION FAILED</b>
 
 💰 Symbol: {signal.symbol}
 📈 Direction: {signal.trade_type}
+📡 From: {channel_display}
 🚨 Error: {result.get('error', 'Unknown error')}
 ⏰ Time: {datetime.now().strftime('%H:%M:%S')}"""
 
@@ -3884,6 +4150,7 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"↩️ Trailing Callback: {config.trailing_callback_percent}%", callback_data="set_trailing_callback")],
         [InlineKeyboardButton(trade_amount_text, callback_data="toggle_trade_amount_mode")],
         [InlineKeyboardButton(channels_text, callback_data="manage_channels")],
+        [InlineKeyboardButton("📋 History in account", callback_data="account_history")],
         [InlineKeyboardButton("✏️ Rename Account", callback_data="rename_account"), InlineKeyboardButton("🗑️ Delete Account", callback_data="delete_account")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
@@ -4002,10 +4269,10 @@ def build_account_page():
 
 def build_settings_menu():
     return ReplyKeyboardMarkup([
-        ["⚡ Leverage", "💰 Risk %", "💵 Trade Amount"],
-        ["🎯 Take Profits", "🛡️ Stop Loss", "📉 Trailing"],
-        ["⏰ Cooldown", "📡 Channels", "🔧 Advanced"],
-        ["🗑️ Delete Account", "✏️ Rename Account"],
+        ["🔮 Trading Type", "⚡ Leverage", "💰 Risk %"],
+        ["💵 Trade Amount", "🎯 Take Profits", "🛡️ Stop Loss"],
+        ["📉 Trailing", "⏰ Cooldown", "📡 Channels"],
+        ["🔧 Advanced", "✏️ Rename Account", "🗑️ Delete Account"],
         ["🔙 Account"]
     ], resize_keyboard=True)
 
@@ -4202,7 +4469,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if acc.account_id in trading_bot.account_exchanges:
                     exchange = trading_bot.account_exchanges[acc.account_id]
-                    bal = exchange.fetch_balance()
+                    acc_trading_type = getattr(acc, 'trading_type', 'swap')
+                    bal = exchange.fetch_balance({'type': acc_trading_type})
                     balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
             except Exception as e:
                 logger.debug(f"Could not fetch balance for {acc.account_name}: {e}")
@@ -4295,12 +4563,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "📋 All History":
-        # Show trade history from all accounts
+        # Show trade history from all accounts (only closed/inactive trades)
         accs = trading_bot.enhanced_db.get_all_accounts()
         all_trades = []
         
         for acc in accs:
-            trades = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=20)
+            trades = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=20, only_closed=True)
             for trade in trades:
                 all_trades.append((acc.account_name, trade))
         
@@ -4417,7 +4685,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if acc.account_id in trading_bot.account_exchanges:
                     exchange = trading_bot.account_exchanges[acc.account_id]
-                    bal = exchange.fetch_balance()
+                    acc_trading_type = getattr(acc, 'trading_type', 'swap')
+                    bal = exchange.fetch_balance({'type': acc_trading_type})
                     balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
             except Exception as e:
                 logger.warning(f"⚠️ Failed to fetch balance for account {acc.account_name}: {e}")
@@ -4498,66 +4767,177 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_stop_trading(update, context)
 
     elif text == "📋 History":
-        # Show trade history for current account only
-        current_account = trading_bot.get_current_account(user_id)
-        
-        if not current_account:
-            await update.message.reply_text(
-                "❌ <b>No Account Selected</b>\n\n"
-                "Please select an account first from the Accounts menu.",
-                parse_mode='HTML',
-                reply_markup=build_main_menu()
+        # COMPLETELY REWRITTEN: Show trade history for current account
+        try:
+            # Step 1: Get current account with multiple fallback methods
+            current_account = None
+            account_id = None
+            account_name = None
+            
+            # Method 1: Try from trading_bot's current_accounts dict
+            try:
+                current_account = trading_bot.get_current_account(user_id)
+                if current_account:
+                    account_id = current_account.account_id
+                    account_name = current_account.account_name
+            except Exception as e:
+                logger.warning(f"Failed to get current account from trading_bot: {e}")
+            
+            # Method 2: Try from context.user_data
+            if not current_account and 'current_account_id' in context.user_data:
+                account_id = context.user_data.get('current_account_id')
+                account_name = context.user_data.get('current_account_name', 'Account')
+                try:
+                    all_accounts = trading_bot.enhanced_db.get_all_accounts()
+                    current_account = next((a for a in all_accounts if a.account_id == account_id), None)
+                    if current_account:
+                        trading_bot.set_current_account(user_id, account_id)
+                except Exception as e:
+                    logger.warning(f"Failed to load account from user_data: {e}")
+            
+            # Step 2: Validate we have an account
+            if not current_account or not account_id:
+                await update.message.reply_text(
+                    "❌ <b>No Account Selected</b>\n\n"
+                    "Please select an account first from the Accounts menu.\n\n"
+                    "Go to: 🔙 Main Menu → 🔑 Accounts → Select your account",
+                    parse_mode='HTML',
+                    reply_markup=build_main_menu()
+                )
+                return
+            
+            # Step 3: Fetch trade history
+            trade_history = trading_bot.enhanced_db.get_trade_history(
+                account_id, 
+                limit=50, 
+                only_closed=True
             )
-            return
-        
-        trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
-        
-        if not trade_history:
+            
+            # Step 4: Handle empty history
+            if not trade_history:
+                await update.message.reply_text(
+                    f"📋 <b>No Trade History</b>\n\n"
+                    f"Account: <b>{account_name}</b>\n\n"
+                    f"No closed trades found for this account.\n"
+                    f"Start trading to see your history here!",
+                    parse_mode='HTML',
+                    reply_markup=build_account_page()
+                )
+                return
+            
+            # Step 5: Build comprehensive history display
+            # Calculate overall statistics
+            total_trades = len(trade_history)
+            winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+            losing_trades = total_trades - winning_trades
+            total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+            # Resolve channel names
+            channel_name_map = {}
+            unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
+            for ch_id in unique_channels:
+                try:
+                    channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
+                except Exception as e:
+                    logger.debug(f"Could not resolve channel name for {ch_id}: {e}")
+                    channel_name_map[ch_id] = f"Channel {ch_id[:8]}..."
+            
+            # Build per-channel statistics
+            channel_stats = {}
+            for trade in trade_history:
+                ch_id = trade.channel_id or 'unknown'
+                if ch_id not in channel_stats:
+                    channel_stats[ch_id] = {
+                        'count': 0,
+                        'wins': 0,
+                        'losses': 0,
+                        'pnl': 0.0
+                    }
+                
+                channel_stats[ch_id]['count'] += 1
+                pnl_value = float(trade.pnl) if trade.pnl else 0
+                channel_stats[ch_id]['pnl'] += pnl_value
+                
+                if pnl_value > 0:
+                    channel_stats[ch_id]['wins'] += 1
+                else:
+                    channel_stats[ch_id]['losses'] += 1
+            
+            # Build message header with summary
+            text = f"📋 <b>Trade History</b>\n"
+            text += f"Account: <b>{account_name}</b>\n\n"
+            
+            text += f"📊 <b>Summary Statistics:</b>\n"
+            text += f"Total Trades: <b>{total_trades}</b>\n"
+            text += f"✅ Winning: <b>{winning_trades}</b>\n"
+            text += f"❌ Losing: <b>{losing_trades}</b>\n"
+            text += f"📈 Win Rate: <b>{win_rate:.1f}%</b>\n"
+            text += f"💵 Total PnL: <b>{total_pnl:.2f} USDT</b>\n\n"
+            
+            # Display individual trades (most recent first)
+            text += f"📝 <b>Recent Trades (Last {min(20, total_trades)}):</b>\n\n"
+            for i, trade in enumerate(trade_history[:20]):
+                # Determine emoji based on PnL
+                pnl_value = float(trade.pnl) if trade.pnl else 0
+                if pnl_value > 0:
+                    status_emoji = "✅"
+                elif pnl_value < 0:
+                    status_emoji = "❌"
+                else:
+                    status_emoji = "⚪"
+                
+                # Get channel name
+                ch_id = trade.channel_id
+                ch_display = ""
+                if ch_id and ch_id in channel_name_map:
+                    ch_display = f"\n  📡 {channel_name_map[ch_id]}"
+                
+                # Format trade entry
+                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
+                text += f"  Entry: {trade.entry_price}"
+                if trade.exit_price:
+                    text += f" → Exit: {trade.exit_price}"
+                text += f"\n  PnL: <b>{pnl_value:.2f} USDT</b>"
+                text += ch_display
+                
+                # Add timestamp
+                if trade.entry_time:
+                    time_str = trade.entry_time[:16] if len(trade.entry_time) > 16 else trade.entry_time
+                    text += f"\n  🕐 {time_str}"
+                
+                text += "\n\n"
+            
+            # Add per-channel analytics
+            if channel_stats and len(channel_stats) > 1:
+                text += f"📡 <b>Per-Channel Performance:</b>\n"
+                for ch_id, stats in sorted(channel_stats.items(), key=lambda x: x[1]['pnl'], reverse=True):
+                    ch_name = channel_name_map.get(ch_id, 'Unknown') if ch_id != 'unknown' else 'Unknown Channel'
+                    ch_wr = (stats['wins'] / stats['count'] * 100) if stats['count'] > 0 else 0
+                    text += f"• {ch_name}\n"
+                    text += f"  Trades: {stats['count']} | WR: {ch_wr:.1f}% | PnL: {stats['pnl']:.2f}\n"
+            
+            # Send the message
             await update.message.reply_text(
-                f"📋 <b>No Trade History</b>\n\n"
-                f"Account: {current_account.account_name}\n\n"
-                f"You haven't made any trades yet on this account.",
+                text, 
+                parse_mode='HTML', 
+                reply_markup=build_account_page()
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ CRITICAL ERROR in History button handler: {e}")
+            logger.error(traceback.format_exc())
+            await update.message.reply_text(
+                "❌ <b>Error Loading History</b>\n\n"
+                f"Something went wrong while loading your trade history.\n\n"
+                f"Error: <code>{str(e)[:100]}</code>\n\n"
+                "Please try again. If the problem persists:\n"
+                "1. Go back to Main Menu\n"
+                "2. Select your account again\n"
+                "3. Try History button again",
                 parse_mode='HTML',
                 reply_markup=build_account_page()
             )
-        else:
-            # Aggregate per-channel stats
-            channel_stats = {}
-            total_trades = len(trade_history)
-            wins = 0
-            for t in trade_history:
-                ch = t.channel_id or 'unknown'
-                cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
-                cs['count'] += 1
-                try:
-                    cs['pnl'] += float(t.pnl or 0)
-                    if float(t.pnl or 0) > 0:
-                        cs['wins'] += 1
-                        wins += 1
-                except Exception:
-                    pass
-
-            text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
-            text += f"Recent trades ({len(trade_history)}):\n\n"
-            for trade in trade_history:
-                status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
-                ch = trade.channel_id or ''
-                ch_line = f" | Ch: {ch}" if ch else ""
-                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
-                text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
-                text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
-
-            # Append per-channel analytics
-            if channel_stats:
-                text += "📡 <b>Per-Channel Analytics</b>\n"
-                for ch, cs in channel_stats.items():
-                    wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
-                    text += f"- {ch}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
-                if total_trades:
-                    overall_wr = wins/total_trades*100
-                    text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
-
-            await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "📈 Trades" and 'current_account_id' in context.user_data:
         # Show active trades for current account only
@@ -4611,7 +4991,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Calculate statistics
         total_trades = len(trade_history)
         winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
-        losing_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) < 0)
+        # Count all non-winning trades as losing (including break-even trades)
+        losing_trades = total_trades - winning_trades
         total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         
@@ -4725,6 +5106,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📉 Trailing stop settings", parse_mode='HTML')
     
     # New comprehensive settings handlers
+    elif text == "🔮 Trading Type":
+        await handle_trading_type_setting(update, context)
+    
     elif text == "⚡ Leverage":
         await handle_leverage_setting(update, context)
     
@@ -5013,6 +5397,24 @@ async def handle_trade_history(update: Update, context: ContextTypes.DEFAULT_TYP
             status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
             text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
             text += f"Entry: {trade.entry_price} | PnL: {trade.pnl}\n"
+            
+            # Get and display channel name
+            if trade.channel_id:
+                try:
+                    telethon_client = trading_bot.user_monitoring_clients.get(user_id)
+                    if telethon_client:
+                        try:
+                            entity = await telethon_client.get_entity(int(trade.channel_id))
+                            channel_name = getattr(entity, 'title', f'Channel {trade.channel_id}')
+                            text += f"📡 Channel: {channel_name}\n"
+                        except Exception:
+                            text += f"📡 Channel: {trade.channel_id}\n"
+                    else:
+                        text += f"📡 Channel: {trade.channel_id}\n"
+                except Exception as e:
+                    logger.debug(f"Could not get channel name for {trade.channel_id}: {e}")
+                    text += f"📡 Channel: {trade.channel_id}\n"
+            
             text += f"Time: {trade.entry_time[:16]}\n\n"
         
         await update.message.reply_text(text, parse_mode='HTML')
@@ -5036,6 +5438,8 @@ async def handle_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Trading Configuration
     msg += f"📊 <b>Trading Configuration:</b>\n"
+    trading_type_display = "🔮 Futures/Swap" if getattr(current_account, 'trading_type', 'swap') == 'swap' else "💱 Spot"
+    msg += f"  {trading_type_display}\n"
     msg += f"  ⚡ Leverage: <b>{current_account.leverage}x</b>\n"
     msg += f"  💰 Risk: <b>{current_account.risk_percentage}%</b>\n"
     
@@ -6851,6 +7255,35 @@ Confidence: {signal.confidence:.2f}""")
 
 # ================== COMPREHENSIVE SETTINGS HANDLERS ==================
 
+async def handle_trading_type_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle trading type setting (spot vs futures)"""
+    user_id = update.effective_user.id
+    current_account = trading_bot.get_current_account(user_id)
+    
+    if not current_account:
+        await update.message.reply_text("❌ No account selected", parse_mode='HTML')
+        return
+    
+    current_type = getattr(current_account, 'trading_type', 'swap')
+    current_display = "🔮 Futures/Swap" if current_type == 'swap' else "💱 Spot"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔮 Futures/Swap", callback_data="set_trading_type_swap")],
+        [InlineKeyboardButton("💱 Spot", callback_data="set_trading_type_spot")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_settings")]
+    ])
+    
+    await update.message.reply_text(
+        f"🔮 <b>Trading Type</b>\n\n"
+        f"Current: <b>{current_display}</b>\n\n"
+        f"⚠️ <b>Important:</b> Make sure your BingX API key has the correct permissions:\n"
+        f"• Futures/Swap: Requires <b>Futures Trading</b> permission\n"
+        f"• Spot: Requires <b>Spot Trading</b> permission\n\n"
+        f"Select trading type:",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
 async def handle_leverage_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle leverage setting"""
     user_id = update.effective_user.id
@@ -7139,6 +7572,30 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
         )
         context.user_data['state'] = 'WAIT_COOLDOWN_HOURS'
     
+    elif data == "set_trading_type_swap":
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, trading_type='swap')
+        # Clear cached exchange to force recreation with new type
+        if current_account.account_id in trading_bot.account_exchanges:
+            del trading_bot.account_exchanges[current_account.account_id]
+        await query.edit_message_text(
+            f"✅ <b>Trading Type Updated</b>\n\n"
+            f"Now using: <b>🔮 Futures/Swap</b>\n\n"
+            f"⚠️ Make sure your BingX API key has <b>Futures Trading</b> permission enabled.",
+            parse_mode='HTML'
+        )
+    
+    elif data == "set_trading_type_spot":
+        trading_bot.enhanced_db.update_account_settings(current_account.account_id, trading_type='spot')
+        # Clear cached exchange to force recreation with new type
+        if current_account.account_id in trading_bot.account_exchanges:
+            del trading_bot.account_exchanges[current_account.account_id]
+        await query.edit_message_text(
+            f"✅ <b>Trading Type Updated</b>\n\n"
+            f"Now using: <b>💱 Spot</b>\n\n"
+            f"⚠️ Make sure your BingX API key has <b>Spot Trading</b> permission enabled.",
+            parse_mode='HTML'
+        )
+    
     elif data == "toggle_signal_settings":
         new_value = not current_account.use_signal_settings
         trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_signal_settings=new_value)
@@ -7182,6 +7639,91 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
                     f"Could not delete account. Please try again.",
                     parse_mode='HTML'
                 )
+    
+    elif data == "show_history" or data == "history" or data == "account_history":
+        # Handle inline history button - show trade history for current account (only closed trades)
+        try:
+            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20, only_closed=True)
+            
+            if not trade_history:
+                # Show "no history" message with back button to return to settings
+                back_keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back to Settings", callback_data="back_to_settings")
+                ]])
+                await query.edit_message_text(
+                    f"📋 <b>No Trade History</b>\n\n"
+                    f"Account: {current_account.account_name}\n\n"
+                    f"You haven't made any trades yet on this account.",
+                    parse_mode='HTML',
+                    reply_markup=back_keyboard
+                )
+            else:
+                # Resolve channel names for all channels first
+                channel_name_map = {}
+                unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
+                for ch_id in unique_channels:
+                    try:
+                        channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not resolve channel name for {ch_id}: {e}")
+                        channel_name_map[ch_id] = f"Channel {ch_id}"
+                
+                # Aggregate per-channel stats
+                channel_stats = {}
+                total_trades = len(trade_history)
+                wins = 0
+                for t in trade_history:
+                    ch = t.channel_id or 'unknown'
+                    cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
+                    cs['count'] += 1
+                    try:
+                        cs['pnl'] += float(t.pnl or 0)
+                        if float(t.pnl or 0) > 0:
+                            cs['wins'] += 1
+                            wins += 1
+                    except Exception:
+                        pass
+
+                text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
+                text += f"Recent trades ({len(trade_history)}):\n\n"
+                for trade in trade_history:
+                    status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
+                    ch = trade.channel_id or ''
+                    ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
+                    ch_line = f" | Ch: {ch_name}" if ch_name else ""
+                    text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
+                    text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
+                    text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
+
+                # Append per-channel analytics with resolved names
+                if channel_stats:
+                    text += "📡 <b>Per-Channel Analytics</b>\n"
+                    for ch, cs in channel_stats.items():
+                        ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
+                        wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
+                        text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
+                    if total_trades:
+                        overall_wr = wins/total_trades*100
+                        text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
+
+                # Truncate if too long for inline message
+                if len(text) > 4000:
+                    text = text[:3900] + "\n\n... (truncated)\n\nUse 📋 History button for full history."
+
+                # Add back button to return to settings
+                back_keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back to Settings", callback_data="back_to_settings")
+                ]])
+                await query.edit_message_text(text, parse_mode='HTML', reply_markup=back_keyboard)
+        except Exception as e:
+            logger.error(f"❌ Error in inline history callback: {e}")
+            logger.error(traceback.format_exc())
+            await query.edit_message_text(
+                "❌ <b>Error Loading History</b>\n\n"
+                f"An error occurred while loading trade history: {str(e)}\n\n"
+                "Please try again using the 📋 History button from the main menu.",
+                parse_mode='HTML'
+            )
 
 # ================== TEXT INPUT HANDLERS ==================
 
@@ -7190,11 +7732,14 @@ async def handle_text_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     text = update.message.text.strip()
     state = context.user_data.get('state')
-
-    # If we're not in any settings/editing state, ignore and let main menu handler process
+    
+    # If we are not in a specific input state, delegate to the main menu handler
+    # so normal navigation buttons work without requiring a selected account
     if not state:
+        await handle_main_menu(update, context)
         return
-
+    
+    # From here on, we are in a settings input flow which requires a current account
     current_account = trading_bot.get_current_account(user_id)
     if not current_account:
         await update.message.reply_text("❌ No account selected", parse_mode='HTML')
