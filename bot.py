@@ -3848,12 +3848,13 @@ class TradingBot:
                             
                             # Initialize last_message_ids for this channel if needed
                             if channel_id_str not in last_message_ids:
-                                # Initialize with msg_id - 1 so the current message will be processed
-                                last_message_ids[channel_id_str] = msg_id - 1
-                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, last ID: {msg_id - 1}")
+                                # Initialize with current msg_id to skip existing messages
+                                # Only process NEW messages that arrive AFTER bot startup
+                                last_message_ids[channel_id_str] = msg_id
+                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, starting from message ID: {msg_id}")
                                 logger.info(f"📝 Latest message preview: {latest_msg.message[:100] if latest_msg.message else '(no text)'}")
-                                logger.info(f"🔄 Will process current message (ID: {msg_id}) as first signal")
-                                # Don't continue - let it process the current message
+                                logger.info(f"⏭️ Skipping existing messages, will only process new messages from now on")
+                                continue  # Skip to next channel, don't process existing messages
                             
                             # Check if this is a new message
                             if msg_id > last_message_ids[channel_id_str]:
