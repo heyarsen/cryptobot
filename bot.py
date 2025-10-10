@@ -18,7 +18,6 @@ import sqlite3
 import uuid
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any, Union
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 import os
@@ -33,11 +32,6 @@ import shutil
 import warnings
 from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*CallbackQueryHandler.*per_message.*")
-
-# Now continue with your existing imports
-import asyncio
-import re
-import json
 
 # Import python-telegram-bot
 from telegram import (
@@ -1895,17 +1889,66 @@ class TradingBot:
         
         # Try to resolve from Telethon client
         try:
-            telethon_client = self.user_monitoring_clients.get(user_id)
+            # First try to get the current account's telethon client
+            current_account = self.get_current_account(user_id)
+            telethon_client = None
+            
+            if current_account:
+                telethon_client = self.user_monitoring_clients.get(current_account.account_id)
+            
+            # If no client found for current account, try any account for this user
+            if not telethon_client:
+                accounts = self.enhanced_db.get_all_accounts()
+                for acc in accounts:
+                    if int(acc.user_id or 0) == int(user_id):
+                        telethon_client = self.user_monitoring_clients.get(acc.account_id)
+                        if telethon_client:
+                            break
+            
             if telethon_client and channel_id:
-                entity = await telethon_client.get_entity(int(channel_id))
-                display_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or f'Channel {channel_id}'
-                # Cache the result
-                self.channel_name_cache[channel_id] = display_name
-                return display_name
+                try:
+                    # Handle special case for "Test Private" - saved messages or private chats
+                    channel_id_int = int(channel_id)
+                    
+                    # Check if it's a saved messages ID (user's own ID)
+                    if channel_id_int == user_id:
+                        display_name = "Test Private"
+                        self.channel_name_cache[channel_id] = display_name
+                        return display_name
+                    
+                    # Try to get entity normally
+                    entity = await telethon_client.get_entity(channel_id_int)
+                    
+                    # Check different entity types
+                    if hasattr(entity, 'title') and entity.title:
+                        display_name = entity.title
+                    elif hasattr(entity, 'first_name') and entity.first_name:
+                        # For private chats/users
+                        display_name = "Test Private"
+                    elif hasattr(entity, 'username') and entity.username:
+                        display_name = entity.username
+                    else:
+                        display_name = f'Channel {channel_id}'
+                    
+                    # Cache the result
+                    self.channel_name_cache[channel_id] = display_name
+                    return display_name
+                except ValueError:
+                    # Invalid channel ID format, might be a test message
+                    logger.debug(f"Invalid channel ID format: {channel_id}")
+                except Exception as e:
+                    logger.debug(f"Could not resolve channel name for {channel_id}: {e}")
         except Exception as e:
-            logger.debug(f"Could not resolve channel name for {channel_id}: {e}")
+            logger.debug(f"Error in get_channel_display_name: {e}")
         
-        # Fallback to channel ID
+        # Fallback: check if this looks like a test/private message ID
+        try:
+            if channel_id and int(channel_id) == user_id:
+                return "Test Private"
+        except:
+            pass
+        
+        # Final fallback to channel ID
         fallback_name = f"Channel {channel_id}" if channel_id else "Unknown Channel"
         self.channel_name_cache[channel_id] = fallback_name
         return fallback_name
@@ -2868,9 +2911,10 @@ class TradingBot:
                 
                 # Validate extremely small but valid prices
                 if 0 < current_price < 0.00001:
-                    logger.warning(f"⚠️ Very small price detected for {bingx_symbol}: {current_price:.12f} - verify this is correct")
+                    logger.info(f"✅ Very small price detected for {bingx_symbol}: {current_price:.12f} - meme coin trading enabled")
             except Exception as e:
                 logger.error(f"❌ Error fetching ticker for {bingx_symbol}: {e}")
+                logger.error(f"❌ Ticker fetch error details: {traceback.format_exc()}")
                 price_str = str(signal.entry_price or '0')
                 current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
                 logger.info(f"📊 Using signal entry price as fallback: {current_price}")
@@ -2893,7 +2937,7 @@ class TradingBot:
             
             # Validate extremely small but valid entry prices
             if 0 < entry_price < 0.00001:
-                logger.warning(f"⚠️ Very small entry price for {signal.symbol}: {entry_price:.12f}")
+                logger.info(f"✅ Very small entry price for {signal.symbol}: {entry_price:.12f} - meme coin trading")
             
             # If we still don't have a valid price, try to fetch it again with different methods
             if not entry_price or entry_price <= 0:
@@ -2935,18 +2979,20 @@ class TradingBot:
                             
                 except Exception as e:
                     logger.error(f"❌ Failed to fetch alternative price: {e}")
+                    logger.error(f"❌ Alternative price fetch error: {traceback.format_exc()}")
 
             logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price} (full precision: {entry_price:.12f})")
             
             # Additional validation for very small prices (meme coins with many zeros)
             if entry_price > 0 and entry_price < 0.00000001:
-                logger.warning(f"⚠️ Detected very small price ({entry_price:.12f}) for {signal.symbol}")
-                logger.info(f"📊 This appears to be a meme coin with many decimal places")
+                logger.info(f"✅ Detected very small price ({entry_price:.12f}) for {signal.symbol}")
+                logger.info(f"📊 This appears to be a meme coin with many decimal places - proceeding with trade")
                 # Allow trading even with very small prices - DO NOT reject
             
-            # Final price validation - only reject if truly zero or invalid
+            # Final price validation - only reject if truly zero, None, or invalid
             # IMPORTANT: Allow very small prices like 0.0000004 (meme coins)
-            if not entry_price or entry_price <= 0:
+            # Use a more robust check that handles float precision issues
+            if entry_price is None or (isinstance(entry_price, (int, float)) and entry_price <= 0):
                 error_msg = (
                     f"❌ Unable to determine valid price for {signal.symbol} ({bingx_symbol}). "
                     f"Please verify:\n"
@@ -3556,8 +3602,8 @@ class TradingBot:
                         )
 
                 except Exception as e:
-                    logger.error(f"Message handler error: {e}")
-                    logger.error(traceback.format_exc())
+                    logger.error(f"❌ Message handler error: {e}")
+                    logger.error(f"❌ Message handler error details: {traceback.format_exc()}")
 
             if not telethon_client.is_connected():
                 await telethon_client.connect()
@@ -3586,7 +3632,8 @@ class TradingBot:
             return True
 
         except Exception as e:
-            logger.error(f"Start monitoring error: {e}")
+            logger.error(f"❌ Start monitoring error: {e}")
+            logger.error(f"❌ Start monitoring error details: {traceback.format_exc()}")
             return False
     
     async def _run_telethon_client(self, user_id: int):
@@ -3740,15 +3787,15 @@ class TradingBot:
                     await asyncio.sleep(5)
                     
                 except Exception as e:
-                    logger.error(f"Error in message polling loop for user {user_id}: {e}")
-                    logger.error(traceback.format_exc())
+                    logger.error(f"❌ Error in message polling loop for user {user_id}: {e}")
+                    logger.error(f"❌ Message polling loop error: {traceback.format_exc()}")
                     await asyncio.sleep(10)
             
             logger.info(f"🛑 Message polling stopped for user {user_id}")
             
         except Exception as e:
-            logger.error(f"Fatal error in message polling: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Fatal error in message polling: {e}")
+            logger.error(f"❌ Message polling fatal error: {traceback.format_exc()}")
     
     async def _handle_new_message(self, message, channel_id: str, user_id: int):
         """Handle a new message from a monitored channel"""
@@ -7347,6 +7394,82 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
                     f"Could not delete account. Please try again.",
                     parse_mode='HTML'
                 )
+    
+    elif data == "show_history" or data == "history" or data == "account_history":
+        # Handle inline history button - show trade history for current account
+        try:
+            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
+            
+            if not trade_history:
+                await query.edit_message_text(
+                    f"📋 <b>No Trade History</b>\n\n"
+                    f"Account: {current_account.account_name}\n\n"
+                    f"You haven't made any trades yet on this account.",
+                    parse_mode='HTML'
+                )
+            else:
+                # Resolve channel names for all channels first
+                channel_name_map = {}
+                unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
+                for ch_id in unique_channels:
+                    try:
+                        channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not resolve channel name for {ch_id}: {e}")
+                        channel_name_map[ch_id] = f"Channel {ch_id}"
+                
+                # Aggregate per-channel stats
+                channel_stats = {}
+                total_trades = len(trade_history)
+                wins = 0
+                for t in trade_history:
+                    ch = t.channel_id or 'unknown'
+                    cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
+                    cs['count'] += 1
+                    try:
+                        cs['pnl'] += float(t.pnl or 0)
+                        if float(t.pnl or 0) > 0:
+                            cs['wins'] += 1
+                            wins += 1
+                    except Exception:
+                        pass
+
+                text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
+                text += f"Recent trades ({len(trade_history)}):\n\n"
+                for trade in trade_history:
+                    status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
+                    ch = trade.channel_id or ''
+                    ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
+                    ch_line = f" | Ch: {ch_name}" if ch_name else ""
+                    text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
+                    text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
+                    text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
+
+                # Append per-channel analytics with resolved names
+                if channel_stats:
+                    text += "📡 <b>Per-Channel Analytics</b>\n"
+                    for ch, cs in channel_stats.items():
+                        ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
+                        wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
+                        text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
+                    if total_trades:
+                        overall_wr = wins/total_trades*100
+                        text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
+
+                # Truncate if too long for inline message
+                if len(text) > 4000:
+                    text = text[:3900] + "\n\n... (truncated)\n\nUse 📋 History button for full history."
+
+                await query.edit_message_text(text, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"❌ Error in inline history callback: {e}")
+            logger.error(traceback.format_exc())
+            await query.edit_message_text(
+                "❌ <b>Error Loading History</b>\n\n"
+                f"An error occurred while loading trade history: {str(e)}\n\n"
+                "Please try again using the 📋 History button from the main menu.",
+                parse_mode='HTML'
+            )
 
 # ================== TEXT INPUT HANDLERS ==================
 
