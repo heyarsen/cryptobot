@@ -2938,7 +2938,14 @@ class TradingBot:
 
             logger.info(f"💲 Final entry price for {signal.symbol}: {entry_price} (full precision: {entry_price:.12f})")
             
-            # Final price validation with detailed error messages
+            # Additional validation for very small prices (meme coins with many zeros)
+            if entry_price > 0 and entry_price < 0.00000001:
+                logger.warning(f"⚠️ Detected very small price ({entry_price:.12f}) for {signal.symbol}")
+                logger.info(f"📊 This appears to be a meme coin with many decimal places")
+                # Allow trading even with very small prices - DO NOT reject
+            
+            # Final price validation - only reject if truly zero or invalid
+            # IMPORTANT: Allow very small prices like 0.0000004 (meme coins)
             if not entry_price or entry_price <= 0:
                 error_msg = (
                     f"❌ Unable to determine valid price for {signal.symbol} ({bingx_symbol}). "
@@ -2949,15 +2956,6 @@ class TradingBot:
                 )
                 logger.error(error_msg)
                 return {'success': False, 'error': f'Invalid or zero price for {signal.symbol}. Symbol may not be supported or not trading.'}
-            
-            # Additional validation for very small prices (meme coins with many zeros)
-            if entry_price > 0 and entry_price < 0.00000001:
-                logger.warning(f"⚠️ Detected very small price ({entry_price:.12f}) for {signal.symbol}")
-                logger.info(f"📊 This appears to be a meme coin with many decimal places")
-                # Verify precision was maintained
-                if entry_price <= 0:
-                    logger.error(f"❌ Price became invalid after conversion: {entry_price}")
-                    return {'success': False, 'error': f'Price precision lost for {signal.symbol}. Original price too small to process safely.'}
             
             # Calculate trade amount based on user preference
             if config.use_fixed_usdt_amount:
@@ -3165,6 +3163,9 @@ class TradingBot:
                     cumulative_assigned = 0.0
                     total_levels = len(requested_quantities)
                     step_size = precision_info['step_size']
+                    
+                    # IMPROVED: Ensure ALL configured TP levels are created
+                    # First pass: try to distribute according to percentages
                     for i, requested in enumerate(requested_quantities):
                         remaining_levels = total_levels - i
                         remaining_capacity = max(quantity - cumulative_assigned, 0.0)
@@ -3172,23 +3173,52 @@ class TradingBot:
                         min_reserved_for_rest = step_size * max(remaining_levels - 1, 0)
                         alloc = min(requested, max(remaining_capacity - min_reserved_for_rest, 0.0))
                         each_qty = self.round_quantity(alloc, step_size, precision_info['qty_precision'])
+                        
+                        # If quantity is too small but we still have levels to create, use minimum
                         if each_qty < step_size:
-                            # Skip this level unless it's the last one
-                            if i != total_levels - 1:
-                                continue
-                            # Last level gets the remainder
-                            each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
+                            if i == total_levels - 1:
+                                # Last level gets all remaining
+                                each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
+                            else:
+                                # Use minimum step_size to ensure this level is created
+                                each_qty = step_size
+                        
                         if cumulative_assigned + each_qty > quantity:
                             each_qty = self.round_quantity(max(quantity - cumulative_assigned, 0.0), step_size, precision_info['qty_precision'])
-                        if each_qty < step_size:
+                        
+                        # Only skip if quantity is truly 0 or negative
+                        if each_qty <= 0:
                             continue
+                            
                         rounded_quantities.append(each_qty)
                         cumulative_assigned += each_qty
                         if cumulative_assigned >= quantity - (step_size * 1e-9):
                             break
+                    
+                    # If we don't have enough TPs, redistribute more evenly
+                    if len(rounded_quantities) < len(tp_targets):
+                        logger.warning(f"⚠️ Only {len(rounded_quantities)} TPs created, but {len(tp_targets)} configured. Redistributing...")
+                        # Redistribute quantity evenly across all TP levels
+                        rounded_quantities = []
+                        qty_per_level = quantity / len(tp_targets)
+                        cumulative_assigned = 0.0
+                        for i in range(len(tp_targets)):
+                            if i == len(tp_targets) - 1:
+                                # Last TP gets remainder
+                                each_qty = self.round_quantity(quantity - cumulative_assigned, step_size, precision_info['qty_precision'])
+                            else:
+                                each_qty = self.round_quantity(qty_per_level, step_size, precision_info['qty_precision'])
+                                # Ensure minimum quantity
+                                if each_qty < step_size:
+                                    each_qty = step_size
+                            
+                            if each_qty > 0:
+                                rounded_quantities.append(each_qty)
+                                cumulative_assigned += each_qty
 
                     # Align number of TP targets with actual rounded quantities
                     effective_tp_pairs = list(zip(tp_targets[:len(rounded_quantities)], rounded_quantities))
+                    logger.info(f"🎯 Creating {len(effective_tp_pairs)} take profit orders")
 
                     for tp, each_qty in effective_tp_pairs:
                         rounded_tp = self.round_price(tp, precision_info['tick_size'], precision_info['price_precision'])
@@ -3506,10 +3536,13 @@ class TradingBot:
                             notification += f"\n\n🎉 Position is LIVE!"
 
                         else:
+                            # Get channel name for failed trade notification
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else "Unknown"
                             notification = f"""❌ <b>TRADE EXECUTION FAILED</b>
 
 💰 Symbol: {signal.symbol}
 📈 Direction: {signal.trade_type}
+📡 From: {channel_display}
 🚨 Error: {result['error']}
 ⏰ Time: {datetime.now().strftime('%H:%M:%S')}"""
 
@@ -3833,10 +3866,13 @@ class TradingBot:
                 if bot_instance:
                     try:
                         if result.get('success'):
+                            # Get channel name for success notification
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else "Unknown"
                             notification = f"""✅ <b>TRADE EXECUTED!</b>
 
 💰 Symbol: {result['symbol']}
 📈 Direction: {signal.trade_type}
+📡 From: {channel_display}
 🆔 Order ID: {result['order_id']}
 📦 Quantity: {result['quantity']}
 💲 Entry: {result['price']}
@@ -3859,10 +3895,13 @@ class TradingBot:
                             notification += f"\n\n🎉 Position is LIVE!"
 
                         else:
+                            # Get channel name for failed trade notification
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else "Unknown"
                             notification = f"""❌ <b>TRADE EXECUTION FAILED</b>
 
 💰 Symbol: {signal.symbol}
 📈 Direction: {signal.trade_type}
+📡 From: {channel_display}
 🚨 Error: {result.get('error', 'Unknown error')}
 ⏰ Time: {datetime.now().strftime('%H:%M:%S')}"""
 
@@ -4575,82 +4614,97 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "📋 History":
         # Show trade history for current account only
-        current_account = trading_bot.get_current_account(user_id)
-        
-        # Fallback: check context.user_data if get_current_account returns None
-        if not current_account and 'current_account_id' in context.user_data:
-            account_id = context.user_data['current_account_id']
-            accounts = trading_bot.enhanced_db.get_all_accounts()
-            current_account = next((a for a in accounts if a.account_id == account_id), None)
-            if current_account:
-                # Sync the current_accounts dict
-                trading_bot.set_current_account(user_id, account_id)
-        
-        if not current_account:
+        try:
+            current_account = trading_bot.get_current_account(user_id)
+            
+            # Fallback: check context.user_data if get_current_account returns None
+            if not current_account and 'current_account_id' in context.user_data:
+                account_id = context.user_data['current_account_id']
+                accounts = trading_bot.enhanced_db.get_all_accounts()
+                current_account = next((a for a in accounts if a.account_id == account_id), None)
+                if current_account:
+                    # Sync the current_accounts dict
+                    trading_bot.set_current_account(user_id, account_id)
+            
+            if not current_account:
+                await update.message.reply_text(
+                    "❌ <b>No Account Selected</b>\n\n"
+                    "Please select an account first from the Accounts menu.",
+                    parse_mode='HTML',
+                    reply_markup=build_main_menu()
+                )
+                return
+            
+            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
+            
+            if not trade_history:
+                await update.message.reply_text(
+                    f"📋 <b>No Trade History</b>\n\n"
+                    f"Account: {current_account.account_name}\n\n"
+                    f"You haven't made any trades yet on this account.",
+                    parse_mode='HTML',
+                    reply_markup=build_account_page()
+                )
+            else:
+                # Resolve channel names for all channels first
+                channel_name_map = {}
+                unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
+                for ch_id in unique_channels:
+                    try:
+                        channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not resolve channel name for {ch_id}: {e}")
+                        channel_name_map[ch_id] = f"Channel {ch_id}"
+                
+                # Aggregate per-channel stats
+                channel_stats = {}
+                total_trades = len(trade_history)
+                wins = 0
+                for t in trade_history:
+                    ch = t.channel_id or 'unknown'
+                    cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
+                    cs['count'] += 1
+                    try:
+                        cs['pnl'] += float(t.pnl or 0)
+                        if float(t.pnl or 0) > 0:
+                            cs['wins'] += 1
+                            wins += 1
+                    except Exception:
+                        pass
+
+                text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
+                text += f"Recent trades ({len(trade_history)}):\n\n"
+                for trade in trade_history:
+                    status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
+                    ch = trade.channel_id or ''
+                    ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
+                    ch_line = f" | Ch: {ch_name}" if ch_name else ""
+                    text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
+                    text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
+                    text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
+
+                # Append per-channel analytics with resolved names
+                if channel_stats:
+                    text += "📡 <b>Per-Channel Analytics</b>\n"
+                    for ch, cs in channel_stats.items():
+                        ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
+                        wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
+                        text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
+                    if total_trades:
+                        overall_wr = wins/total_trades*100
+                        text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
+
+                await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
+        except Exception as e:
+            logger.error(f"❌ Error in History button handler: {e}")
+            logger.error(traceback.format_exc())
             await update.message.reply_text(
-                "❌ <b>No Account Selected</b>\n\n"
-                "Please select an account first from the Accounts menu.",
-                parse_mode='HTML',
-                reply_markup=build_main_menu()
-            )
-            return
-        
-        trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
-        
-        if not trade_history:
-            await update.message.reply_text(
-                f"📋 <b>No Trade History</b>\n\n"
-                f"Account: {current_account.account_name}\n\n"
-                f"You haven't made any trades yet on this account.",
+                "❌ <b>Error Loading History</b>\n\n"
+                f"An error occurred while loading trade history: {str(e)}\n\n"
+                "Please try again or contact support.",
                 parse_mode='HTML',
                 reply_markup=build_account_page()
             )
-        else:
-            # Resolve channel names for all channels first
-            channel_name_map = {}
-            unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
-            for ch_id in unique_channels:
-                channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
-            
-            # Aggregate per-channel stats
-            channel_stats = {}
-            total_trades = len(trade_history)
-            wins = 0
-            for t in trade_history:
-                ch = t.channel_id or 'unknown'
-                cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
-                cs['count'] += 1
-                try:
-                    cs['pnl'] += float(t.pnl or 0)
-                    if float(t.pnl or 0) > 0:
-                        cs['wins'] += 1
-                        wins += 1
-                except Exception:
-                    pass
-
-            text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
-            text += f"Recent trades ({len(trade_history)}):\n\n"
-            for trade in trade_history:
-                status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
-                ch = trade.channel_id or ''
-                ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
-                ch_line = f" | Ch: {ch_name}" if ch_name else ""
-                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
-                text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
-                text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
-
-            # Append per-channel analytics with resolved names
-            if channel_stats:
-                text += "📡 <b>Per-Channel Analytics</b>\n"
-                for ch, cs in channel_stats.items():
-                    ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
-                    wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
-                    text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
-                if total_trades:
-                    overall_wr = wins/total_trades*100
-                    text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
-
-            await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
 
     elif text == "📈 Trades" and 'current_account_id' in context.user_data:
         # Show active trades for current account only
