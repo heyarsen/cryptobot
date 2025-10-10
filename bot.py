@@ -24,7 +24,6 @@ import os
 import sys
 import traceback
 import requests
-import subprocess
 import signal
 import shutil
 
@@ -39,7 +38,6 @@ from telegram import (
     InlineKeyboardButton, 
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton
 )
 from telegram.ext import (
@@ -2017,13 +2015,17 @@ class TradingBot:
         return None
 
     def to_bingx_symbol(self, symbol: str) -> str:
+        """Convert symbol to BingX perpetual swap format (e.g., BTC-USDT)"""
         try:
-            # Convert like BTCUSDT -> BTC/USDT:USDT (perpetual swap)
-            if '/' in symbol:
-                return symbol
+            # BingX uses hyphen format for perpetual swaps: BTC-USDT
+            # Remove any existing separators and reconstruct
+            if '/' in symbol or ':' in symbol or '-' in symbol:
+                # Clean up to base-USDT format
+                base = symbol.split('/')[0].split('-')[0].split(':')[0]
+                return f"{base}-USDT"
             if symbol.endswith('USDT'):
                 base = symbol[:-4]
-                return f"{base}/USDT:USDT"
+                return f"{base}-USDT"
             return symbol
         except Exception:
             return symbol
@@ -2898,6 +2900,7 @@ class TradingBot:
 
             bingx_symbol = self.to_bingx_symbol(signal.symbol)
             # Ensure we always have current price with proper precision handling
+            current_price = 0.0
             try:
                 ticker = self.exchange.fetch_ticker(bingx_symbol)
                 logger.info(f"📊 Raw ticker response for {bingx_symbol}: last={ticker.get('last')}, price={ticker.get('info', {}).get('price')}")
@@ -2913,11 +2916,28 @@ class TradingBot:
                 if 0 < current_price < 0.00001:
                     logger.info(f"✅ Very small price detected for {bingx_symbol}: {current_price:.12f} - meme coin trading enabled")
             except Exception as e:
-                logger.error(f"❌ Error fetching ticker for {bingx_symbol}: {e}")
-                logger.error(f"❌ Ticker fetch error details: {traceback.format_exc()}")
-                price_str = str(signal.entry_price or '0')
-                current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
-                logger.info(f"📊 Using signal entry price as fallback: {current_price}")
+                logger.warning(f"⚠️ Error fetching ticker for {bingx_symbol}: {e}")
+                # Try alternative symbol format as fallback
+                try:
+                    # If hyphen format failed, the symbol might already be in a different format
+                    alt_symbol = signal.symbol if '/' not in signal.symbol else signal.symbol.replace('/', '-').split(':')[0]
+                    logger.info(f"🔄 Trying alternative symbol format: {alt_symbol}")
+                    ticker = self.exchange.fetch_ticker(alt_symbol)
+                    price_str = str(ticker.get('last') or ticker.get('info', {}).get('price') or '0')
+                    current_price = float(Decimal(price_str)) if price_str and price_str != '0' else 0.0
+                    logger.info(f"✅ Found price with alternative format: {current_price}")
+                    bingx_symbol = alt_symbol  # Update to working symbol
+                except Exception as e2:
+                    logger.warning(f"⚠️ Alternative ticker fetch also failed: {e2}")
+                    # Last resort: use signal entry price or minimal fallback
+                    if signal.entry_price and signal.entry_price > 0:
+                        price_str = str(signal.entry_price)
+                        current_price = float(Decimal(price_str))
+                        logger.info(f"📊 Using signal entry price as fallback: {current_price}")
+                    else:
+                        # For very small meme coins, use a minimal non-zero fallback
+                        current_price = 0.00000001
+                        logger.warning(f"⚠️ Using minimal fallback price: {current_price} - trade will proceed with caution")
 
             # Attempt to set leverage, but proceed if it fails
             try:
@@ -3522,13 +3542,12 @@ class TradingBot:
 
                     if signal:
                         settings_source = "Signal" if user_config.use_signal_settings else "Bot"
-                        # Try to get channel name
+                        # Get consistent channel name using the cache
                         channel_info = ""
                         try:
-                            if hasattr(event, 'chat') and event.chat:
-                                channel_name = getattr(event.chat, 'title', None)
-                                if channel_name:
-                                    channel_info = f"\n📡 Source: {channel_name}"
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else None
+                            if channel_display:
+                                channel_info = f"\n📡 Source: {channel_display}"
                         except Exception:
                             pass
                         
@@ -3541,18 +3560,12 @@ class TradingBot:
                         result = await self.execute_trade(signal, user_config)
 
                         if result['success']:
-                            # Try to include source channel name if available
+                            # Use consistent channel name for success notification
                             source_info = ""
                             try:
-                                ch_name = None
-                                if hasattr(event, 'chat') and event.chat:
-                                    ch_name = getattr(event.chat, 'title', None)
-                                if hasattr(event.message, 'forward') and event.message.forward and getattr(event.message.forward, 'chat', None):
-                                    ch_name = getattr(event.message.forward.chat, 'title', ch_name)
-                                if ch_name:
-                                    source_info = f"\n📡 Source: {ch_name}"
-                                elif matching_channels:
-                                    source_info = f"\n📡 Source ID: {list(matching_channels)[0]}"
+                                channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else None
+                                if channel_display:
+                                    source_info = f"\n📡 From: {channel_display}"
                             except Exception:
                                 pass
 
@@ -3725,11 +3738,19 @@ class TradingBot:
                             logger.debug(f"🔎 Checking channel {channel_id_str} for new messages...")
                             
                             # Get entity first to avoid ChatIdInvalidError
+                            # Use PeerChannel for proper channel/megagroup handling
                             try:
-                                entity = await telethon_client.get_entity(channel_id)
+                                from telethon.tl.types import PeerChannel
+                                # For channels/megagroups, use PeerChannel with positive ID
+                                peer = PeerChannel(abs(channel_id))
+                                entity = await telethon_client.get_entity(peer)
                             except Exception as entity_error:
-                                logger.warning(f"⚠️ Could not get entity for channel {channel_id_str}: {entity_error}")
-                                continue
+                                # Fallback to direct int if PeerChannel fails
+                                try:
+                                    entity = await telethon_client.get_entity(channel_id)
+                                except Exception as e2:
+                                    logger.warning(f"⚠️ Could not get entity for channel {channel_id_str}: {entity_error}, fallback also failed: {e2}")
+                                    continue
                             
                             # Get the latest message from this channel
                             messages = await telethon_client.get_messages(entity, limit=1)
@@ -3745,10 +3766,12 @@ class TradingBot:
                             
                             # Initialize last_message_ids for this channel if needed
                             if channel_id_str not in last_message_ids:
-                                last_message_ids[channel_id_str] = msg_id
-                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, last ID: {msg_id}")
+                                # Initialize with msg_id - 1 so the current message will be processed
+                                last_message_ids[channel_id_str] = msg_id - 1
+                                logger.info(f"📝 Initialized tracking for channel {channel_id_str}, last ID: {msg_id - 1}")
                                 logger.info(f"📝 Latest message preview: {latest_msg.message[:100] if latest_msg.message else '(no text)'}")
-                                continue
+                                logger.info(f"🔄 Will process current message (ID: {msg_id}) as first signal")
+                                # Don't continue - let it process the current message
                             
                             # Check if this is a new message
                             if msg_id > last_message_ids[channel_id_str]:
@@ -3885,14 +3908,12 @@ class TradingBot:
                 settings_source = "Signal" if config.use_signal_settings else "Bot"
                 if bot_instance:
                     try:
-                        # Try to get channel name
+                        # Get consistent channel name using the cache
                         channel_info = ""
                         try:
-                            # Get channel name from the message context
-                            if hasattr(message, 'chat') and message.chat:
-                                channel_name = getattr(message.chat, 'title', None)
-                                if channel_name:
-                                    channel_info = f"\n📡 Source: {channel_name}"
+                            channel_display = await self.get_channel_display_name(signal.channel_id, user_id) if signal.channel_id else None
+                            if channel_display:
+                                channel_info = f"\n📡 Source: {channel_display}"
                         except Exception:
                             pass
                         
@@ -4046,6 +4067,7 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"↩️ Trailing Callback: {config.trailing_callback_percent}%", callback_data="set_trailing_callback")],
         [InlineKeyboardButton(trade_amount_text, callback_data="toggle_trade_amount_mode")],
         [InlineKeyboardButton(channels_text, callback_data="manage_channels")],
+        [InlineKeyboardButton("📋 History in account", callback_data="account_history")],
         [InlineKeyboardButton("✏️ Rename Account", callback_data="rename_account"), InlineKeyboardButton("🗑️ Delete Account", callback_data="delete_account")],
         [InlineKeyboardButton("✅ Done", callback_data="trading_done")]
     ]
@@ -7401,11 +7423,16 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
             trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
             
             if not trade_history:
+                # Show "no history" message with back button to return to settings
+                back_keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back to Settings", callback_data="back_to_settings")
+                ]])
                 await query.edit_message_text(
                     f"📋 <b>No Trade History</b>\n\n"
                     f"Account: {current_account.account_name}\n\n"
                     f"You haven't made any trades yet on this account.",
-                    parse_mode='HTML'
+                    parse_mode='HTML',
+                    reply_markup=back_keyboard
                 )
             else:
                 # Resolve channel names for all channels first
@@ -7460,7 +7487,11 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
                 if len(text) > 4000:
                     text = text[:3900] + "\n\n... (truncated)\n\nUse 📋 History button for full history."
 
-                await query.edit_message_text(text, parse_mode='HTML')
+                # Add back button to return to settings
+                back_keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back to Settings", callback_data="back_to_settings")
+                ]])
+                await query.edit_message_text(text, parse_mode='HTML', reply_markup=back_keyboard)
         except Exception as e:
             logger.error(f"❌ Error in inline history callback: {e}")
             logger.error(traceback.format_exc())
