@@ -4766,95 +4766,174 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_stop_trading(update, context)
 
     elif text == "📋 History":
-        # Show trade history for current account only (only closed/inactive trades)
+        # COMPLETELY REWRITTEN: Show trade history for current account
         try:
-            current_account = trading_bot.get_current_account(user_id)
+            # Step 1: Get current account with multiple fallback methods
+            current_account = None
+            account_id = None
+            account_name = None
             
-            # Fallback: check context.user_data if get_current_account returns None
-            if not current_account and 'current_account_id' in context.user_data:
-                account_id = context.user_data['current_account_id']
-                accounts = trading_bot.enhanced_db.get_all_accounts()
-                current_account = next((a for a in accounts if a.account_id == account_id), None)
+            # Method 1: Try from trading_bot's current_accounts dict
+            try:
+                current_account = trading_bot.get_current_account(user_id)
                 if current_account:
-                    # Sync the current_accounts dict
-                    trading_bot.set_current_account(user_id, account_id)
+                    account_id = current_account.account_id
+                    account_name = current_account.account_name
+            except Exception as e:
+                logger.warning(f"Failed to get current account from trading_bot: {e}")
             
-            if not current_account:
+            # Method 2: Try from context.user_data
+            if not current_account and 'current_account_id' in context.user_data:
+                account_id = context.user_data.get('current_account_id')
+                account_name = context.user_data.get('current_account_name', 'Account')
+                try:
+                    all_accounts = trading_bot.enhanced_db.get_all_accounts()
+                    current_account = next((a for a in all_accounts if a.account_id == account_id), None)
+                    if current_account:
+                        trading_bot.set_current_account(user_id, account_id)
+                except Exception as e:
+                    logger.warning(f"Failed to load account from user_data: {e}")
+            
+            # Step 2: Validate we have an account
+            if not current_account or not account_id:
                 await update.message.reply_text(
                     "❌ <b>No Account Selected</b>\n\n"
-                    "Please select an account first from the Accounts menu.",
+                    "Please select an account first from the Accounts menu.\n\n"
+                    "Go to: 🔙 Main Menu → 🔑 Accounts → Select your account",
                     parse_mode='HTML',
                     reply_markup=build_main_menu()
                 )
                 return
             
-            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20, only_closed=True)
+            # Step 3: Fetch trade history
+            trade_history = trading_bot.enhanced_db.get_trade_history(
+                account_id, 
+                limit=50, 
+                only_closed=True
+            )
             
+            # Step 4: Handle empty history
             if not trade_history:
                 await update.message.reply_text(
                     f"📋 <b>No Trade History</b>\n\n"
-                    f"Account: {current_account.account_name}\n\n"
-                    f"You haven't made any trades yet on this account.",
+                    f"Account: <b>{account_name}</b>\n\n"
+                    f"No closed trades found for this account.\n"
+                    f"Start trading to see your history here!",
                     parse_mode='HTML',
                     reply_markup=build_account_page()
                 )
-            else:
-                # Resolve channel names for all channels first
-                channel_name_map = {}
-                unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
-                for ch_id in unique_channels:
-                    try:
-                        channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Could not resolve channel name for {ch_id}: {e}")
-                        channel_name_map[ch_id] = f"Channel {ch_id}"
+                return
+            
+            # Step 5: Build comprehensive history display
+            # Calculate overall statistics
+            total_trades = len(trade_history)
+            winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+            losing_trades = total_trades - winning_trades
+            total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+            # Resolve channel names
+            channel_name_map = {}
+            unique_channels = set(t.channel_id for t in trade_history if t.channel_id)
+            for ch_id in unique_channels:
+                try:
+                    channel_name_map[ch_id] = await trading_bot.get_channel_display_name(ch_id, user_id)
+                except Exception as e:
+                    logger.debug(f"Could not resolve channel name for {ch_id}: {e}")
+                    channel_name_map[ch_id] = f"Channel {ch_id[:8]}..."
+            
+            # Build per-channel statistics
+            channel_stats = {}
+            for trade in trade_history:
+                ch_id = trade.channel_id or 'unknown'
+                if ch_id not in channel_stats:
+                    channel_stats[ch_id] = {
+                        'count': 0,
+                        'wins': 0,
+                        'losses': 0,
+                        'pnl': 0.0
+                    }
                 
-                # Aggregate per-channel stats
-                channel_stats = {}
-                total_trades = len(trade_history)
-                wins = 0
-                for t in trade_history:
-                    ch = t.channel_id or 'unknown'
-                    cs = channel_stats.setdefault(ch, {'count': 0, 'wins': 0, 'pnl': 0.0})
-                    cs['count'] += 1
-                    try:
-                        cs['pnl'] += float(t.pnl or 0)
-                        if float(t.pnl or 0) > 0:
-                            cs['wins'] += 1
-                            wins += 1
-                    except Exception:
-                        pass
-
-                text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
-                text += f"Recent trades ({len(trade_history)}):\n\n"
-                for trade in trade_history:
-                    status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
-                    ch = trade.channel_id or ''
-                    ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
-                    ch_line = f" | Ch: {ch_name}" if ch_name else ""
-                    text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
-                    text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
-                    text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
-
-                # Append per-channel analytics with resolved names
-                if channel_stats:
-                    text += "📡 <b>Per-Channel Analytics</b>\n"
-                    for ch, cs in channel_stats.items():
-                        ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
-                        wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
-                        text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
-                    if total_trades:
-                        overall_wr = wins/total_trades*100
-                        text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
-
-                await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
+                channel_stats[ch_id]['count'] += 1
+                pnl_value = float(trade.pnl) if trade.pnl else 0
+                channel_stats[ch_id]['pnl'] += pnl_value
+                
+                if pnl_value > 0:
+                    channel_stats[ch_id]['wins'] += 1
+                else:
+                    channel_stats[ch_id]['losses'] += 1
+            
+            # Build message header with summary
+            text = f"📋 <b>Trade History</b>\n"
+            text += f"Account: <b>{account_name}</b>\n\n"
+            
+            text += f"📊 <b>Summary Statistics:</b>\n"
+            text += f"Total Trades: <b>{total_trades}</b>\n"
+            text += f"✅ Winning: <b>{winning_trades}</b>\n"
+            text += f"❌ Losing: <b>{losing_trades}</b>\n"
+            text += f"📈 Win Rate: <b>{win_rate:.1f}%</b>\n"
+            text += f"💵 Total PnL: <b>{total_pnl:.2f} USDT</b>\n\n"
+            
+            # Display individual trades (most recent first)
+            text += f"📝 <b>Recent Trades (Last {min(20, total_trades)}):</b>\n\n"
+            for i, trade in enumerate(trade_history[:20]):
+                # Determine emoji based on PnL
+                pnl_value = float(trade.pnl) if trade.pnl else 0
+                if pnl_value > 0:
+                    status_emoji = "✅"
+                elif pnl_value < 0:
+                    status_emoji = "❌"
+                else:
+                    status_emoji = "⚪"
+                
+                # Get channel name
+                ch_id = trade.channel_id
+                ch_display = ""
+                if ch_id and ch_id in channel_name_map:
+                    ch_display = f"\n  📡 {channel_name_map[ch_id]}"
+                
+                # Format trade entry
+                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
+                text += f"  Entry: {trade.entry_price}"
+                if trade.exit_price:
+                    text += f" → Exit: {trade.exit_price}"
+                text += f"\n  PnL: <b>{pnl_value:.2f} USDT</b>"
+                text += ch_display
+                
+                # Add timestamp
+                if trade.entry_time:
+                    time_str = trade.entry_time[:16] if len(trade.entry_time) > 16 else trade.entry_time
+                    text += f"\n  🕐 {time_str}"
+                
+                text += "\n\n"
+            
+            # Add per-channel analytics
+            if channel_stats and len(channel_stats) > 1:
+                text += f"📡 <b>Per-Channel Performance:</b>\n"
+                for ch_id, stats in sorted(channel_stats.items(), key=lambda x: x[1]['pnl'], reverse=True):
+                    ch_name = channel_name_map.get(ch_id, 'Unknown') if ch_id != 'unknown' else 'Unknown Channel'
+                    ch_wr = (stats['wins'] / stats['count'] * 100) if stats['count'] > 0 else 0
+                    text += f"• {ch_name}\n"
+                    text += f"  Trades: {stats['count']} | WR: {ch_wr:.1f}% | PnL: {stats['pnl']:.2f}\n"
+            
+            # Send the message
+            await update.message.reply_text(
+                text, 
+                parse_mode='HTML', 
+                reply_markup=build_account_page()
+            )
+            
         except Exception as e:
-            logger.error(f"❌ Error in History button handler: {e}")
+            logger.error(f"❌ CRITICAL ERROR in History button handler: {e}")
             logger.error(traceback.format_exc())
             await update.message.reply_text(
                 "❌ <b>Error Loading History</b>\n\n"
-                f"An error occurred while loading trade history: {str(e)}\n\n"
-                "Please try again or contact support.",
+                f"Something went wrong while loading your trade history.\n\n"
+                f"Error: <code>{str(e)[:100]}</code>\n\n"
+                "Please try again. If the problem persists:\n"
+                "1. Go back to Main Menu\n"
+                "2. Select your account again\n"
+                "3. Try History button again",
                 parse_mode='HTML',
                 reply_markup=build_account_page()
             )
@@ -4911,7 +4990,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Calculate statistics
         total_trades = len(trade_history)
         winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
-        losing_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) < 0)
+        # Count all non-winning trades as losing (including break-even trades)
+        losing_trades = total_trades - winning_trades
         total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         
