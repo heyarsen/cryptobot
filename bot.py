@@ -1094,18 +1094,32 @@ class EnhancedDatabase:
             logger.error(f"❌ Failed to save trade history: {e}")
             return False
     
-    def get_trade_history(self, account_id: str, limit: int = 50) -> List[TradeHistory]:
-        """Get trade history for an account"""
+    def get_trade_history(self, account_id: str, limit: int = 50, only_closed: bool = False) -> List[TradeHistory]:
+        """Get trade history for an account
+        
+        Args:
+            account_id: The account ID to filter trades
+            limit: Maximum number of trades to return
+            only_closed: If True, only return closed/inactive trades (not OPEN)
+        """
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            cursor.execute('''
-                SELECT * FROM trade_history 
-                WHERE account_id = ? 
-                ORDER BY entry_time DESC 
-                LIMIT ?
-            ''', (account_id, limit))
+            if only_closed:
+                cursor.execute('''
+                    SELECT * FROM trade_history 
+                    WHERE account_id = ? AND status != 'OPEN'
+                    ORDER BY entry_time DESC 
+                    LIMIT ?
+                ''', (account_id, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM trade_history 
+                    WHERE account_id = ? 
+                    ORDER BY entry_time DESC 
+                    LIMIT ?
+                ''', (account_id, limit))
             
             rows = cursor.fetchall()
             conn.close()
@@ -2173,10 +2187,56 @@ class TradingBot:
 
             bingx_symbol = self.to_bingx_symbol(symbol)
             markets = self.exchange.load_markets()
-            if bingx_symbol not in markets:
-                return {'error': f'Symbol {symbol} not found'}
-
-            market = markets[bingx_symbol]
+            
+            # Try multiple symbol formats to find the market
+            market = None
+            tried_symbols = [bingx_symbol]
+            
+            # Try the primary format first
+            if bingx_symbol in markets:
+                market = markets[bingx_symbol]
+                logger.info(f"✅ Found market for {bingx_symbol}")
+            else:
+                # Try alternative formats
+                # Extract base symbol (e.g., COAI from COAI-USDT)
+                base = symbol.replace('-USDT', '').replace('/USDT', '').replace('USDT', '').replace(':', '').replace('/', '')
+                
+                alternative_formats = [
+                    f"{base}/USDT",      # Slash format
+                    f"{base}-USDT",      # Hyphen format (already tried)
+                    f"{base}USDT",       # No separator
+                    f"{base}/USDT:USDT", # Perpetual format
+                    symbol               # Original symbol as-is
+                ]
+                
+                for alt_symbol in alternative_formats:
+                    if alt_symbol in tried_symbols:
+                        continue
+                    tried_symbols.append(alt_symbol)
+                    if alt_symbol in markets:
+                        market = markets[alt_symbol]
+                        bingx_symbol = alt_symbol  # Update to the working format
+                        logger.info(f"✅ Found market using alternative format: {alt_symbol}")
+                        break
+                
+                if not market:
+                    # Symbol not found in any format - log warning and use safe defaults
+                    logger.warning(f"⚠️ Symbol {symbol} not found in markets (tried: {', '.join(tried_symbols)})")
+                    logger.warning(f"⚠️ Using safe default precision values for {symbol}")
+                    # Return safe defaults instead of error - this allows trade to proceed
+                    default_precision = {
+                        'step_size': 1.0,
+                        'min_qty': 1.0,
+                        'tick_size': 0.00001,
+                        'min_price': 0.00001,
+                        'max_price': 1000000.0,
+                        'qty_precision': 0,
+                        'price_precision': 5
+                    }
+                    self.symbol_info_cache[symbol] = default_precision
+                    return default_precision
+            
+            # If we found the market, continue with precision extraction
             # Derive precision and limits
             raw_price_precision = market.get('precision', {}).get('price', None)
             raw_amount_precision = market.get('precision', {}).get('amount', None)
@@ -4479,12 +4539,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
     elif text == "📋 All History":
-        # Show trade history from all accounts
+        # Show trade history from all accounts (only closed/inactive trades)
         accs = trading_bot.enhanced_db.get_all_accounts()
         all_trades = []
         
         for acc in accs:
-            trades = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=20)
+            trades = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=20, only_closed=True)
             for trade in trades:
                 all_trades.append((acc.account_name, trade))
         
@@ -4682,7 +4742,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_stop_trading(update, context)
 
     elif text == "📋 History":
-        # Show trade history for current account only
+        # Show trade history for current account only (only closed/inactive trades)
         try:
             current_account = trading_bot.get_current_account(user_id)
             
@@ -4704,7 +4764,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
+            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20, only_closed=True)
             
             if not trade_history:
                 await update.message.reply_text(
@@ -7418,9 +7478,9 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
                 )
     
     elif data == "show_history" or data == "history" or data == "account_history":
-        # Handle inline history button - show trade history for current account
+        # Handle inline history button - show trade history for current account (only closed trades)
         try:
-            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20)
+            trade_history = trading_bot.enhanced_db.get_trade_history(current_account.account_id, limit=20, only_closed=True)
             
             if not trade_history:
                 # Show "no history" message with back button to return to settings
