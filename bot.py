@@ -1800,6 +1800,7 @@ class TradingBot:
         self.monitoring_status: Dict[int, bool] = {}  # Track monitoring status per user (deprecated)
         self.account_monitoring_status: Dict[str, bool] = {}  # Track monitoring status per account_id
         self.channel_name_cache: Dict[str, str] = {}  # channel_id -> channel_name for display
+        self.processed_messages: Dict[str, set] = {}  # Track processed message IDs per channel to prevent duplicates
         
         # Enhanced main menu
         self.main_menu = ReplyKeyboardMarkup(
@@ -3142,9 +3143,10 @@ class TradingBot:
             # Get trading type for this account (futures/swap vs spot)
             current_trading_type = getattr(current_account, 'trading_type', 'swap') if current_account else 'swap'
             
-            # Include positionSide param for hedge mode for entry + explicit type for BingX futures
+            # Include positionSide param for hedge mode for entry
             # Note: positionSide is only valid for futures/swap trading, not spot
-            order_params = {'type': current_trading_type}  # Explicitly specify swap (futures) or spot
+            # The trading type (swap/spot) is set via defaultType at exchange level, not per-order
+            order_params = {}
             if current_trading_type == 'swap':
                 order_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
             # Create order with simple retry if exchange is transiently busy
@@ -3255,8 +3257,7 @@ class TradingBot:
                                 'stopPrice': rounded_sl,
                                 'triggerPrice': rounded_sl,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE',
-                                'type': current_trading_type  # Explicitly specify swap (futures) or spot
+                                'workingType': 'MARK_PRICE'
                             }
                         )
                         logger.info(f"🛑 Stop Loss order placed: {sl_order}")
@@ -3393,8 +3394,7 @@ class TradingBot:
                                 'stopPrice': rounded_tp,
                                 'triggerPrice': rounded_tp,
                                 'positionSide': position_side,
-                                'workingType': 'MARK_PRICE',
-                                'type': current_trading_type  # Explicitly specify swap (futures) or spot
+                                'workingType': 'MARK_PRICE'
                             }
                         )
                         logger.info(f"🎯 Take Profit order placed: {tp_order}")
@@ -3418,7 +3418,6 @@ class TradingBot:
                                 'positionSide': position_side,
                                 'workingType': 'MARK_PRICE'
                             }
-                            trailing_params['type'] = current_trading_type  # Explicitly specify swap (futures) or spot
                             trailing_order = self.exchange.create_order(
                                 market_symbol,
                                 'TRAILING_STOP_MARKET',
@@ -3906,6 +3905,27 @@ class TradingBot:
         """Handle a new message from a monitored channel"""
         try:
             logger.info(f"🔔 [_handle_new_message] Called for user {user_id}, channel {channel_id}")
+
+            # Prevent duplicate processing of the same message
+            message_id = getattr(message, 'id', None)
+            if message_id:
+                channel_key = f"{channel_id}_{user_id}"
+                if channel_key not in self.processed_messages:
+                    self.processed_messages[channel_key] = set()
+                
+                if message_id in self.processed_messages[channel_key]:
+                    logger.info(f"⏭️ [_handle_new_message] Message {message_id} already processed, skipping to prevent duplicate order")
+                    return
+                
+                # Mark message as processed
+                self.processed_messages[channel_key].add(message_id)
+                
+                # Keep only last 100 message IDs to prevent memory bloat
+                if len(self.processed_messages[channel_key]) > 100:
+                    # Remove oldest 50 messages
+                    sorted_ids = sorted(self.processed_messages[channel_key])
+                    for old_id in sorted_ids[:50]:
+                        self.processed_messages[channel_key].discard(old_id)
 
             # Route to the correct trading account based on the channel
             try:
