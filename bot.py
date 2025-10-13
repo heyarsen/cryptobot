@@ -3785,34 +3785,34 @@ class TradingBot:
                     
                     logger.debug(f"🔍 Polling {len(config.monitored_channels)} channels for user {user_id}: {config.monitored_channels}")
                     
-                    # Get current account to filter channels
-                    current_account = self.get_current_account(user_id)
+                    # Get ALL accounts for this user, not just current account
+                    # This ensures background monitoring works even when user is on different pages
+                    all_user_accounts = self.enhanced_db.get_user_accounts(user_id)
                     
-                    # Only monitor channels for accounts that are actively monitoring
-                    if current_account and not self.account_monitoring_status.get(current_account.account_id, False):
-                        logger.warning(f"⏸️ Account {current_account.account_name} (ID: {current_account.account_id}) monitoring is paused, skipping message processing...")
-                        logger.warning(f"⏸️ Current account_monitoring_status: {dict(self.account_monitoring_status)}")
+                    # Collect all channels from all actively monitoring accounts
+                    channels_to_check_map = {}  # channel_id -> account_id mapping
+                    for account in all_user_accounts:
+                        # Only monitor channels for accounts that are actively monitoring
+                        if self.account_monitoring_status.get(account.account_id, False):
+                            logger.debug(f"🔍 Account {account.account_name} (ID: {account.account_id}) is actively monitoring")
+                            # Add this account's channels to the check list
+                            for ch in (account.monitored_channels or []):
+                                ch_str = str(ch)
+                                if ch_str in config.monitored_channels or ch in config.monitored_channels:
+                                    channels_to_check_map[ch_str] = account.account_id
+                                    logger.debug(f"📡 Will monitor channel {ch_str} for account {account.account_name}")
+                        else:
+                            logger.debug(f"⏸️ Account {account.account_name} (ID: {account.account_id}) monitoring is paused")
+                    
+                    if not channels_to_check_map:
+                        logger.debug(f"⏸️ No active channels to check for user {user_id}")
                         await asyncio.sleep(10)
                         continue
                     
-                    # Filter to only the current account's channels
-                    # Convert both to strings to ensure proper comparison (channels can be stored as int or str)
-                    account_channels = [str(ch) for ch in (current_account.monitored_channels if current_account else [])]
-                    channels_to_check = [ch for ch in config.monitored_channels if str(ch) in account_channels]
-                    
-                    logger.info(f"🔍 Account channels (raw): {current_account.monitored_channels if current_account else []}")
-                    logger.info(f"🔍 Account channels (normalized): {account_channels}")
-                    logger.info(f"🔍 Config monitored channels: {config.monitored_channels}")
-                    logger.info(f"🔍 Channels to check (intersection): {channels_to_check}")
-                    logger.info(f"🔍 Channel types - config: {[type(ch).__name__ for ch in config.monitored_channels]}, account: {[type(ch).__name__ for ch in (current_account.monitored_channels if current_account else [])]}")
-                    
-                    if not channels_to_check:
-                        logger.warning(f"⚠️ No channels to check! Account channels: {account_channels}, Config channels: {config.monitored_channels}")
-                        await asyncio.sleep(10)
-                        continue
+                    logger.info(f"🔍 Monitoring {len(channels_to_check_map)} channels across {len(all_user_accounts)} accounts for user {user_id}")
                     
                     # Check each monitored channel for new messages
-                    for channel_id_str in channels_to_check:
+                    for channel_id_str, associated_account_id in channels_to_check_map.items():
                         try:
                             # Convert string channel ID to entity
                             channel_id = int(channel_id_str)
@@ -3873,7 +3873,7 @@ class TradingBot:
                                 for msg in reversed(new_messages):
                                     if msg.id > last_message_ids[channel_id_str] and msg.message:
                                         logger.info(f"📨 Processing new message ID {msg.id}: {msg.message[:100]}...")
-                                        await self._handle_new_message(msg, channel_id_str, user_id)
+                                        await self._handle_new_message(msg, channel_id_str, user_id, associated_account_id)
                                     elif msg.id > last_message_ids[channel_id_str]:
                                         logger.debug(f"⏭️ Skipping message ID {msg.id} (no text content)")
                                 
@@ -3903,33 +3903,46 @@ class TradingBot:
             logger.error(f"❌ Fatal error in message polling: {e}")
             logger.error(f"❌ Message polling fatal error: {traceback.format_exc()}")
     
-    async def _handle_new_message(self, message, channel_id: str, user_id: int):
-        """Handle a new message from a monitored channel"""
+    async def _handle_new_message(self, message, channel_id: str, user_id: int, account_id: str = None):
+        """Handle a new message from a monitored channel
+        
+        Args:
+            message: The Telethon message object
+            channel_id: The channel ID where the message was received
+            user_id: The Telegram user ID
+            account_id: The account ID to use for this message (if known from background monitoring)
+        """
         try:
-            logger.info(f"🔔 [_handle_new_message] Called for user {user_id}, channel {channel_id}")
+            logger.info(f"🔔 [_handle_new_message] Called for user {user_id}, channel {channel_id}, account {account_id}")
 
-            # Route to the correct trading account based on the channel
-            try:
-                accounts = self.enhanced_db.get_all_accounts()
-                matching = None
-                for acc in accounts:
-                    if int(acc.user_id or 0) != int(user_id):
-                        continue
-                    try:
-                        if channel_id and int(channel_id) in [int(str(c)) for c in (acc.monitored_channels or [])]:
-                            matching = acc
-                            break
-                    except Exception:
-                        continue
-                if matching:
-                    current = self.get_current_account(user_id)
-                    if not current or current.account_id != matching.account_id:
-                        logger.info(f"🔗 [_handle_new_message] Switching current account to '{matching.account_name}' based on channel {channel_id}")
-                        self.set_current_account(user_id, matching.account_id)
-                else:
-                    logger.info(f"ℹ️ [_handle_new_message] No specific account matched for channel {channel_id}; using current account")
-            except Exception as e:
-                logger.warning(f"⚠️ [_handle_new_message] Account routing by channel failed: {e}")
+            # Route to the correct trading account
+            # If account_id is provided (from background monitoring), use it directly
+            if account_id:
+                logger.info(f"🔗 [_handle_new_message] Using provided account ID: {account_id}")
+                self.set_current_account(user_id, account_id)
+            else:
+                # Fallback: search for matching account based on channel
+                try:
+                    accounts = self.enhanced_db.get_all_accounts()
+                    matching = None
+                    for acc in accounts:
+                        if int(acc.user_id or 0) != int(user_id):
+                            continue
+                        try:
+                            if channel_id and int(channel_id) in [int(str(c)) for c in (acc.monitored_channels or [])]:
+                                matching = acc
+                                break
+                        except Exception:
+                            continue
+                    if matching:
+                        current = self.get_current_account(user_id)
+                        if not current or current.account_id != matching.account_id:
+                            logger.info(f"🔗 [_handle_new_message] Switching current account to '{matching.account_name}' based on channel {channel_id}")
+                            self.set_current_account(user_id, matching.account_id)
+                    else:
+                        logger.info(f"ℹ️ [_handle_new_message] No specific account matched for channel {channel_id}; using current account")
+                except Exception as e:
+                    logger.warning(f"⚠️ [_handle_new_message] Account routing by channel failed: {e}")
             
             config = self.get_user_config(user_id)
             logger.info(f"🔧 [_handle_new_message] Config loaded - monitored channels: {config.monitored_channels}")
@@ -4448,10 +4461,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_count = sum(1 for acc in accs if trading_bot.monitoring_status.get(user_id, False))
         msg += f"🟢 Active Monitoring: <b>{active_count}</b>\n\n"
         
-        # Per-account stats
+        # Per-account stats (compact format)
         msg += "💼 <b>Account Details:</b>\n\n"
         
+        accounts_shown = 0
         for acc in accs:
+            # Check message length to avoid exceeding Telegram's limit
+            if len(msg) > 3500:
+                msg += f"<i>... and {len(accs) - accounts_shown} more accounts</i>\n"
+                break
+            
             # Get active trades and history for this account
             active_trades = trading_bot.enhanced_db.get_active_trades(acc.account_id)
             trade_history = trading_bot.enhanced_db.get_trade_history(acc.account_id, limit=100)
@@ -4464,30 +4483,21 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             winning_trades = [t for t in closed_trades if float(t.pnl or 0) > 0]
             win_rate = (len(winning_trades) / len(closed_trades) * 100) if closed_trades else 0
             
-            # Get balance from exchange
-            balance = 0.0
-            try:
-                if acc.account_id in trading_bot.account_exchanges:
-                    exchange = trading_bot.account_exchanges[acc.account_id]
-                    acc_trading_type = getattr(acc, 'trading_type', 'swap')
-                    bal = exchange.fetch_balance({'type': acc_trading_type})
-                    balance = bal.get('USDT', {}).get('total', 0.0) if isinstance(bal, dict) else 0.0
-            except Exception as e:
-                logger.debug(f"Could not fetch balance for {acc.account_name}: {e}")
+            monitor_status = "🟢" if trading_bot.monitoring_status.get(user_id, False) else "🔴"
             
-            monitor_status = "🟢 Active" if trading_bot.monitoring_status.get(user_id, False) else "🔴 Inactive"
-            balance_mode = f"{acc.balance_percentage}%" if acc.use_percentage_balance else f"${acc.fixed_usdt_amount}"
+            # Compact format
+            acc_name = acc.account_name
+            if len(acc_name) > 20:
+                acc_name = acc_name[:17] + "..."
             
-            msg += f"<b>{acc.account_name}</b>\n"
-            msg += f"  Status: {monitor_status}\n"
-            msg += f"  ⚡ Leverage: {acc.leverage}x\n"
-            msg += f"  💰 Balance: {balance:.2f} USDT\n"
-            msg += f"  💵 Trade Amount: {balance_mode}\n"
-            msg += f"  📈 Active Trades: {len(active_trades)}\n"
-            msg += f"  📊 Total Trades: {len(trade_history)}\n"
-            msg += f"  🎯 Win Rate: {win_rate:.1f}% ({len(winning_trades)}/{len(closed_trades)})\n"
-            msg += f"  💵 Total PnL: {total_pnl:.2f} USDT\n"
-            msg += f"  📡 Channels: {len(acc.monitored_channels)}\n\n"
+            msg += f"<b>{acc_name}</b> {monitor_status}\n"
+            msg += f"  {acc.leverage}x | Active: {len(active_trades)} | Total: {len(trade_history)}\n"
+            msg += f"  WR: {win_rate:.1f}% | PnL: {total_pnl:.2f} USDT\n\n"
+            accounts_shown += 1
+        
+        # Ensure we don't exceed Telegram's limit
+        if len(msg) > 4000:
+            msg = msg[:3950] + "\n\n<i>... (truncated)</i>"
         
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=build_main_menu())
 
@@ -4876,8 +4886,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"💵 Total PnL: <b>{total_pnl:.2f} USDT</b>\n\n"
             
             # Display individual trades (most recent first)
-            text += f"📝 <b>Recent Trades (Last {min(20, total_trades)}):</b>\n\n"
-            for i, trade in enumerate(trade_history[:20]):
+            # Limit to fewer trades to avoid message length issues
+            trades_to_show = min(10, total_trades)
+            text += f"📝 <b>Recent Trades (Last {trades_to_show}):</b>\n\n"
+            
+            for i, trade in enumerate(trade_history[:trades_to_show]):
+                # Check if adding this trade would exceed Telegram's limit
+                if len(text) > 3500:  # Leave room for channel stats
+                    text += f"<i>... and {total_trades - i} more trades</i>\n\n"
+                    break
+                
                 # Determine emoji based on PnL
                 pnl_value = float(trade.pnl) if trade.pnl else 0
                 if pnl_value > 0:
@@ -4887,35 +4905,38 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     status_emoji = "⚪"
                 
-                # Get channel name
+                # Get channel name (shortened)
                 ch_id = trade.channel_id
                 ch_display = ""
                 if ch_id and ch_id in channel_name_map:
-                    ch_display = f"\n  📡 {channel_name_map[ch_id]}"
+                    ch_name = channel_name_map[ch_id]
+                    # Truncate long channel names
+                    if len(ch_name) > 20:
+                        ch_name = ch_name[:17] + "..."
+                    ch_display = f" | {ch_name}"
                 
-                # Format trade entry
-                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
+                # Format trade entry (compact)
+                text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_display}\n"
                 text += f"  Entry: {trade.entry_price}"
                 if trade.exit_price:
-                    text += f" → Exit: {trade.exit_price}"
-                text += f"\n  PnL: <b>{pnl_value:.2f} USDT</b>"
-                text += ch_display
-                
-                # Add timestamp
-                if trade.entry_time:
-                    time_str = trade.entry_time[:16] if len(trade.entry_time) > 16 else trade.entry_time
-                    text += f"\n  🕐 {time_str}"
-                
-                text += "\n\n"
+                    text += f" → {trade.exit_price}"
+                text += f" | PnL: <b>{pnl_value:.2f}</b>\n\n"
             
-            # Add per-channel analytics
-            if channel_stats and len(channel_stats) > 1:
-                text += f"📡 <b>Per-Channel Performance:</b>\n"
-                for ch_id, stats in sorted(channel_stats.items(), key=lambda x: x[1]['pnl'], reverse=True):
-                    ch_name = channel_name_map.get(ch_id, 'Unknown') if ch_id != 'unknown' else 'Unknown Channel'
+            # Add per-channel analytics (compact)
+            if channel_stats and len(channel_stats) > 1 and len(text) < 3800:
+                text += f"📡 <b>Per-Channel:</b>\n"
+                for ch_id, stats in sorted(channel_stats.items(), key=lambda x: x[1]['pnl'], reverse=True)[:5]:
+                    if len(text) > 3900:
+                        break
+                    ch_name = channel_name_map.get(ch_id, 'Unknown') if ch_id != 'unknown' else 'Unknown'
+                    if len(ch_name) > 15:
+                        ch_name = ch_name[:12] + "..."
                     ch_wr = (stats['wins'] / stats['count'] * 100) if stats['count'] > 0 else 0
-                    text += f"• {ch_name}\n"
-                    text += f"  Trades: {stats['count']} | WR: {ch_wr:.1f}% | PnL: {stats['pnl']:.2f}\n"
+                    text += f"• {ch_name}: {stats['count']} trades, {ch_wr:.0f}% WR, {stats['pnl']:.1f} PnL\n"
+            
+            # Ensure we don't exceed Telegram's limit
+            if len(text) > 4000:
+                text = text[:3950] + "\n\n<i>... (truncated)</i>"
             
             # Send the message
             await update.message.reply_text(
@@ -4958,12 +4979,21 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"📈 <b>Active Trades - {acc_name}</b>\n\n"
             text += f"Open positions ({len(active_trades)}):\n\n"
             
+            trades_shown = 0
             for trade in active_trades:
+                # Check message length to avoid exceeding Telegram's limit
+                if len(text) > 3500:
+                    text += f"<i>... and {len(active_trades) - trades_shown} more trades</i>\n"
+                    break
+                
                 text += f"<b>{trade.symbol}</b> {trade.side}\n"
-                text += f"Entry: {trade.entry_price}\n"
-                text += f"Quantity: {trade.quantity}\n"
-                text += f"Leverage: {trade.leverage}x\n"
-                text += f"Status: {trade.status}\n\n"
+                text += f"Entry: {trade.entry_price} | Qty: {trade.quantity}\n"
+                text += f"Leverage: {trade.leverage}x | Status: {trade.status}\n\n"
+                trades_shown += 1
+            
+            # Ensure we don't exceed Telegram's limit
+            if len(text) > 4000:
+                text = text[:3950] + "\n\n<i>... (truncated)</i>"
             
             await update.message.reply_text(text, parse_mode='HTML', reply_markup=build_account_page())
 
@@ -5361,12 +5391,22 @@ async def handle_active_trades(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     else:
         text = f"📈 <b>Active Trades ({len(active_trades)})</b>\n\n"
+        
+        trades_shown = 0
         for trade in active_trades:
+            # Check message length to avoid exceeding Telegram's limit
+            if len(text) > 3500:
+                text += f"<i>... and {len(active_trades) - trades_shown} more trades</i>\n"
+                break
+            
             text += f"<b>{trade.symbol}</b> {trade.side}\n"
-            text += f"Entry: {trade.entry_price}\n"
-            text += f"Quantity: {trade.quantity}\n"
-            text += f"Leverage: {trade.leverage}x\n"
-            text += f"Status: {trade.status}\n\n"
+            text += f"Entry: {trade.entry_price} | Qty: {trade.quantity}\n"
+            text += f"Leverage: {trade.leverage}x | Status: {trade.status}\n\n"
+            trades_shown += 1
+        
+        # Ensure we don't exceed Telegram's limit
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n<i>... (truncated)</i>"
         
         await update.message.reply_text(text, parse_mode='HTML')
 
@@ -5393,29 +5433,42 @@ async def handle_trade_history(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     else:
         text = f"📋 <b>Recent Trade History ({len(trade_history)})</b>\n\n"
+        
+        trades_shown = 0
         for trade in trade_history:
+            # Check message length to avoid exceeding Telegram's limit
+            if len(text) > 3500:
+                text += f"<i>... and {len(trade_history) - trades_shown} more trades</i>\n"
+                break
+            
             status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
             text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}\n"
             text += f"Entry: {trade.entry_price} | PnL: {trade.pnl}\n"
             
-            # Get and display channel name
+            # Get and display channel name (compact)
             if trade.channel_id:
                 try:
                     telethon_client = trading_bot.user_monitoring_clients.get(user_id)
                     if telethon_client:
                         try:
                             entity = await telethon_client.get_entity(int(trade.channel_id))
-                            channel_name = getattr(entity, 'title', f'Channel {trade.channel_id}')
-                            text += f"📡 Channel: {channel_name}\n"
+                            channel_name = getattr(entity, 'title', f'Ch {trade.channel_id[:8]}')
+                            if len(channel_name) > 20:
+                                channel_name = channel_name[:17] + "..."
+                            text += f"📡 {channel_name}\n"
                         except Exception:
-                            text += f"📡 Channel: {trade.channel_id}\n"
+                            text += f"📡 Ch {trade.channel_id[:8]}\n"
                     else:
-                        text += f"📡 Channel: {trade.channel_id}\n"
+                        text += f"📡 Ch {trade.channel_id[:8]}\n"
                 except Exception as e:
                     logger.debug(f"Could not get channel name for {trade.channel_id}: {e}")
-                    text += f"📡 Channel: {trade.channel_id}\n"
             
             text += f"Time: {trade.entry_time[:16]}\n\n"
+            trades_shown += 1
+        
+        # Ensure we don't exceed Telegram's limit
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n<i>... (truncated)</i>"
         
         await update.message.reply_text(text, parse_mode='HTML')
 
@@ -5978,6 +6031,8 @@ Next: open ⚙️ Settings""",
             acc = trading_bot.get_current_account(user_id)
             if acc:
                 trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+                # Reload config to ensure fresh data
+                config = trading_bot.get_user_config(user_id)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
         return ConversationHandler.END
@@ -5988,6 +6043,8 @@ Next: open ⚙️ Settings""",
             acc = trading_bot.get_current_account(user_id)
             if acc:
                 trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+                # Reload config to ensure fresh data
+                config = trading_bot.get_user_config(user_id)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
         channels = context.user_data.get('available_channels', [])
@@ -6042,6 +6099,8 @@ The bot will automatically extract the channel ID.""",
             acc = trading_bot.get_current_account(user_id)
             if acc:
                 trading_bot.enhanced_db.update_monitored_channels(acc.account_id, config.monitored_channels)
+                # Reload config to ensure fresh data
+                config = trading_bot.get_user_config(user_id)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist monitored channels: {e}")
 
@@ -6187,6 +6246,8 @@ Next: press 🚀 Start on the account page""",
             current_account = trading_bot.get_current_account(user_id)
             if current_account:
                 trading_bot.enhanced_db.update_account_settings(current_account.account_id, use_signal_settings=config.use_signal_settings)
+                # Reload config from database to ensure fresh data
+                config = trading_bot.get_user_config(user_id)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist settings source: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
@@ -6203,6 +6264,8 @@ Next: press 🚀 Start on the account page""",
             current_account = trading_bot.get_current_account(user_id)
             if current_account:
                 trading_bot.enhanced_db.update_account_settings(current_account.account_id, create_sl_tp=config.create_sl_tp)
+                # Reload config from database to ensure fresh data
+                config = trading_bot.get_user_config(user_id)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist SL/TP setting: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
@@ -6219,6 +6282,8 @@ Next: press 🚀 Start on the account page""",
             current_account = trading_bot.get_current_account(user_id)
             if current_account:
                 trading_bot.enhanced_db.update_account_settings(current_account.account_id, make_webhook_enabled=config.make_webhook_enabled)
+                # Reload config from database to ensure fresh data
+                config = trading_bot.get_user_config(user_id)
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist webhook setting: {e}")
         keyboard_markup = create_settings_keyboard(user_id)
@@ -7686,29 +7751,44 @@ async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAUL
 
                 text = f"📋 <b>Trade History - {current_account.account_name}</b>\n\n"
                 text += f"Recent trades ({len(trade_history)}):\n\n"
+                
+                trades_shown = 0
                 for trade in trade_history:
+                    # Check message length to avoid exceeding Telegram's limit
+                    if len(text) > 3200:  # Leave room for channel stats
+                        text += f"<i>... and {len(trade_history) - trades_shown} more</i>\n\n"
+                        break
+                    
                     status_emoji = "🟢" if trade.status == "OPEN" else "🔴" if trade.status == "CLOSED" else "🟡"
                     ch = trade.channel_id or ''
                     ch_name = channel_name_map.get(ch, 'Unknown') if ch else ''
-                    ch_line = f" | Ch: {ch_name}" if ch_name else ""
+                    # Truncate long channel names
+                    if len(ch_name) > 15:
+                        ch_name = ch_name[:12] + "..."
+                    ch_line = f" | {ch_name}" if ch_name else ""
+                    
                     text += f"{status_emoji} <b>{trade.symbol}</b> {trade.side}{ch_line}\n"
-                    text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n"
-                    text += f"Time: {trade.entry_time[:16] if trade.entry_time else 'N/A'}\n\n"
+                    text += f"Entry: {trade.entry_price} | PnL: {trade.pnl if trade.pnl else '0'}\n\n"
+                    trades_shown += 1
 
-                # Append per-channel analytics with resolved names
-                if channel_stats:
-                    text += "📡 <b>Per-Channel Analytics</b>\n"
-                    for ch, cs in channel_stats.items():
+                # Append per-channel analytics (compact)
+                if channel_stats and len(text) < 3500:
+                    text += "📡 <b>Per-Channel:</b>\n"
+                    for ch, cs in list(channel_stats.items())[:5]:
+                        if len(text) > 3800:
+                            break
                         ch_name = channel_name_map.get(ch, ch) if ch != 'unknown' else 'Unknown'
+                        if len(ch_name) > 15:
+                            ch_name = ch_name[:12] + "..."
                         wr = (cs['wins']/cs['count']*100) if cs['count'] else 0
-                        text += f"- {ch_name}: {cs['count']} trades, WR {wr:.1f}%, PnL {cs['pnl']:.2f}\n"
+                        text += f"• {ch_name}: {cs['count']} trades, {wr:.0f}% WR, {cs['pnl']:.1f} PnL\n"
                     if total_trades:
                         overall_wr = wins/total_trades*100
-                        text += f"\n📊 Overall WR: {overall_wr:.1f}%\n"
+                        text += f"\n📊 Overall: {overall_wr:.1f}% WR\n"
 
-                # Truncate if too long for inline message
+                # Ensure we don't exceed Telegram's limit for inline messages
                 if len(text) > 4000:
-                    text = text[:3900] + "\n\n... (truncated)\n\nUse 📋 History button for full history."
+                    text = text[:3900] + "\n\n<i>... (truncated)</i>"
 
                 # Add back button to return to settings
                 back_keyboard = InlineKeyboardMarkup([[
