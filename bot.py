@@ -2527,8 +2527,10 @@ class TradingBot:
                             account_id = getattr(position, 'account_id', None)
                             if account_id:
                                 trade_history = self.enhanced_db.get_trade_history(account_id, limit=100)
-                                total_trades = len([t for t in trade_history if t.status == "CLOSED"])
-                                winning_trades = len([t for t in trade_history if t.status == "CLOSED" and t.pnl and float(t.pnl) > 0])
+                                # Only count trades with PnL data (exclude old trades without win/lose logs)
+                                trades_with_pnl = [t for t in trade_history if t.status == "CLOSED" and t.pnl is not None and str(t.pnl).strip() != '']
+                                total_trades = len(trades_with_pnl)
+                                winning_trades = len([t for t in trades_with_pnl if float(t.pnl) > 0])
                                 win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
                                 
                                 pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
@@ -2622,8 +2624,10 @@ class TradingBot:
                                                 account_id = getattr(position, 'account_id', None)
                                                 if account_id:
                                                     trade_history = self.enhanced_db.get_trade_history(account_id, limit=100)
-                                                    total_trades = len([t for t in trade_history if t.status == "CLOSED"])
-                                                    winning_trades = len([t for t in trade_history if t.status == "CLOSED" and t.pnl and float(t.pnl) > 0])
+                                                    # Only count trades with PnL data (exclude old trades without win/lose logs)
+                                                    trades_with_pnl = [t for t in trade_history if t.status == "CLOSED" and t.pnl is not None and str(t.pnl).strip() != '']
+                                                    total_trades = len(trades_with_pnl)
+                                                    winning_trades = len([t for t in trades_with_pnl if float(t.pnl) > 0])
                                                     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
                                                     
                                                     pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
@@ -2954,8 +2958,10 @@ class TradingBot:
                 usdt_balance = 0
                 if isinstance(bal, dict) and 'USDT' in bal:
                     asset = bal['USDT']
-                    usdt_balance = float(asset.get('total', asset.get('free', 0)) or 0)
-                    logger.info(f"✅ Found USDT balance: {usdt_balance}")
+                    # Use 'free' balance (not locked in positions) instead of 'total'
+                    usdt_balance = float(asset.get('free', 0) or 0)
+                    total_balance = float(asset.get('total', 0) or 0)
+                    logger.info(f"✅ Found USDT balance - Free: {usdt_balance:.2f}, Total: {total_balance:.2f}")
             except Exception as e:
                 logger.error(f"❌ Error getting account balance: {e}")
                 return {'success': False, 'error': f'Balance error: {str(e)}'}
@@ -4478,9 +4484,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Calculate PnL and win rate
             total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
             
-            # Calculate win rate from closed trades only
-            closed_trades = [t for t in trade_history if t.status == "CLOSED"]
-            winning_trades = [t for t in closed_trades if float(t.pnl or 0) > 0]
+            # Calculate win rate from closed trades with PnL data only
+            closed_trades = [t for t in trade_history if t.status == "CLOSED" and t.pnl is not None and str(t.pnl).strip() != '']
+            winning_trades = [t for t in closed_trades if float(t.pnl) > 0]
             win_rate = (len(winning_trades) / len(closed_trades) * 100) if closed_trades else 0
             
             monitor_status = "🟢" if trading_bot.monitoring_status.get(user_id, False) else "🔴"
@@ -4836,11 +4842,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             # Step 5: Build comprehensive history display
-            # Calculate overall statistics
-            total_trades = len(trade_history)
-            winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+            # Calculate overall statistics - only count trades with PnL data
+            trades_with_pnl = [t for t in trade_history if t.pnl is not None and str(t.pnl).strip() != '']
+            total_trades = len(trades_with_pnl)
+            winning_trades = sum(1 for t in trades_with_pnl if float(t.pnl) > 0)
             losing_trades = total_trades - winning_trades
-            total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+            total_pnl = sum(float(t.pnl) for t in trades_with_pnl)
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
             
             # Resolve channel names
@@ -5018,12 +5025,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_trades = trading_bot.enhanced_db.get_active_trades(acc_id)
         trade_history = trading_bot.enhanced_db.get_trade_history(acc_id, limit=100)
         
-        # Calculate statistics
-        total_trades = len(trade_history)
-        winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+        # Calculate statistics - only count trades with PnL data
+        trades_with_pnl = [t for t in trade_history if t.pnl is not None and str(t.pnl).strip() != '']
+        total_trades = len(trades_with_pnl)
+        winning_trades = sum(1 for t in trades_with_pnl if float(t.pnl) > 0)
         # Count all non-winning trades as losing (including break-even trades)
         losing_trades = total_trades - winning_trades
-        total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
+        total_pnl = sum(float(t.pnl) for t in trades_with_pnl)
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         
         # Build stats message
