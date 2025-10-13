@@ -2527,8 +2527,10 @@ class TradingBot:
                             account_id = getattr(position, 'account_id', None)
                             if account_id:
                                 trade_history = self.enhanced_db.get_trade_history(account_id, limit=100)
-                                total_trades = len([t for t in trade_history if t.status == "CLOSED"])
-                                winning_trades = len([t for t in trade_history if t.status == "CLOSED" and t.pnl and float(t.pnl) > 0])
+                                # Only count trades that were properly closed with actual win/lose data
+                                closed_trades = [t for t in trade_history if t.status == "CLOSED" and t.exit_time is not None]
+                                total_trades = len(closed_trades)
+                                winning_trades = len([t for t in closed_trades if t.pnl and float(t.pnl) > 0])
                                 win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
                                 
                                 pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
@@ -2622,8 +2624,10 @@ class TradingBot:
                                                 account_id = getattr(position, 'account_id', None)
                                                 if account_id:
                                                     trade_history = self.enhanced_db.get_trade_history(account_id, limit=100)
-                                                    total_trades = len([t for t in trade_history if t.status == "CLOSED"])
-                                                    winning_trades = len([t for t in trade_history if t.status == "CLOSED" and t.pnl and float(t.pnl) > 0])
+                                                    # Only count trades that were properly closed with actual win/lose data
+                                                    closed_trades = [t for t in trade_history if t.status == "CLOSED" and t.exit_time is not None]
+                                                    total_trades = len(closed_trades)
+                                                    winning_trades = len([t for t in closed_trades if t.pnl and float(t.pnl) > 0])
                                                     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
                                                     
                                                     pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
@@ -2954,8 +2958,9 @@ class TradingBot:
                 usdt_balance = 0
                 if isinstance(bal, dict) and 'USDT' in bal:
                     asset = bal['USDT']
-                    usdt_balance = float(asset.get('total', asset.get('free', 0)) or 0)
-                    logger.info(f"✅ Found USDT balance: {usdt_balance}")
+                    # Use 'free' balance instead of 'total' to avoid using locked funds
+                    usdt_balance = float(asset.get('free', 0) or 0)
+                    logger.info(f"✅ Found USDT balance - Free: {usdt_balance}, Total: {float(asset.get('total', 0) or 0)}")
             except Exception as e:
                 logger.error(f"❌ Error getting account balance: {e}")
                 return {'success': False, 'error': f'Balance error: {str(e)}'}
@@ -3097,12 +3102,32 @@ class TradingBot:
                 return {'success': False, 'error': f'Invalid or zero price for {signal.symbol}. Symbol may not be supported or not trading.'}
             
             # Calculate trade amount based on user preference
+            logger.info(f"💰 Balance calculation mode: {'Fixed USDT' if config.use_fixed_usdt_amount else 'Percentage'}")
+            logger.info(f"💰 Config values - Fixed: ${config.fixed_usdt_amount}, Percentage: {config.balance_percent}%")
+            
             if config.use_fixed_usdt_amount:
                 trade_amount = min(config.fixed_usdt_amount, usdt_balance)
-                logger.info(f"💰 Using fixed USDT amount: ${trade_amount:.2f}")
+                logger.info(f"💰 Using fixed USDT amount: ${trade_amount:.2f} (min of ${config.fixed_usdt_amount} and ${usdt_balance})")
             else:
-                trade_amount = usdt_balance * (config.balance_percent / 100)
-                logger.info(f"💰 Using percentage of balance: ${trade_amount:.2f} ({config.balance_percent}%)")
+                # Ensure percentage is in correct format (e.g., 10 for 10%, not 0.10)
+                percentage = float(config.balance_percent)
+                if percentage > 1:
+                    # Percentage is in format like 10 for 10%
+                    trade_amount = usdt_balance * (percentage / 100)
+                else:
+                    # Percentage might be in decimal format like 0.10 for 10% - convert it
+                    logger.warning(f"⚠️ Percentage {percentage} seems to be in decimal format, converting to standard format")
+                    trade_amount = usdt_balance * percentage
+                    percentage = percentage * 100  # For logging
+                
+                logger.info(f"💰 Using percentage of balance: ${trade_amount:.2f} ({percentage}% of ${usdt_balance})")
+                logger.info(f"💰 Calculation: ${usdt_balance} × {percentage}% = ${trade_amount:.2f}")
+                
+                # Safety check: if trade_amount is more than 50% of balance, something is wrong
+                if trade_amount > usdt_balance * 0.5:
+                    logger.error(f"❌ SAFETY CHECK FAILED: Trade amount ${trade_amount:.2f} is more than 50% of balance ${usdt_balance}")
+                    logger.error(f"❌ This suggests incorrect percentage value. Expected: {config.balance_percent}%")
+                    return {'success': False, 'error': f'Trade amount calculation error: ${trade_amount:.2f} exceeds safety limit (50% of ${usdt_balance}). Check your balance percentage setting.'}
             
             position_value = trade_amount * leverage
             
@@ -3113,10 +3138,12 @@ class TradingBot:
             raw_quantity = (trade_amount * leverage) / entry_price
 
             logger.info(f"🧮 Trade calculation:")
-            logger.info(f"   Balance: {usdt_balance} USDT")
-            logger.info(f"   Trade amount: ${trade_amount:.2f}")
-            logger.info(f"   Entry price: {entry_price}")
-            logger.info(f"   Raw quantity: {raw_quantity}")
+            logger.info(f"   Available Balance: ${usdt_balance:.2f} USDT")
+            logger.info(f"   Trade Amount: ${trade_amount:.2f} USDT ({(trade_amount/usdt_balance*100):.2f}% of balance)")
+            logger.info(f"   Leverage: {leverage}x")
+            logger.info(f"   Position Value: ${trade_amount * leverage:.2f}")
+            logger.info(f"   Entry Price: {entry_price}")
+            logger.info(f"   Raw Quantity: {raw_quantity}")
 
             precision_info = self.get_symbol_precision(signal.symbol)
             if 'error' in precision_info:
@@ -4837,8 +4864,10 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Step 5: Build comprehensive history display
             # Calculate overall statistics
-            total_trades = len(trade_history)
-            winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+            # Only count trades that were properly closed with actual win/lose data
+            closed_trades = [t for t in trade_history if t.status == "CLOSED" and t.exit_time is not None]
+            total_trades = len(closed_trades)
+            winning_trades = sum(1 for t in closed_trades if t.pnl and float(t.pnl) > 0)
             losing_trades = total_trades - winning_trades
             total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
@@ -5018,9 +5047,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_trades = trading_bot.enhanced_db.get_active_trades(acc_id)
         trade_history = trading_bot.enhanced_db.get_trade_history(acc_id, limit=100)
         
-        # Calculate statistics
-        total_trades = len(trade_history)
-        winning_trades = sum(1 for t in trade_history if t.pnl and float(t.pnl) > 0)
+            # Calculate statistics
+        # Only count trades that were properly closed with actual win/lose data
+        closed_trades = [t for t in trade_history if t.status == "CLOSED" and t.exit_time is not None]
+        total_trades = len(closed_trades)
+        winning_trades = sum(1 for t in closed_trades if t.pnl and float(t.pnl) > 0)
         # Count all non-winning trades as losing (including break-even trades)
         losing_trades = total_trades - winning_trades
         total_pnl = sum(float(t.pnl) if t.pnl else 0 for t in trade_history)
