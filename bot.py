@@ -1781,8 +1781,8 @@ class TradingBot:
         self.exchange: Optional[ccxt.Exchange] = None
         self.user_monitoring_clients: Dict[int, TelegramClient] = {}
         self.user_data: Dict[int, BotConfig] = {}
-        self.active_monitoring = {}
-        self.monitoring_tasks = {}
+        self.active_monitoring = {}  # Deprecated - use account_monitoring_status instead
+        self.monitoring_tasks: Dict[str, Any] = {}  # account_id -> monitoring task
         self.webhook_loggers: Dict[int, MakeWebhookLogger] = {}
         self.symbol_info_cache: Dict[str, Dict] = {}
         self.active_positions: Dict[str, ActivePosition] = {}
@@ -3739,12 +3739,13 @@ class TradingBot:
             self.account_monitoring_status[account_id] = True
             logger.info(f"🔛 Set account_monitoring_status[{account_id}] = True")
 
-            # Start background task to process Telethon events if not already running
-            if user_id not in self.monitoring_tasks or self.monitoring_tasks[user_id].done():
-                self.monitoring_tasks[user_id] = asyncio.create_task(self._run_telethon_client(user_id))
-                logger.info(f"✅ Started Telethon event loop task for user {user_id}")
+            # Start background task to process Telethon events for THIS ACCOUNT if not already running
+            # Each account gets its own monitoring task for true background monitoring
+            if account_id not in self.monitoring_tasks or self.monitoring_tasks[account_id].done():
+                self.monitoring_tasks[account_id] = asyncio.create_task(self._run_telethon_client(account_id, user_id))
+                logger.info(f"✅ Started Telethon event loop task for account {account_id} (user {user_id})")
             else:
-                logger.info(f"ℹ️ Telethon event loop task already running for user {user_id}")
+                logger.info(f"ℹ️ Telethon event loop task already running for account {account_id}")
 
             logger.info(f"📡 Monitoring now ACTIVE for user {user_id}")
             logger.info(f"📡 Monitored channels: {config.monitored_channels}")
@@ -3758,88 +3759,83 @@ class TradingBot:
             logger.error(f"❌ Start monitoring error details: {traceback.format_exc()}")
             return False
     
-    async def _run_telethon_client(self, user_id: int):
-        """Actively poll Telethon for new messages.
+    async def _run_telethon_client(self, account_id: str, user_id: int):
+        """Actively poll Telethon for new messages for a specific account.
         
-        This function manually checks for new messages in monitored channels.
-        This is more reliable than relying on Telethon's automatic event handlers
-        when integrating with other async frameworks like python-telegram-bot.
+        This function manually checks for new messages in monitored channels for ONE account.
+        Each account runs its own monitoring task, enabling true background monitoring.
+        
+        Args:
+            account_id: The account ID to monitor
+            user_id: The user ID that owns this account
         """
         try:
-            # Get current account to use account-specific Telethon client
-            current_account = self.get_current_account(user_id)
-            if not current_account:
-                logger.error(f"❌ No current account found for user {user_id}")
+            # Get account from database
+            accounts = self.enhanced_db.get_all_accounts()
+            account = None
+            for acc in accounts:
+                if acc.account_id == account_id:
+                    account = acc
+                    break
+            
+            if not account:
+                logger.error(f"❌ Account {account_id} not found")
                 return
             
-            account_id = current_account.account_id
             telethon_client = self.user_monitoring_clients.get(account_id)
             if not telethon_client:
                 logger.error(f"❌ No Telethon client found for account {account_id}")
                 return
             
-            logger.info(f"🔄 [_run_telethon_client] Starting message polling for user {user_id}")
-            logger.info(f"🔄 [_run_telethon_client] Active monitoring status: {self.active_monitoring.get(user_id, False)}")
+            logger.info(f"🔄 [_run_telethon_client] Starting message polling for account {account.account_name} (ID: {account_id})")
+            logger.info(f"🔄 [_run_telethon_client] Account monitoring status: {self.account_monitoring_status.get(account_id, False)}")
             
             # Ensure connection is established
             if not telethon_client.is_connected():
-                logger.info(f"🔌 [_run_telethon_client] Connecting Telethon client...")
+                logger.info(f"🔌 [_run_telethon_client] Connecting Telethon client for account {account.account_name}...")
                 await telethon_client.connect()
             
-            logger.info(f"✅ [_run_telethon_client] Telethon client connected, actively polling for new messages")
+            logger.info(f"✅ [_run_telethon_client] Telethon client connected for account {account.account_name}, actively polling for new messages")
             logger.info(f"✅ [_run_telethon_client] Entering polling loop...")
             
             # Track last message ID for each channel to detect new messages
             last_message_ids = {}
             
-            # Get bot instance (passed in via start_monitoring)
-            from telegram.ext import ContextTypes
-            
-            # Keep polling while monitoring is active
-            while self.active_monitoring.get(user_id, False):
+            # Keep polling while THIS ACCOUNT's monitoring is active
+            while self.account_monitoring_status.get(account_id, False):
                 try:
                     # Check if client is still connected
                     if not telethon_client.is_connected():
-                        logger.warning(f"⚠️ Telethon client disconnected for user {user_id}, reconnecting...")
+                        logger.warning(f"⚠️ Telethon client disconnected for account {account.account_name}, reconnecting...")
                         await telethon_client.connect()
                     
-                    # Get current config to check monitored channels
-                    config = self.get_user_config(user_id)
-                    if not config.monitored_channels:
-                        logger.debug(f"⏸️ No channels configured for user {user_id}, waiting...")
+                    # Get fresh account data from database to check monitored channels
+                    accounts = self.enhanced_db.get_all_accounts()
+                    account = None
+                    for acc in accounts:
+                        if acc.account_id == account_id:
+                            account = acc
+                            break
+                    
+                    if not account or not account.monitored_channels:
+                        logger.debug(f"⏸️ No channels configured for account {account_id}, waiting...")
                         await asyncio.sleep(10)
                         continue
                     
-                    logger.debug(f"🔍 Polling {len(config.monitored_channels)} channels for user {user_id}: {config.monitored_channels}")
+                    logger.debug(f"🔍 Polling {len(account.monitored_channels)} channels for account {account.account_name}: {account.monitored_channels}")
                     
-                    # Get ALL accounts for this user, not just current account
-                    # This ensures background monitoring works even when user is on different pages
-                    all_user_accounts = self.enhanced_db.get_user_accounts(user_id)
+                    # Monitor only THIS account's channels
+                    channels_to_check = [str(ch) for ch in account.monitored_channels]
                     
-                    # Collect all channels from all actively monitoring accounts
-                    channels_to_check_map = {}  # channel_id -> account_id mapping
-                    for account in all_user_accounts:
-                        # Only monitor channels for accounts that are actively monitoring
-                        if self.account_monitoring_status.get(account.account_id, False):
-                            logger.debug(f"🔍 Account {account.account_name} (ID: {account.account_id}) is actively monitoring")
-                            # Add this account's channels to the check list
-                            for ch in (account.monitored_channels or []):
-                                ch_str = str(ch)
-                                if ch_str in config.monitored_channels or ch in config.monitored_channels:
-                                    channels_to_check_map[ch_str] = account.account_id
-                                    logger.debug(f"📡 Will monitor channel {ch_str} for account {account.account_name}")
-                        else:
-                            logger.debug(f"⏸️ Account {account.account_name} (ID: {account.account_id}) monitoring is paused")
-                    
-                    if not channels_to_check_map:
-                        logger.debug(f"⏸️ No active channels to check for user {user_id}")
+                    if not channels_to_check:
+                        logger.debug(f"⏸️ No active channels to check for account {account_id}")
                         await asyncio.sleep(10)
                         continue
                     
-                    logger.info(f"🔍 Monitoring {len(channels_to_check_map)} channels across {len(all_user_accounts)} accounts for user {user_id}")
+                    logger.debug(f"🔍 Monitoring {len(channels_to_check)} channels for account {account.account_name}")
                     
                     # Check each monitored channel for new messages
-                    for channel_id_str, associated_account_id in channels_to_check_map.items():
+                    for channel_id_str in channels_to_check:
                         try:
                             # Convert string channel ID to entity
                             channel_id = int(channel_id_str)
@@ -3900,7 +3896,7 @@ class TradingBot:
                                 for msg in reversed(new_messages):
                                     if msg.id > last_message_ids[channel_id_str] and msg.message:
                                         logger.info(f"📨 Processing new message ID {msg.id}: {msg.message[:100]}...")
-                                        await self._handle_new_message(msg, channel_id_str, user_id, associated_account_id)
+                                        await self._handle_new_message(msg, channel_id_str, user_id, account_id)
                                     elif msg.id > last_message_ids[channel_id_str]:
                                         logger.debug(f"⏭️ Skipping message ID {msg.id} (no text content)")
                                 
@@ -3920,14 +3916,14 @@ class TradingBot:
                     await asyncio.sleep(5)
                     
                 except Exception as e:
-                    logger.error(f"❌ Error in message polling loop for user {user_id}: {e}")
+                    logger.error(f"❌ Error in message polling loop for account {account_id}: {e}")
                     logger.error(f"❌ Message polling loop error: {traceback.format_exc()}")
                     await asyncio.sleep(10)
             
-            logger.info(f"🛑 Message polling stopped for user {user_id}")
+            logger.info(f"🛑 Message polling stopped for account {account.account_name} (ID: {account_id})")
             
         except Exception as e:
-            logger.error(f"❌ Fatal error in message polling: {e}")
+            logger.error(f"❌ Fatal error in message polling for account {account_id}: {e}")
             logger.error(f"❌ Message polling fatal error: {traceback.format_exc()}")
     
     async def _handle_new_message(self, message, channel_id: str, user_id: int, account_id: str = None):
@@ -4569,6 +4565,13 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Stop monitoring for this account
                 trading_bot.account_monitoring_status[acc.account_id] = False
                 
+                # Stop account-specific monitoring task
+                if acc.account_id in trading_bot.monitoring_tasks:
+                    task = trading_bot.monitoring_tasks[acc.account_id]
+                    if not task.done():
+                        task.cancel()
+                    del trading_bot.monitoring_tasks[acc.account_id]
+                
                 # Close telethon client if exists for this account
                 if acc.account_id in trading_bot.user_monitoring_clients:
                     try:
@@ -4583,16 +4586,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error stopping {acc.account_name}: {e}")
         
-        # Stop user-level monitoring
+        # Stop user-level monitoring (legacy)
         trading_bot.active_monitoring[user_id] = False
         trading_bot.monitoring_status[user_id] = False
-        
-        # Stop any running monitoring tasks
-        if user_id in trading_bot.monitoring_tasks:
-            task = trading_bot.monitoring_tasks[user_id]
-            if not task.done():
-                task.cancel()
-            del trading_bot.monitoring_tasks[user_id]
         
         msg = f"🛑 <b>Stop All Accounts</b>\n\n"
         msg += f"✅ Successfully stopped: {stopped_count}\n"
@@ -5673,6 +5669,23 @@ async def handle_stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Stop monitoring for THIS account only
         trading_bot.account_monitoring_status[account_id] = False
         
+        # Stop account-specific monitoring task
+        if account_id in trading_bot.monitoring_tasks:
+            task = trading_bot.monitoring_tasks[account_id]
+            if not task.done():
+                task.cancel()
+            del trading_bot.monitoring_tasks[account_id]
+        
+        # Close telethon client for this account
+        if account_id in trading_bot.user_monitoring_clients:
+            try:
+                client = trading_bot.user_monitoring_clients[account_id]
+                if client.is_connected():
+                    await client.disconnect()
+                del trading_bot.user_monitoring_clients[account_id]
+            except Exception as e:
+                logger.error(f"Error closing telethon client for account {account_id}: {e}")
+        
         # Check if any other accounts for this user are still monitoring
         user_accounts = trading_bot.enhanced_db.get_user_accounts(user_id)
         any_monitoring = False
@@ -5681,29 +5694,10 @@ async def handle_stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
                 any_monitoring = True
                 break
         
-        # Only stop Telethon client if NO accounts are monitoring
+        # Update legacy user-level flags
         if not any_monitoring:
             trading_bot.active_monitoring[user_id] = False
             trading_bot.monitoring_status[user_id] = False
-            
-            # Stop any running monitoring tasks
-            if user_id in trading_bot.monitoring_tasks:
-                task = trading_bot.monitoring_tasks[user_id]
-                if not task.done():
-                    task.cancel()
-                del trading_bot.monitoring_tasks[user_id]
-            
-            # Close telethon client if exists for all user's accounts
-            user_accounts = trading_bot.enhanced_db.get_user_accounts(user_id)
-            for acc in user_accounts:
-                if acc.account_id in trading_bot.user_monitoring_clients:
-                    try:
-                        client = trading_bot.user_monitoring_clients[acc.account_id]
-                        if client.is_connected():
-                            await client.disconnect()
-                        del trading_bot.user_monitoring_clients[acc.account_id]
-                    except Exception as e:
-                        logger.error(f"Error closing telethon client for account {acc.account_id}: {e}")
         
         await update.message.reply_text(
             f"🛑 <b>Trading Stopped Successfully!</b>\n\n"
@@ -6700,12 +6694,35 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to start!", parse_mode='HTML')
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Legacy stop monitoring function - stops all accounts for the user"""
     user_id = update.effective_user.id
+    
+    # Stop all accounts for this user
+    accs = trading_bot.enhanced_db.get_user_accounts(user_id)
+    stopped_count = 0
+    
+    for acc in accs:
+        try:
+            # Stop monitoring for this account
+            trading_bot.account_monitoring_status[acc.account_id] = False
+            
+            # Stop account-specific monitoring task
+            if acc.account_id in trading_bot.monitoring_tasks:
+                task = trading_bot.monitoring_tasks[acc.account_id]
+                if not task.done():
+                    task.cancel()
+                del trading_bot.monitoring_tasks[acc.account_id]
+            
+            stopped_count += 1
+        except Exception as e:
+            logger.error(f"Error stopping {acc.account_name}: {e}")
+    
+    # Update legacy flags
     trading_bot.active_monitoring[user_id] = False
     trading_bot.monitoring_status[user_id] = False
     trading_bot.order_monitor_running = False
 
-    await update.message.reply_text("🛑 <b>Monitoring stopped!</b>", parse_mode='HTML')
+    await update.message.reply_text(f"🛑 <b>Monitoring stopped!</b>\n\nStopped {stopped_count} account(s).", parse_mode='HTML')
 
 # ================== TEST SIGNAL ==================
 
