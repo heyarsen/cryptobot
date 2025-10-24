@@ -1236,6 +1236,35 @@ class EnhancedDatabase:
             # On error, allow the trade to proceed
             return True
     
+    def can_trade_account(self, account_id: str, cooldown_hours: int = 24) -> bool:
+        """Check if any trade can be opened for this account based on a 24-hour cooldown."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT entry_time FROM trade_history
+                WHERE account_id = ?
+                ORDER BY entry_time DESC
+                LIMIT 1
+            ''', (account_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return True
+            from datetime import datetime, timedelta
+            last_trade_time = datetime.fromisoformat(row[0])
+            current_time = datetime.now()
+            time_diff = current_time - last_trade_time
+            can_trade = time_diff >= timedelta(hours=cooldown_hours)
+            if not can_trade:
+                remaining_hours = cooldown_hours - (time_diff.total_seconds() / 3600)
+                logger.info(f"⏳ Account {account_id} is in cooldown. {remaining_hours:.1f} hours remaining.")
+            return can_trade
+        except Exception as e:
+            logger.error(f"❌ Failed to check account cooldown: {e}")
+            # On error, allow the trade to proceed to avoid false negatives
+            return True
+    
     def update_trade_status(self, trade_id: str, status: Optional[str] = None,
                              pnl: Optional[float] = None, exit_time: Optional[str] = None) -> bool:
         """Update trade status/PnL/exit_time for an existing trade id."""
@@ -2914,18 +2943,15 @@ class TradingBot:
             current_account = self.get_current_account(config.user_id)
             account_key = current_account.account_id if current_account else None
 
-            # Check symbol cooldown if enabled on the account
-            cooldown_hours = 0
-            if current_account and getattr(current_account, 'cooldown_enabled', False):
-                try:
-                    cooldown_hours = int(getattr(current_account, 'cooldown_hours', 24) or 24)
-                except Exception:
-                    cooldown_hours = 24
-            if cooldown_hours and account_key and not self.enhanced_db.can_trade_symbol(account_key, signal.symbol, cooldown_hours=cooldown_hours):
-                logger.warning(f"⏳ Trade blocked: {signal.symbol} is in 24-hour cooldown for account {current_account.account_name if current_account else account_key}")
+            # Enforce strict 24-hour per-account cooldown (applies to all symbols)
+            cooldown_hours = 24
+            if account_key and not self.enhanced_db.can_trade_account(account_key, cooldown_hours=cooldown_hours):
+                logger.warning(
+                    f"⏳ Trade blocked: account {current_account.account_name if current_account else account_key} is in 24-hour cooldown"
+                )
                 return {
-                    'success': False, 
-                    'error': f'Symbol {signal.symbol} is in cooldown for {cooldown_hours}h.'
+                    'success': False,
+                    'error': f'Account cooldown active. Try again after {cooldown_hours}h.'
                 }
 
             if account_key and account_key in self.account_exchanges:
