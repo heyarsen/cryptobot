@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Enhanced Signal Parser v2.2 - Improved Pattern Recognition for Multi-Line Signals
+Enhanced Signal Parser v2.3 - FIXED: Signals anywhere in message
 Handles signals where trading information is not at the beginning of the message
+NOW WORKS WITH: Messages starting with any text before signal keywords
 """
 
 import re
@@ -56,7 +57,7 @@ class EnhancedSignalParser:
     
     # Enhanced symbol patterns - now searches across entire text, not just beginning
     SYMBOL_PATTERNS = [
-        # NEW: Handle "🗯DYM LONG📈" format anywhere in text
+        # NEW: Handle "🗯DYM LONG📈" format anywhere in text - HIGHEST PRIORITY
         r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📈',  # 🗯DYM LONG📈
         r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📉',  # 🗯DYM SHORT📉
         r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)',    # 🗯DYM LONG
@@ -70,12 +71,12 @@ class EnhancedSignalParser:
         r'#([A-Z]{2,10})\s+(SHORT|LONG|ЛОНГ|ШОРТ)',  # #SOL SHORT, #BTC LONG
         r'#([A-Z]{2,10})(?:/USDT|USDT)?',  # #BTCUSDT, #BTC/USDT
         
-        # Standard patterns
-        r'\b(LONG|SHORT|ЛОНГ|ШОРТ)\s*#?\s*([A-Z]{2,10})(?:/USDT|USDT)?',
-        r'([A-Z]{2,10})(?:/USDT|USDT)?\s+(LONG|SHORT|ЛОНГ|ШОРТ)',
+        # Standard patterns - search anywhere in message
+        r'(?:^|\s)(LONG|SHORT|ЛОНГ|ШОРТ)\s*#?\s*([A-Z]{2,10})(?:/USDT|USDT)?',
+        r'(?:^|\s)([A-Z]{2,10})(?:/USDT|USDT)?\s+(LONG|SHORT|ЛОНГ|ШОРТ)',
         
-        # Look for symbols in any line that might be trading pairs
-        r'\b([A-Z]{2,10})(?:/USDT|USDT)?\b',   # Any potential crypto symbol
+        # Look for symbols in any line that might be trading pairs - ANYWHERE in text
+        r'(?:^|\s)([A-Z]{2,10})(?:/USDT|USDT)?\b',   # Any potential crypto symbol
         r'([A-Z]{2,10})\s*—',              # BTC —
     ]
     
@@ -178,36 +179,24 @@ class EnhancedSignalParser:
             if not text:
                 return None
             
-            # NEW: Look for signal indicators and extract the trading block
-            trading_block = EnhancedSignalParser._extract_trading_block(text)
-            if trading_block:
-                logger.info(f"📦 Extracted trading block: {trading_block[:100]}...")
-                # Use the extracted block for parsing
-                parse_text = trading_block
-            else:
-                # No specific block found, use entire text
-                parse_text = text
+            # NEW APPROACH: Search for symbols and sides ANYWHERE in the entire message
+            # This fixes the issue where signals are not at the beginning of the message
+            logger.info(f"📝 Full message text: {text[:300]}...")
             
-            # Extract symbol and side together for better accuracy
-            symbol, side = EnhancedSignalParser._extract_symbol_and_side(parse_text)
+            # Extract symbol and side together for better accuracy - search ENTIRE message
+            symbol, side = EnhancedSignalParser._extract_symbol_and_side_anywhere(text)
             if not symbol or not side:
-                logger.info(f"❌ Missing symbol ({symbol}) or side ({side}) in trading block")
-                # Fallback: try parsing the entire original text
-                if parse_text != text:
-                    logger.info("🔄 Fallback: trying entire message")
-                    symbol, side = EnhancedSignalParser._extract_symbol_and_side(text)
-                    parse_text = text  # Use full text for other extractions
-                
-                if not symbol or not side:
-                    logger.info(f"❌ Still missing symbol ({symbol}) or side ({side})")
-                    return None
+                logger.info(f"❌ Missing symbol ({symbol}) or side ({side}) when searching entire message")
+                return None
             
-            # Extract other components from the parse_text
-            entry_price = EnhancedSignalParser._extract_entry_price(parse_text)
-            take_profits = EnhancedSignalParser._extract_take_profits(parse_text)
-            stop_loss = EnhancedSignalParser._extract_stop_loss(parse_text)
-            leverage = EnhancedSignalParser._extract_leverage(parse_text)
-            risk_percentage = EnhancedSignalParser._extract_risk_percentage(parse_text)
+            logger.info(f"✅ Found symbol and side anywhere in message: {symbol} {side}")
+            
+            # Extract other components from the ENTIRE text (not just a trading block)
+            entry_price = EnhancedSignalParser._extract_entry_price(text)
+            take_profits = EnhancedSignalParser._extract_take_profits(text)
+            stop_loss = EnhancedSignalParser._extract_stop_loss(text)
+            leverage = EnhancedSignalParser._extract_leverage(text)
+            risk_percentage = EnhancedSignalParser._extract_risk_percentage(text)
             
             logger.info(f"📊 Parsed components - Entry: {entry_price}, TP: {take_profits}, SL: {stop_loss}, Lev: {leverage}")
             
@@ -238,6 +227,174 @@ class EnhancedSignalParser:
         except Exception as e:
             logger.error(f"❌ Error parsing signal: {e}")
             return None
+    
+    @staticmethod
+    def _extract_symbol_and_side_anywhere(text: str) -> tuple[Optional[str], Optional[str]]:
+        """Extract both symbol and side from ANYWHERE in the message - FIXED VERSION"""
+        
+        # NEW: Search for trading patterns anywhere in the ENTIRE message using MULTILINE and DOTALL flags
+        # This is the key fix: we search the entire message, not just specific blocks
+        
+        combined_patterns = [
+            # HIGHEST PRIORITY: Handle the specific format "🗯DYM LONG📈" anywhere in message
+            r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📈',  # 🗯DYM LONG📈
+            r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📉',  # 🗯DYM SHORT📉
+            r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)',    # 🗯DYM LONG
+            
+            # Standard patterns with emojis anywhere in message
+            r'([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📈',   # DYM LONG📈
+            r'([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📉',   # DYM SHORT📉
+            r'([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)',     # DYM LONG
+            
+            # Hash format
+            r'#([A-Z]{2,10})\s+(SHORT|LONG|ЛОНГ|ШОРТ)',    # #SOL SHORT
+            
+            # Reverse order patterns
+            r'(?:^|\s)(LONG|SHORT|ЛОНГ|ШОРТ)\s+([A-Z]{2,10})(?:/USDT|USDT)?',  # LONG BTC
+            r'([A-Z]{2,10})(?:/USDT|USDT)?\s+(LONG|SHORT|ЛОНГ|ШОРТ)',    # BTC LONG
+        ]
+        
+        # CRITICAL FIX: Use MULTILINE | DOTALL | IGNORECASE to search EVERYWHERE in the message
+        for pattern in combined_patterns:
+            # Search EVERYWHERE in the text, not just line by line
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            if match:
+                groups = match.groups()
+                logger.info(f"🎯 Pattern matched ANYWHERE in message: {pattern} -> groups: {groups}")
+                
+                # Determine which group is symbol and which is side
+                symbol_group = None
+                side_group = None
+                
+                for group in groups:
+                    if re.match(r'^(LONG|SHORT|ЛОНГ|ШОРТ)$', group, re.IGNORECASE):
+                        side_group = group.upper()
+                        # Normalize Cyrillic to English
+                        if side_group in ['ЛОНГ']:
+                            side_group = 'LONG'
+                        elif side_group in ['ШОРТ']:
+                            side_group = 'SHORT'
+                    elif re.match(r'^[A-Z]{2,10}$', group, re.IGNORECASE) and not group.isdigit():
+                        symbol_group = group.upper()
+                
+                if symbol_group and side_group:
+                    # Clean up symbol
+                    symbol = symbol_group
+                    if not symbol.endswith('USDT'):
+                        symbol = symbol + 'USDT'
+                    
+                    # Fix double USDT
+                    if symbol.endswith('USDUSDT'):
+                        symbol = symbol.replace('USDUSDT', 'USDT')
+                    
+                    logger.info(f"✅ Combined pattern matched ANYWHERE: {symbol} {side_group}")
+                    return symbol, side_group
+        
+        # NEW FALLBACK: Search for symbols and sides separately ANYWHERE in the message
+        logger.info("🔄 No combined pattern found, searching separately anywhere in message...")
+        symbol = EnhancedSignalParser._extract_symbol_anywhere(text)
+        side = EnhancedSignalParser._extract_side_anywhere(text)
+        
+        logger.info(f"🔄 Separate extraction anywhere in message: symbol={symbol}, side={side}")
+        return symbol, side
+    
+    @staticmethod
+    def _extract_symbol_anywhere(text: str) -> Optional[str]:
+        """Extract trading symbol from ANYWHERE in the message - FIXED VERSION"""
+        
+        # Look through all patterns, prioritizing those with emoji indicators
+        priority_patterns = []
+        regular_patterns = []
+        
+        for pattern in EnhancedSignalParser.SYMBOL_PATTERNS:
+            if '🗯' in pattern or '📈' in pattern or '📉' in pattern:
+                priority_patterns.append(pattern)
+            else:
+                regular_patterns.append(pattern)
+        
+        # Try priority patterns first
+        all_patterns = priority_patterns + regular_patterns
+        
+        for pattern in all_patterns:
+            # CRITICAL FIX: Use MULTILINE | DOTALL | IGNORECASE to search EVERYWHERE
+            matches = list(re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL))
+            
+            for match in matches:
+                if len(match.groups()) >= 2:
+                    # Handle patterns with multiple groups
+                    for group in match.groups():
+                        if (re.match(r'^[A-Z]{2,10}$', group, re.IGNORECASE) and 
+                            not group.isdigit() and 
+                            not re.match(r'^(LONG|SHORT|ЛОНГ|ШОРТ)$', group, re.IGNORECASE)):
+                            symbol = group.upper()
+                            break
+                    else:
+                        continue
+                else:
+                    symbol = match.group(1).upper()
+                
+                # Skip if symbol is just numbers or too short
+                if symbol.isdigit() or len(symbol) < 2 or symbol in ['X', 'XX', 'XXX']:
+                    continue
+                
+                # Normalize symbol
+                if not symbol.endswith('USDT'): 
+                    symbol = symbol + 'USDT'
+                
+                # Fix double USDT
+                if symbol.endswith('USDUSDT'):
+                    symbol = symbol.replace('USDUSDT', 'USDT')
+                
+                logger.info(f"✅ Symbol found ANYWHERE with pattern {pattern}: {symbol}")
+                return symbol
+        
+        return None
+    
+    @staticmethod
+    def _extract_side_anywhere(text: str) -> Optional[str]:
+        """Extract trade side (LONG/SHORT) from ANYWHERE in the message - FIXED VERSION"""
+        
+        # CRITICAL FIX: Use MULTILINE | DOTALL | IGNORECASE to search EVERYWHERE in message
+        
+        # First, check for explicit SHORT/LONG words anywhere in text (highest priority)
+        if re.search(r'\bSHORT\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            logger.info("✅ Found SHORT keyword anywhere in message")
+            return 'SHORT'
+        if re.search(r'\bLONG\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            logger.info("✅ Found LONG keyword anywhere in message")
+            return 'LONG'
+        
+        # Check for Russian equivalents anywhere in message
+        if re.search(r'\bШОРТ\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            logger.info("✅ Found ШОРТ keyword anywhere in message")
+            return 'SHORT'
+        if re.search(r'\bЛОНГ\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            logger.info("✅ Found ЛОНГ keyword anywhere in message")
+            return 'LONG'
+        
+        # Check for BUY/SELL anywhere in message
+        if re.search(r'\bSELL\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            logger.info("✅ Found SELL keyword anywhere in message")
+            return 'SHORT'
+        if re.search(r'\bBUY\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            logger.info("✅ Found BUY keyword anywhere in message")
+            return 'LONG'
+        
+        # Only check emojis if no explicit words found - search EVERYWHERE
+        # Check for SHORT patterns (emojis and other indicators)
+        for pattern in EnhancedSignalParser.SHORT_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+                logger.info(f"✅ Found SHORT pattern anywhere in message: {pattern}")
+                return 'SHORT'
+        
+        # Check for LONG patterns (emojis and other indicators)
+        for pattern in EnhancedSignalParser.LONG_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+                logger.info(f"✅ Found LONG pattern anywhere in message: {pattern}")
+                return 'LONG'
+        
+        logger.info("❌ No side pattern found anywhere in message")
+        return None
     
     @staticmethod
     def _extract_trading_block(text: str) -> Optional[str]:
@@ -286,14 +443,15 @@ class EnhancedSignalParser:
                         logger.info(f"📦 Extracted trading block from lines {signal_start_idx + 1 + i} to {signal_start_idx + 1 + i + end_idx - 1}")
                         return trading_block
             
-            # If no signal indicator found, look for trading symbols anywhere in the message
+            # NEW: If no signal indicator found, look for trading symbols ANYWHERE in the message
             for i, line in enumerate(lines):
                 line_stripped = line.strip()
                 if not line_stripped:
                     continue
                 
-                # Check if this line contains trading symbols
-                if re.search(r'🗯.*[A-Z]{2,10}.*(?:LONG|SHORT|ЛОНГ|ШОРТ)', line_stripped, re.IGNORECASE):
+                # Check if this line contains trading symbols ANYWHERE
+                if re.search(r'🗯.*[A-Z]{2,10}.*(?:LONG|SHORT|ЛОНГ|ШОРТ)', line_stripped, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+                    logger.info(f"📦 Found trading pattern at line {i}: {line_stripped}")
                     # Found potential start, extract from here
                     trading_lines = lines[i:]
                     
@@ -309,71 +467,15 @@ class EnhancedSignalParser:
                     logger.info(f"📦 Extracted trading block without signal indicator from line {i}")
                     return trading_block
             
-            # If still no trading block found, return None to use full text
+            # NEW: Final fallback - if we still can't find a specific trading block,
+            # the entire message might BE the signal (just with some intro text)
+            # Return None to indicate we should use the full text
+            logger.info("📦 No specific trading block found, will use entire message")
             return None
             
         except Exception as e:
             logger.error(f"❌ Error extracting trading block: {e}")
             return None
-    
-    @staticmethod
-    def _extract_symbol_and_side(text: str) -> tuple[Optional[str], Optional[str]]:
-        """Extract both symbol and side together for better accuracy"""
-        # Try patterns that capture both symbol and side
-        combined_patterns = [
-            # NEW: Handle the specific format "🗯DYM LONG📈" - prioritize this pattern
-            r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📈',  # 🗯DYM LONG📈
-            r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📉',  # 🗯DYM SHORT📉
-            r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)',    # 🗯DYM LONG
-            
-            r'([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📈',   # DYM LONG📈
-            r'([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📉',   # DYM SHORT📉
-            r'([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)',     # DYM LONG
-            r'#([A-Z]{2,10})\s+(SHORT|LONG|ЛОНГ|ШОРТ)',    # #SOL SHORT
-            r'\b(LONG|SHORT|ЛОНГ|ШОРТ)\s+([A-Z]{2,10})(?:/USDT|USDT)?',  # LONG BTC
-            r'([A-Z]{2,10})(?:/USDT|USDT)?\s+(LONG|SHORT|ЛОНГ|ШОРТ)',    # BTC LONG
-        ]
-        
-        for pattern in combined_patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                groups = match.groups()
-                logger.info(f"🎯 Pattern matched: {pattern} -> groups: {groups}")
-                
-                # Determine which group is symbol and which is side
-                symbol_group = None
-                side_group = None
-                
-                for group in groups:
-                    if re.match(r'^(LONG|SHORT|ЛОНГ|ШОРТ)$', group, re.IGNORECASE):
-                        side_group = group.upper()
-                        # Normalize Cyrillic to English
-                        if side_group in ['ЛОНГ']:
-                            side_group = 'LONG'
-                        elif side_group in ['ШОРТ']:
-                            side_group = 'SHORT'
-                    elif re.match(r'^[A-Z]{2,10}$', group, re.IGNORECASE) and not group.isdigit():
-                        symbol_group = group.upper()
-                
-                if symbol_group and side_group:
-                    # Clean up symbol
-                    symbol = symbol_group
-                    if not symbol.endswith('USDT'):
-                        symbol = symbol + 'USDT'
-                    
-                    # Fix double USDT
-                    if symbol.endswith('USDUSDT'):
-                        symbol = symbol.replace('USDUSDT', 'USDT')
-                    
-                    logger.info(f"✅ Combined pattern matched: {symbol} {side_group}")
-                    return symbol, side_group
-        
-        # Fallback: extract symbol and side separately
-        symbol = EnhancedSignalParser._extract_symbol(text)
-        side = EnhancedSignalParser._extract_side(text)
-        
-        logger.info(f"🔄 Fallback extraction: symbol={symbol}, side={side}")
-        return symbol, side
     
     @staticmethod
     def _extract_symbol(text: str) -> Optional[str]:
@@ -392,8 +494,8 @@ class EnhancedSignalParser:
         all_patterns = priority_patterns + regular_patterns
         
         for pattern in all_patterns:
-            # Use MULTILINE flag to match across lines
-            matches = list(re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE))
+            # CRITICAL FIX: Use MULTILINE | DOTALL | IGNORECASE to search EVERYWHERE
+            matches = list(re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL))
             
             for match in matches:
                 if len(match.groups()) >= 2:
@@ -421,57 +523,60 @@ class EnhancedSignalParser:
                 if symbol.endswith('USDUSDT'):
                     symbol = symbol.replace('USDUSDT', 'USDT')
                 
-                logger.info(f"✅ Symbol found with pattern {pattern}: {symbol}")
+                logger.info(f"✅ Symbol found ANYWHERE with pattern {pattern}: {symbol}")
                 return symbol
         
         return None
     
     @staticmethod
     def _extract_side(text: str) -> Optional[str]:
-        """Extract trade side (LONG/SHORT) from text"""
+        """Extract trade side (LONG/SHORT) from ANYWHERE in the message"""
+        
+        # CRITICAL FIX: Use MULTILINE | DOTALL | IGNORECASE to search EVERYWHERE
+        
         # First, check for explicit SHORT/LONG words anywhere in text (highest priority)
-        # Use MULTILINE flag to search across all lines
-        if re.search(r'\bSHORT\b', text, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'\bSHORT\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
             return 'SHORT'
-        if re.search(r'\bLONG\b', text, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'\bLONG\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
             return 'LONG'
         
-        # Check for Russian equivalents
-        if re.search(r'\bШОРТ\b', text, re.IGNORECASE | re.MULTILINE):
+        # Check for Russian equivalents anywhere in message
+        if re.search(r'\bШОРТ\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
             return 'SHORT'
-        if re.search(r'\bЛОНГ\b', text, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'\bЛОНГ\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
             return 'LONG'
         
-        # Check for BUY/SELL
-        if re.search(r'\bSELL\b', text, re.IGNORECASE | re.MULTILINE):
+        # Check for BUY/SELL anywhere in message
+        if re.search(r'\bSELL\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
             return 'SHORT'
-        if re.search(r'\bBUY\b', text, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'\bBUY\b', text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
             return 'LONG'
         
-        # Only check emojis if no explicit words found
+        # Only check emojis if no explicit words found - search EVERYWHERE
         # Check for SHORT patterns (emojis and other indicators)
         for pattern in EnhancedSignalParser.SHORT_PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
                 return 'SHORT'
         
         # Check for LONG patterns (emojis and other indicators)
         for pattern in EnhancedSignalParser.LONG_PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
                 return 'LONG'
         
         return None
     
     @staticmethod
     def _extract_entry_price(text: str) -> Optional[float]:
-        """Extract entry price from text"""
+        """Extract entry price from ANYWHERE in the message"""
         for pattern in EnhancedSignalParser.ENTRY_PATTERNS:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            # CRITICAL FIX: Search EVERYWHERE in message
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
             if match:
                 try:
                     price_str = match.group(1).replace('$', '').replace(',', '.')
                     price = float(price_str)
                     if price > 0:
-                        logger.info(f"💲 Found entry price: {price}")
+                        logger.info(f"💲 Found entry price ANYWHERE: {price}")
                         return price
                 except ValueError:
                     continue
@@ -480,12 +585,13 @@ class EnhancedSignalParser:
     
     @staticmethod
     def _extract_take_profits(text: str) -> List[float]:
-        """Extract take profit levels from text with support for multiple values on same line"""
+        """Extract take profit levels from ANYWHERE in the message with support for multiple values on same line"""
         take_profits = []
         
-        # Look for multiple TP patterns
+        # Look for multiple TP patterns ANYWHERE in message
         for pattern in EnhancedSignalParser.TP_PATTERNS:
-            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+            # CRITICAL FIX: Search EVERYWHERE in message
+            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
             for match in matches:
                 if isinstance(match, tuple):
                     match = match[0]
@@ -494,7 +600,7 @@ class EnhancedSignalParser:
                 if 'цели' in pattern.lower():
                     # Extract all price-like numbers from the matched group
                     numbers = re.findall(r'([\d.,]+)', match)
-                    logger.info(f"🎯 Found multiple TP values in match '{match}': {numbers}")
+                    logger.info(f"🎯 Found multiple TP values ANYWHERE in match '{match}': {numbers}")
                     for num_str in numbers:
                         try:
                             tp_val = float(num_str.replace(',', '.'))
@@ -510,25 +616,26 @@ class EnhancedSignalParser:
                             tp_val = float(match.replace('$', '').replace(',', '.').strip())
                             if tp_val > 0:
                                 take_profits.append(tp_val)
-                                logger.info(f"  ✅ Added single TP: {tp_val}")
+                                logger.info(f"  ✅ Added single TP ANYWHERE: {tp_val}")
                         except ValueError:
                             continue
         
         # Remove duplicates and sort
         take_profits = sorted(list(set(take_profits)))
-        logger.info(f"🎯 Final take profits: {take_profits}")
+        logger.info(f"🎯 Final take profits found ANYWHERE: {take_profits}")
         
         # Limit to reasonable number of TPs
         return take_profits[:5]
     
     @staticmethod
     def _extract_stop_loss(text: str) -> Optional[float]:
-        """Extract stop loss from text with support for non-numeric values"""
+        """Extract stop loss from ANYWHERE in the message with support for non-numeric values"""
         for pattern in EnhancedSignalParser.SL_PATTERNS:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            # CRITICAL FIX: Search EVERYWHERE in message
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
             if match:
                 sl_value = match.group(1).strip()
-                logger.info(f"🛑 Found stop loss text: '{sl_value}'")
+                logger.info(f"🛑 Found stop loss text ANYWHERE: '{sl_value}'")
                 
                 # Check if it's a numeric value
                 try:
@@ -537,27 +644,28 @@ class EnhancedSignalParser:
                     if re.match(r'^[\d.]+$', clean_value):
                         sl = float(clean_value)
                         if sl > 0:
-                            logger.info(f"🛑 Parsed numeric stop loss: {sl}")
+                            logger.info(f"🛑 Parsed numeric stop loss ANYWHERE: {sl}")
                             return sl
                 except ValueError:
                     pass
                 
                 # If it's a non-numeric value like "пока не ставлю", log but return None
-                logger.info(f"🛑 Non-numeric stop loss found: {sl_value} (will use default SL)")
+                logger.info(f"🛑 Non-numeric stop loss found ANYWHERE: {sl_value} (will use default SL)")
                 return None  # Let the bot use its default SL settings
         
         return None
     
     @staticmethod
     def _extract_leverage(text: str) -> Optional[int]:
-        """Extract leverage from text with cross margin support"""
+        """Extract leverage from ANYWHERE in the message with cross margin support"""
         for pattern in EnhancedSignalParser.LEVERAGE_PATTERNS:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            # CRITICAL FIX: Search EVERYWHERE in message
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
             if match:
                 try:
                     leverage = int(match.group(1))
                     if 1 <= leverage <= 125:
-                        logger.info(f"⚡ Found leverage: {leverage}x")
+                        logger.info(f"⚡ Found leverage ANYWHERE: {leverage}x")
                         return leverage
                 except ValueError:
                     continue
@@ -566,14 +674,15 @@ class EnhancedSignalParser:
     
     @staticmethod
     def _extract_risk_percentage(text: str) -> Optional[float]:
-        """Extract risk percentage from text"""
+        """Extract risk percentage from ANYWHERE in the message"""
         for pattern in EnhancedSignalParser.RISK_PATTERNS:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            # CRITICAL FIX: Search EVERYWHERE in message
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
             if match:
                 try:
                     risk = float(match.group(1).replace(',', '.'))
                     if 0 < risk <= 100:
-                        logger.info(f"💰 Found risk percentage: {risk}%")
+                        logger.info(f"💰 Found risk percentage ANYWHERE: {risk}%")
                         return risk
                 except ValueError:
                     continue
@@ -632,7 +741,8 @@ def test_parser():
 
 🎁400$ на спот за регистрацию и торговлю на бирже Bybit📈""",
 
-        """Новости и аналитика
+        """Новости и аналитика рынка сегодня
+Прогнозы на завтра выглядят оптимистично
 
 🗯SOL SHORT📉
 
@@ -641,21 +751,47 @@ def test_parser():
 цели - 240$ 235$ 230$
 стоп - 250$
 
-Торговля с умом!""",
+Торговля с умом! Удачи всем!""",
 
-        """Ежедневный обзор рынка
-Сегодня интересные движения
+        """Ежедневный обзор рынка крипто
+Сегодня интересные движения по альткоинам
+Рекомендую обратить внимание на следующий сигнал
 
 🗯BTC LONG📈
 
 плечо - 5 кросс
 цена входа - 67500$
 цели - 68000$ 68500$ 69000$
-стоп - 67000$"""
+стоп - 67000$
+
+Успешных сделок!""",
+
+        """Привет, трейдеры!
+Смотрим на интересную настройку
+
+ETHUSDT LONG
+
+Entry: 2500
+Target: 2600 2700 2800
+SL: 2400
+Leverage: 10x
+
+Удачи в торговле!""",
+
+        """Внимание!
+Хорошая возможность
+
+BTC SHORT
+@45000
+TP: 44000 43000 42000
+Stop: 46000
+20x
+
+Будьте аккуратны!"""
     ]
     
-    print("🧪 Testing Enhanced Signal Parser v2.2")
-    print("=" * 50)
+    print("🧪 Testing Enhanced Signal Parser v2.3 - FIXED VERSION")
+    print("=" * 60)
     
     for i, signal_text in enumerate(test_signals, 1):
         print(f"\n📊 Testing Signal {i}:")
