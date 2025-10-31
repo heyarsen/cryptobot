@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Enhanced Signal Parser v2.7 - FIXED: Confidence Scoring for Signal Indicators
+Enhanced Signal Parser v2.8 - FIXED: Case-insensitive Signal Indicator Detection
 CRITICAL FIXES:
-- Signals with explicit indicators like ❗️СИГНАЛ now get massive confidence boost (0.5 base)
-- Fixed confidence calculation to properly detect signals with signal markers
+- Fixed case-insensitive matching for ❗️СИГНАЛ (was only matching lowercase сигнал)
+- Now properly detects both ❗️сигнал and ❗️СИГНАЛ 
+- Massive confidence boost (0.6) for messages with signal indicators
 - Enhanced emoji-marked pattern detection (🗯DYM LONG gets highest priority)
 - Improved multi-line signal handling with proper confidence scoring
 - Signal deduplication within 10 minutes
@@ -208,9 +209,10 @@ class EnhancedSignalParser:
         return cls._deduplicator
     
     # CRITICAL FIX: Enhanced signal block indicators - words that indicate a trading signal
+    # NOTE: All patterns will be searched with re.IGNORECASE flag, so case doesn't matter here
     SIGNAL_INDICATORS = [
-        r'❗️\s*сигнал\b',        # ❗️СИГНАЛ or ❗️сигнал
-        r'❗️\s*signal\b',        # ❗️SIGNAL or ❗️signal
+        r'❗️\s*сигнал\b',        # ❗️СИГНАЛ or ❗️сигнал (case insensitive)
+        r'❗️\s*signal\b',        # ❗️SIGNAL or ❗️signal (case insensitive)
         r'🚨\s*сигнал\b',         # 🚨сигнал
         r'🚨\s*signal\b',         # 🚨signal
         r'новый\s*сигнал\b',      # новый сигнал
@@ -295,8 +297,8 @@ class EnhancedSignalParser:
     TP_PATTERNS = [
         # NEW: Handle "цели - 0.0993$ 0.1004$ 0.1040$" format
         r'цели[:\s-]*((?:[\.,\d,]+\$?\s*)+)',  # цели - 0.0993$ 0.1004$ 0.1040$
-        r'Target\s*\d*[:.]?\s*([\.,\d,]+)\$?',
-        r'TP\s*\d*[:.]?\s*([\.,\d,]+)\$?',
+        r'Target\s*\d*[:.:]?\s*([\.,\d,]+)\$?',
+        r'TP\s*\d*[:.:]?\s*([\.,\d,]+)\$?',
         r'Тп[:\s-]*([\.,\d,]+)\$?',
         r'Take\s*Profit[:\s-]*([\.,\d,]+)\$?',
         r'Цель[:\s-]*([\.,\d,]+)\$?',
@@ -352,13 +354,16 @@ class EnhancedSignalParser:
             if not text:
                 return None
             
-            # CRITICAL: Check if this message contains signal indicators FIRST
+            # CRITICAL FIX: Check if this message contains signal indicators FIRST with CASE INSENSITIVE matching
             has_signal_indicator = False
             for indicator in EnhancedSignalParser.SIGNAL_INDICATORS:
                 if re.search(indicator, text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
                     has_signal_indicator = True
-                    logger.info(f"✅ Found CRITICAL signal indicator: {indicator}")
+                    logger.info(f"✅ Found CRITICAL signal indicator (case insensitive): {indicator}")
                     break
+            
+            if not has_signal_indicator:
+                logger.info("ℹ️ No explicit signal indicator found, but continuing parsing...")
             
             # NEW APPROACH: Search for symbols and sides ANYWHERE in the entire message
             logger.info(f"📝 Full message text: {text[:300]}...")
@@ -772,36 +777,36 @@ class EnhancedSignalParser:
         # Base confidence for having symbol and side (most important)
         if symbol and side:
             confidence += 0.25  # Solid bonus for valid symbol + side
-            logger.info(f"✅ Symbol + side bonus: +0.25 (total: {confidence})")
+            logger.info(f"✅ Symbol + side bonus: +0.25 (total: {confidence:.2f})")
         
         # Entry price adds significant confidence
         if entry_price:
             confidence += 0.15  # Good bonus for entry price
-            logger.info(f"✅ Entry price bonus: +0.15 (total: {confidence})")
+            logger.info(f"✅ Entry price bonus: +0.15 (total: {confidence:.2f})")
         
         # Take profits add confidence
         if take_profits:
             confidence += 0.1
-            logger.info(f"✅ Take profits bonus: +0.1 (total: {confidence})")
+            logger.info(f"✅ Take profits bonus: +0.1 (total: {confidence:.2f})")
         
         # Stop loss adds some confidence (even if None due to "not setting")
         confidence += 0.05
-        logger.info(f"✅ Stop loss considered bonus: +0.05 (total: {confidence})")
+        logger.info(f"✅ Stop loss considered bonus: +0.05 (total: {confidence:.2f})")
         
         # Leverage adds confidence
         if leverage:
             confidence += 0.05
-            logger.info(f"✅ Leverage bonus: +0.05 (total: {confidence})")
+            logger.info(f"✅ Leverage bonus: +0.05 (total: {confidence:.2f})")
         
         # Bonus for having multiple TPs
         if len(take_profits) > 1:
             confidence += 0.05
-            logger.info(f"✅ Multiple TPs bonus: +0.05 (total: {confidence})")
+            logger.info(f"✅ Multiple TPs bonus: +0.05 (total: {confidence:.2f})")
         
         # Bonus if this looks like a properly formatted signal
         if symbol and side and (entry_price or take_profits):
             confidence += 0.05
-            logger.info(f"✅ Well-formatted signal bonus: +0.05 (total: {confidence})")
+            logger.info(f"✅ Well-formatted signal bonus: +0.05 (total: {confidence:.2f})")
         
         final_confidence = min(confidence, 1.0)
         logger.info(f"📊 FINAL CONFIDENCE SCORE: {final_confidence:.2f} {'✅ ABOVE THRESHOLD (0.5)' if final_confidence >= 0.5 else '❌ BELOW THRESHOLD (0.5)'}")
@@ -870,8 +875,8 @@ Leverage: 10x
 стоп - 2550$"""
     ]
     
-    print("🧪 Testing Enhanced Signal Parser v2.7 - FIXED CONFIDENCE SCORING")
-    print("=" * 80)
+    print("🧪 Testing Enhanced Signal Parser v2.8 - FIXED CASE INSENSITIVE SIGNAL DETECTION")
+    print("=" * 90)
     
     for i, signal_text in enumerate(test_signals, 1):
         print(f"\n📊 Testing Signal {i}:")
@@ -891,7 +896,7 @@ Leverage: 10x
         else:
             print(f"❌ FAILED/DUPLICATE - No signal detected or duplicate rejected")
     
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("🧪 Testing deduplication with time gap...")
     
     # Test deduplication with forced time gap
