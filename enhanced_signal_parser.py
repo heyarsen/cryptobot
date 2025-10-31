@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Enhanced Signal Parser v2.4 - FIXED: Duplicates + Symbol Detection
+Enhanced Signal Parser v2.5 - FIXED: Symbol Detection + Confidence Scoring
 New Features:
 - Signal deduplication within 10 minutes
 - Improved symbol detection when not first word
-- Better position in text handling
+- Better confidence scoring for signals with indicators
+- Enhanced handling of multi-line signals
 """
 
 import re
@@ -274,43 +275,43 @@ class EnhancedSignalParser:
     
     # Enhanced entry price patterns with Ukrainian terms
     ENTRY_PATTERNS = [
-        r'цена входа[:\s-]*([\.\d,]+)\$?',  # цена входа - 0.0983$
-        r'вход[:\s-]*([\.\d,]+)\$?',        # вход - 0.0983$
-        r'Entry[:\s-]*([\.\d,]+)\$?',
-        r'@\s*([\.\d,]+)\$?',
-        r'Price[:\s-]*([\.\d,]+)\$?',
-        r'Цена[:\s-]*([\.\d,]+)\$?',
-        r'Вход в позицию[:\s-]*([\.\d,]+)\$?',
-        r'Моя точка входа[:\s-]*([\.\d,]+)\$?',
-        r'Точка входа[:\s-]*([\.\d,]+)\$?',
-        r'Открытие сделки[:\s-]*([\.\d,]+)\$?',
+        r'цена входа[:\s-]*([\.,\d,]+)\$?',  # цена входа - 0.0983$
+        r'вход[:\s-]*([\.,\d,]+)\$?',        # вход - 0.0983$
+        r'Entry[:\s-]*([\.,\d,]+)\$?',
+        r'@\s*([\.,\d,]+)\$?',
+        r'Price[:\s-]*([\.,\d,]+)\$?',
+        r'Цена[:\s-]*([\.,\d,]+)\$?',
+        r'Вход в позицию[:\s-]*([\.,\d,]+)\$?',
+        r'Моя точка входа[:\s-]*([\.,\d,]+)\$?',
+        r'Точка входа[:\s-]*([\.,\d,]+)\$?',
+        r'Открытие сделки[:\s-]*([\.,\d,]+)\$?',
     ]
     
     # Enhanced take profit patterns supporting multiple values on same line
     TP_PATTERNS = [
         # NEW: Handle "цели - 0.0993$ 0.1004$ 0.1040$" format
-        r'цели[:\s-]*((?:[\.\d,]+\$?\s*)+)',  # цели - 0.0993$ 0.1004$ 0.1040$
-        r'Target\s*\d*[:]?\s*([\.\d,]+)\$?',
-        r'TP\s*\d*[:]?\s*([\.\d,]+)\$?',
-        r'Тп[:\s-]*([\.\d,]+)\$?',
-        r'Take\s*Profit[:\s-]*([\.\d,]+)\$?',
-        r'Цель[:\s-]*([\.\d,]+)\$?',
-        r'Тейки[:\s-]*([\.\d,]+)\$?',
-        r'Тейк[:\s-]*([\.\d,]+)\$?',
-        r'Цели по сделке[:\s-]*([\.\d,]+)\$?',
+        r'цели[:\s-]*((?:[\.,\d,]+\$?\s*)+)',  # цели - 0.0993$ 0.1004$ 0.1040$
+        r'Target\s*\d*[:]?\s*([\.,\d,]+)\$?',
+        r'TP\s*\d*[:]?\s*([\.,\d,]+)\$?',
+        r'Тп[:\s-]*([\.,\d,]+)\$?',
+        r'Take\s*Profit[:\s-]*([\.,\d,]+)\$?',
+        r'Цель[:\s-]*([\.,\d,]+)\$?',
+        r'Тейки[:\s-]*([\.,\d,]+)\$?',
+        r'Тейк[:\s-]*([\.,\d,]+)\$?',
+        r'Цели по сделке[:\s-]*([\.,\d,]+)\$?',
         # NEW: Multiple TPs on same line
-        r'(?:TP|Target|цели)[:\s-]*((?:[\.\d,]+\$?[\s/|]*)+)',
+        r'(?:TP|Target|цели)[:\s-]*((?:[\.,\d,]+\$?[\s/|]*)+)',
     ]
     
     # Enhanced stop loss patterns supporting non-numeric values
     SL_PATTERNS = [
         r'стоп[:\s-]*([^\n\r]+)',  # стоп - пока не ставлю
-        r'Stop\s*Loss[:\s-]*([\.\d,]+)\$?',
-        r'SL[:\s-]*([\.\d,]+)\$?',
-        r'Сл[:\s-]*([\.\d,]+)\$?',
-        r'Стоп[:\s-]*([\.\d,]+)\$?',
-        r'Стоп-лос[:\s-]*([\.\d,]+)\$?',
-        r'Stop[:\s-]*([\.\d,]+)\$?',
+        r'Stop\s*Loss[:\s-]*([\.,\d,]+)\$?',
+        r'SL[:\s-]*([\.,\d,]+)\$?',
+        r'Сл[:\s-]*([\.,\d,]+)\$?',
+        r'Стоп[:\s-]*([\.,\d,]+)\$?',
+        r'Стоп-лос[:\s-]*([\.,\d,]+)\$?',
+        r'Stop[:\s-]*([\.,\d,]+)\$?',
     ]
     
     # Enhanced leverage patterns with Ukrainian cross margin terms
@@ -327,12 +328,12 @@ class EnhancedSignalParser:
     
     # Risk management patterns
     RISK_PATTERNS = [
-        r'РМ[:\s-]*([\.\d,]+)%',
-        r'Риск[:\s-]*([\.\d,]+)%',
-        r'Риски[:\s-]*([\.\d,]+)%',
-        r'Risk[:\s-]*([\.\d,]+)%',
-        r'([\.\d,]+)%\s*от депозита',
-        r'([\.\d,]+)%\s*от депо',
+        r'РМ[:\s-]*([\.,\d,]+)%',
+        r'Риск[:\s-]*([\.,\d,]+)%',
+        r'Риски[:\s-]*([\.,\d,]+)%',
+        r'Risk[:\s-]*([\.,\d,]+)%',
+        r'([\.,\d,]+)%\s*от депозита',
+        r'([\.,\d,]+)%\s*от депо',
     ]
     
     @staticmethod
@@ -346,6 +347,14 @@ class EnhancedSignalParser:
             text = text.strip()
             if not text:
                 return None
+            
+            # Check if this message contains signal indicators
+            has_signal_indicator = False
+            for indicator in EnhancedSignalParser.SIGNAL_INDICATORS:
+                if re.search(indicator, text, re.IGNORECASE | re.MULTILINE):
+                    has_signal_indicator = True
+                    logger.info(f"✅ Found signal indicator: {indicator}")
+                    break
             
             # NEW APPROACH: Search for symbols and sides ANYWHERE in the entire message
             logger.info(f"📝 Full message text: {text[:300]}...")
@@ -374,9 +383,9 @@ class EnhancedSignalParser:
                     logger.info(f"🔄 Signal rejected as duplicate: {symbol} {side} (10 min cooldown)")
                     return None
             
-            # Calculate confidence score
+            # Calculate confidence score with indicator bonus
             confidence = EnhancedSignalParser._calculate_confidence(
-                symbol, side, entry_price, take_profits, stop_loss, leverage
+                symbol, side, entry_price, take_profits, stop_loss, leverage, has_signal_indicator
             )
             
             signal_id = str(uuid.uuid4())
@@ -747,44 +756,58 @@ class EnhancedSignalParser:
     @staticmethod
     def _calculate_confidence(symbol: str, side: str, entry_price: Optional[float], 
                             take_profits: List[float], stop_loss: Optional[float], 
-                            leverage: Optional[int]) -> float:
-        """Calculate confidence score for the parsed signal"""
+                            leverage: Optional[int], has_signal_indicator: bool = False) -> float:
+        """Calculate confidence score for the parsed signal with indicator bonus"""
         confidence = 0.0
+        
+        # NEW: Major bonus for having signal indicators (like ❗️СИГНАЛ)
+        if has_signal_indicator:
+            confidence += 0.3  # Big boost for messages that explicitly say "SIGNAL"
+            logger.info("✅ Signal indicator bonus: +0.3")
         
         # Base confidence for having symbol and side (most important)
         if symbol and side:
             confidence += 0.4  # Increased from 0.3
+            logger.info(f"✅ Symbol + side bonus: +0.4 (total: {confidence})")
         
         # Entry price adds significant confidence
         if entry_price:
             confidence += 0.25  # Increased from 0.2
+            logger.info(f"✅ Entry price bonus: +0.25 (total: {confidence})")
         
         # Take profits add confidence
         if take_profits:
             confidence += 0.2
+            logger.info(f"✅ Take profits bonus: +0.2 (total: {confidence})")
         
         # Stop loss adds some confidence (even if None due to "not setting")
         confidence += 0.05
+        logger.info(f"✅ Stop loss bonus: +0.05 (total: {confidence})")
         
         # Leverage adds confidence
         if leverage:
             confidence += 0.1
+            logger.info(f"✅ Leverage bonus: +0.1 (total: {confidence})")
         
         # Bonus for having multiple TPs
         if len(take_profits) > 1:
             confidence += 0.05
+            logger.info(f"✅ Multiple TPs bonus: +0.05 (total: {confidence})")
         
         # Bonus if this looks like a properly formatted signal
         if symbol and side and (entry_price or take_profits):
             confidence += 0.1
+            logger.info(f"✅ Well-formatted signal bonus: +0.1 (total: {confidence})")
         
-        return min(confidence, 1.0)
+        final_confidence = min(confidence, 1.0)
+        logger.info(f"📊 Final confidence score: {final_confidence:.2f}")
+        return final_confidence
 
 # Test function for development
 def test_parser():
     """Test the enhanced parser with example signals including duplicates"""
     test_signals = [
-        # Test 1: Standard format with intro text
+        # Test 1: Standard format with intro text (YOUR EXACT CASE)
         """❗️СИГНАЛ
 
 🗯DYM LONG📈
@@ -843,7 +866,7 @@ Leverage: 10x
 стоп - 2550$"""
     ]
     
-    print("🧪 Testing Enhanced Signal Parser v2.4 - DEDUPLICATION + SYMBOL DETECTION")
+    print("🧪 Testing Enhanced Signal Parser v2.5 - SIGNAL INDICATOR BONUS")
     print("=" * 80)
     
     for i, signal_text in enumerate(test_signals, 1):
