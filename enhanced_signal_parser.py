@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Enhanced Signal Parser v2.5 - FIXED: Symbol Detection + Confidence Scoring
+Enhanced Signal Parser v2.6 - FIXED: Confidence Scoring for Signal Indicators
 New Features:
 - Signal deduplication within 10 minutes
 - Improved symbol detection when not first word
-- Better confidence scoring for signals with indicators
+- FIXED: Better confidence scoring for signals with indicators
 - Enhanced handling of multi-line signals
+- CRITICAL: Signals with explicit indicators like ❗️СИГНАЛ now get much higher confidence
 """
 
 import re
@@ -291,8 +292,8 @@ class EnhancedSignalParser:
     TP_PATTERNS = [
         # NEW: Handle "цели - 0.0993$ 0.1004$ 0.1040$" format
         r'цели[:\s-]*((?:[\.,\d,]+\$?\s*)+)',  # цели - 0.0993$ 0.1004$ 0.1040$
-        r'Target\s*\d*[:]?\s*([\.,\d,]+)\$?',
-        r'TP\s*\d*[:]?\s*([\.,\d,]+)\$?',
+        r'Target\s*\d*[:.]?\s*([\.,\d,]+)\$?',
+        r'TP\s*\d*[:.]?\s*([\.,\d,]+)\$?',
         r'Тп[:\s-]*([\.,\d,]+)\$?',
         r'Take\s*Profit[:\s-]*([\.,\d,]+)\$?',
         r'Цель[:\s-]*([\.,\d,]+)\$?',
@@ -757,37 +758,37 @@ class EnhancedSignalParser:
     def _calculate_confidence(symbol: str, side: str, entry_price: Optional[float], 
                             take_profits: List[float], stop_loss: Optional[float], 
                             leverage: Optional[int], has_signal_indicator: bool = False) -> float:
-        """Calculate confidence score for the parsed signal with indicator bonus"""
+        """Calculate confidence score for the parsed signal with FIXED indicator bonus"""
         confidence = 0.0
         
-        # NEW: Major bonus for having signal indicators (like ❗️СИГНАЛ)
+        # CRITICAL FIX: Massive bonus for having explicit signal indicators (like ❗️СИГНАЛ)
         if has_signal_indicator:
-            confidence += 0.3  # Big boost for messages that explicitly say "SIGNAL"
-            logger.info("✅ Signal indicator bonus: +0.3")
+            confidence += 0.5  # HUGE boost for messages that explicitly say "SIGNAL" - this alone gets us to threshold!
+            logger.info("✅ SIGNAL INDICATOR MAJOR BONUS: +0.5")
         
         # Base confidence for having symbol and side (most important)
         if symbol and side:
-            confidence += 0.4  # Increased from 0.3
-            logger.info(f"✅ Symbol + side bonus: +0.4 (total: {confidence})")
+            confidence += 0.25  # Solid bonus for valid symbol + side
+            logger.info(f"✅ Symbol + side bonus: +0.25 (total: {confidence})")
         
         # Entry price adds significant confidence
         if entry_price:
-            confidence += 0.25  # Increased from 0.2
-            logger.info(f"✅ Entry price bonus: +0.25 (total: {confidence})")
+            confidence += 0.15  # Good bonus for entry price
+            logger.info(f"✅ Entry price bonus: +0.15 (total: {confidence})")
         
         # Take profits add confidence
         if take_profits:
-            confidence += 0.2
-            logger.info(f"✅ Take profits bonus: +0.2 (total: {confidence})")
+            confidence += 0.1
+            logger.info(f"✅ Take profits bonus: +0.1 (total: {confidence})")
         
         # Stop loss adds some confidence (even if None due to "not setting")
         confidence += 0.05
-        logger.info(f"✅ Stop loss bonus: +0.05 (total: {confidence})")
+        logger.info(f"✅ Stop loss considered bonus: +0.05 (total: {confidence})")
         
         # Leverage adds confidence
         if leverage:
-            confidence += 0.1
-            logger.info(f"✅ Leverage bonus: +0.1 (total: {confidence})")
+            confidence += 0.05
+            logger.info(f"✅ Leverage bonus: +0.05 (total: {confidence})")
         
         # Bonus for having multiple TPs
         if len(take_profits) > 1:
@@ -796,11 +797,11 @@ class EnhancedSignalParser:
         
         # Bonus if this looks like a properly formatted signal
         if symbol and side and (entry_price or take_profits):
-            confidence += 0.1
-            logger.info(f"✅ Well-formatted signal bonus: +0.1 (total: {confidence})")
+            confidence += 0.05
+            logger.info(f"✅ Well-formatted signal bonus: +0.05 (total: {confidence})")
         
         final_confidence = min(confidence, 1.0)
-        logger.info(f"📊 Final confidence score: {final_confidence:.2f}")
+        logger.info(f"📊 FINAL CONFIDENCE SCORE: {final_confidence:.2f} {'✅ ABOVE THRESHOLD (0.5)' if final_confidence >= 0.5 else '❌ BELOW THRESHOLD (0.5)'}")
         return final_confidence
 
 # Test function for development
@@ -866,7 +867,7 @@ Leverage: 10x
 стоп - 2550$"""
     ]
     
-    print("🧪 Testing Enhanced Signal Parser v2.5 - SIGNAL INDICATOR BONUS")
+    print("🧪 Testing Enhanced Signal Parser v2.6 - FIXED CONFIDENCE SCORING")
     print("=" * 80)
     
     for i, signal_text in enumerate(test_signals, 1):
