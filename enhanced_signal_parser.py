@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Enhanced Signal Parser v2.6 - FIXED: Confidence Scoring for Signal Indicators
-New Features:
+Enhanced Signal Parser v2.7 - FIXED: Confidence Scoring for Signal Indicators
+CRITICAL FIXES:
+- Signals with explicit indicators like ❗️СИГНАЛ now get massive confidence boost (0.5 base)
+- Fixed confidence calculation to properly detect signals with signal markers
+- Enhanced emoji-marked pattern detection (🗯DYM LONG gets highest priority)
+- Improved multi-line signal handling with proper confidence scoring
 - Signal deduplication within 10 minutes
 - Improved symbol detection when not first word
-- FIXED: Better confidence scoring for signals with indicators
-- Enhanced handling of multi-line signals
-- CRITICAL: Signals with explicit indicators like ❗️СИГНАЛ now get much higher confidence
 """
 
 import re
@@ -206,21 +207,23 @@ class EnhancedSignalParser:
             cls._deduplicator = SignalDeduplicator()
         return cls._deduplicator
     
-    # Signal block indicators - words that might appear before the actual signal
+    # CRITICAL FIX: Enhanced signal block indicators - words that indicate a trading signal
     SIGNAL_INDICATORS = [
-        r'❗️?\s*сигнал\b',      # ❗️СИГНАЛ or сигнал
-        r'❗️?\s*signal\b',      # ❗️SIGNAL or signal
-        r'🚨\s*сигнал\b',       # 🚨сигнал
-        r'🚨\s*signal\b',       # 🚨signal
-        r'новый\s*сигнал\b',    # новый сигнал
-        r'new\s*signal\b',      # new signal
-        r'торговый\s*сигнал\b', # торговый сигнал
-        r'trading\s*signal\b',  # trading signal
+        r'❗️\s*сигнал\b',        # ❗️СИГНАЛ or ❗️сигнал
+        r'❗️\s*signal\b',        # ❗️SIGNAL or ❗️signal
+        r'🚨\s*сигнал\b',         # 🚨сигнал
+        r'🚨\s*signal\b',         # 🚨signal
+        r'новый\s*сигнал\b',      # новый сигнал
+        r'new\s*signal\b',        # new signal
+        r'торговый\s*сигнал\b',   # торговый сигнал
+        r'trading\s*signal\b',    # trading signal
+        r'\bсигнал\b',           # сигнал (standalone)
+        r'\bsignal\b',           # signal (standalone)
     ]
     
-    # Enhanced symbol patterns - IMPROVED to find symbols anywhere
+    # FIXED: Enhanced symbol patterns with HIGHEST PRIORITY for emoji-marked symbols
     SYMBOL_PATTERNS = [
-        # HIGHEST PRIORITY: Emoji-marked patterns anywhere in text
+        # HIGHEST PRIORITY: Emoji-marked patterns anywhere in text (🗯DYM LONG)
         r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📈',  # 🗯DYM LONG📈
         r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)📉',  # 🗯DYM SHORT📉
         r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|ЛОНГ|ШОРТ)',    # 🗯DYM LONG
@@ -349,12 +352,12 @@ class EnhancedSignalParser:
             if not text:
                 return None
             
-            # Check if this message contains signal indicators
+            # CRITICAL: Check if this message contains signal indicators FIRST
             has_signal_indicator = False
             for indicator in EnhancedSignalParser.SIGNAL_INDICATORS:
-                if re.search(indicator, text, re.IGNORECASE | re.MULTILINE):
+                if re.search(indicator, text, re.IGNORECASE | re.MULTILINE | re.DOTALL):
                     has_signal_indicator = True
-                    logger.info(f"✅ Found signal indicator: {indicator}")
+                    logger.info(f"✅ Found CRITICAL signal indicator: {indicator}")
                     break
             
             # NEW APPROACH: Search for symbols and sides ANYWHERE in the entire message
@@ -384,7 +387,7 @@ class EnhancedSignalParser:
                     logger.info(f"🔄 Signal rejected as duplicate: {symbol} {side} (10 min cooldown)")
                     return None
             
-            # Calculate confidence score with indicator bonus
+            # CRITICAL FIX: Calculate confidence score with massive indicator bonus
             confidence = EnhancedSignalParser._calculate_confidence(
                 symbol, side, entry_price, take_profits, stop_loss, leverage, has_signal_indicator
             )
@@ -761,10 +764,10 @@ class EnhancedSignalParser:
         """Calculate confidence score for the parsed signal with FIXED indicator bonus"""
         confidence = 0.0
         
-        # CRITICAL FIX: Massive bonus for having explicit signal indicators (like ❗️СИГНАЛ)
+        # CRITICAL FIX: MASSIVE bonus for having explicit signal indicators (like ❗️СИГНАЛ)
         if has_signal_indicator:
-            confidence += 0.5  # HUGE boost for messages that explicitly say "SIGNAL" - this alone gets us to threshold!
-            logger.info("✅ SIGNAL INDICATOR MAJOR BONUS: +0.5")
+            confidence += 0.6  # HUGE boost for messages that explicitly say "SIGNAL" - this alone exceeds threshold!
+            logger.info("✅ CRITICAL SIGNAL INDICATOR MEGA BONUS: +0.6")
         
         # Base confidence for having symbol and side (most important)
         if symbol and side:
@@ -867,7 +870,7 @@ Leverage: 10x
 стоп - 2550$"""
     ]
     
-    print("🧪 Testing Enhanced Signal Parser v2.6 - FIXED CONFIDENCE SCORING")
+    print("🧪 Testing Enhanced Signal Parser v2.7 - FIXED CONFIDENCE SCORING")
     print("=" * 80)
     
     for i, signal_text in enumerate(test_signals, 1):
