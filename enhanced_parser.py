@@ -1,8 +1,4 @@
-"""
-Enhanced Signal Parser with Russian Support and Improved Symbol Detection
-"""
-
-import re
+"""Enhanced Signal Parser with Russian Support and Improved Symbol Detection"""import re
 import uuid
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -50,7 +46,7 @@ class EnhancedSignalParser:
         r'\b(LONG|SHORT|BUY|SELL|ЛОНГ|ШОРТ|лонг|шорт|покупка|продажа)\s*#?\s*([A-Z]{2,10})(?:/USDT|USDT|-USDT)?',  # LONG BTCUSDT, ЛОНГ DYM
         
         # Russian-specific patterns
-        r'🗩\s*([A-Z]{2,10})\s+(LONG|SHORT|лонг|шорт)',  # 🗩DYM LONG
+        r'🗯\s*([A-Z]{2,10})\s+(LONG|SHORT|лонг|шорт)',  # 🗯DYM LONG
         r'([A-Z]{2,10})\s+(ЛОНГ|ШОРТ|лонг|шорт)',  # DYM ЛОНГ
         
         # Symbols with various separators (anywhere in text)
@@ -95,45 +91,45 @@ class EnhancedSignalParser:
         r'открываем шорт-позицию',
     ]
     
-    # Enhanced price patterns for Russian
+    # FIXED: Enhanced price patterns for Russian - replaced broken unicode with proper \d
     ENTRY_PATTERNS = [
-        r'Entry[:\s]*([큃4.,]+)',
-        r'Вход[:\s]*([큃4.,]+)',
-        r'цена входа[:\s-]*([큃4.,]+)',
-        r'@\s*([큃4.,]+)',
-        r'Price[:\s]*([큃4.,]+)',
-        r'Цена[:\s]*([큃4.,]+)',
-        r'вход в позицию[:\s-]*([큃4.,]+)',
-        r'Моя точка входа[:\s-]*([큃4.,]+)',
-        r'Точка входа[:\s-]*([큃4.,]+)',
-        r'Открытие сделки[:\s-]*([큃4.,]+)',
+        r'Entry[:\s]*([\d.,]+)',
+        r'Вход[:\s]*([\d.,]+)',
+        r'цена входа[:\s-]*([\d.,]+)',
+        r'@\s*([\d.,]+)',
+        r'Price[:\s]*([\d.,]+)',
+        r'Цена[:\s]*([\d.,]+)',
+        r'вход в позицию[:\s-]*([\d.,]+)',
+        r'Моя точка входа[:\s-]*([\d.,]+)',
+        r'Точка входа[:\s-]*([\d.,]+)',
+        r'Открытие сделки[:\s-]*([\d.,]+)',
     ]
     
-    # Enhanced take profit patterns for Russian
+    # FIXED: Enhanced take profit patterns for Russian - replaced broken unicode with proper \d
     TP_PATTERNS = [
-        r'Target\s*\d*[:]?\s*([큃4.,]+)',
-        r'TP\s*\d*[:]?\s*([큃4.,]+)',
-        r'Тп[:\s]*([큃4.,]+)',
-        r'цели?[:\s-]*([큃4.,]+)',
-        r'Take\s*Profit[:\s]*([큃4.,]+)',
-        r'Цель[:\s]*([큃4.,]+)',
-        r'Тейки[:\s]*([큃4.,]+)',
-        r'Тейк[:\s]*([큃4.,]+)',
-        r'Цели по сделке[:\s-]*([큃4.,]+)',
+        r'Target\s*\d*[:]?\s*([\d.,]+)',
+        r'TP\s*\d*[:]?\s*([\d.,]+)',
+        r'Тп[:\s]*([\d.,]+)',
+        r'цели?[:\s-]*([\d.,]+)',
+        r'Take\s*Profit[:\s]*([\d.,]+)',
+        r'Цель[:\s]*([\d.,]+)',
+        r'Тейки[:\s]*([\d.,]+)',
+        r'Тейк[:\s]*([\d.,]+)',
+        r'Цели по сделке[:\s-]*([\d.,]+)',
     ]
     
-    # Enhanced stop loss patterns for Russian
+    # FIXED: Enhanced stop loss patterns for Russian - replaced broken unicode with proper \d
     SL_PATTERNS = [
-        r'Stop\s*Loss[:\s]*([큃4.,]+)',
-        r'SL[:\s]*([큃4.,]+)',
-        r'Сл[:\s]*([큃4.,]+)',
-        r'Стоп[:\s-]*([큃4.,]+)',
-        r'Стоп-лос[:\s-]*([큃4.,]+)',
-        r'Stop[:\s]*([큃4.,]+)',
+        r'Stop\s*Loss[:\s]*([\d.,]+)',
+        r'SL[:\s]*([\d.,]+)',
+        r'Сл[:\s]*([\d.,]+)',
+        r'Стоп[:\s-]*([\d.,]+)',
+        r'Стоп-лос[:\s-]*([\d.,]+)',
+        r'Stop[:\s]*([\d.,]+)',
         r'стоп \- пока не ставлю',  # Special case for "no stop loss yet"
     ]
     
-    # Enhanced leverage patterns for Russian
+    # FIXED: Enhanced leverage patterns for Russian - replaced broken unicode with proper \d
     LEVERAGE_PATTERNS = [
         r'Leverage[:\s]*(\d+)',
         r'Плечо[:\s-]*(\d+)[-xх]*(\d)*',
@@ -144,14 +140,14 @@ class EnhancedSignalParser:
         r'(\d+)\s*кросс',  # Russian "cross" margin
     ]
     
-    # Risk management patterns for Russian
+    # FIXED: Risk management patterns for Russian - replaced broken unicode with proper \d
     RISK_PATTERNS = [
-        r'РМ[:\s]*([큃4.,]+)%',
-        r'Риск[:\s]*([큃4.,]+)%',
-        r'Риски[:\s]*([큃4.,]+)%',
-        r'Risk[:\s]*([큃4.,]+)%',
-        r'([큃4.,]+)%\s*от депозита',
-        r'([큃4.,]+)%\s*от депо',
+        r'РМ[:\s]*([\d.,]+)%',
+        r'Риск[:\s]*([\d.,]+)%',
+        r'Риски[:\s]*([\d.,]+)%',
+        r'Risk[:\s]*([\d.,]+)%',
+        r'([\d.,]+)%\s*от депозита',
+        r'([\d.,]+)%\s*от депо',
     ]
     
     @staticmethod
@@ -327,7 +323,7 @@ class EnhancedSignalParser:
                         continue
         
         # Special handling for Russian "цели" with multiple prices in one line
-        tp_line_match = re.search(r'цели[\s-]*((?:[큃4.,]+\$?\s*)+)', text, re.IGNORECASE | re.UNICODE)
+        tp_line_match = re.search(r'цели[\s-]*((?:[\d.,]+\$?\s*)+)', text, re.IGNORECASE | re.UNICODE)
         if tp_line_match:
             tp_line = tp_line_match.group(1)
             # Find all price-like patterns in the line
